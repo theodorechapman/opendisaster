@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import type { WebGPURenderer } from "three/webgpu";
 import type { AgentManager } from "./AgentManager.ts";
 import { AgentState, Position, AgentFacing } from "../core/Components.ts";
 import type { PerceptionPayload } from "./types.ts";
@@ -6,20 +7,19 @@ import type { PerceptionPayload } from "./types.ts";
 const RENDER_SIZE = 256;
 
 /**
- * Renders first-person views for each living agent using a shared WebGLRenderTarget.
+ * Renders first-person views for each living agent using a shared RenderTarget.
  * Returns base64-encoded JPEG frames for VLM consumption.
  */
 export class AgentPerceptionSystem {
-  private renderer: THREE.WebGLRenderer;
+  private renderer: WebGPURenderer;
   private scene: THREE.Scene;
   private manager: AgentManager;
-  private renderTarget: THREE.WebGLRenderTarget;
-  private pixelBuffer: Uint8Array;
+  private renderTarget: THREE.RenderTarget;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
 
   constructor(
-    renderer: THREE.WebGLRenderer,
+    renderer: WebGPURenderer,
     scene: THREE.Scene,
     manager: AgentManager,
   ) {
@@ -27,12 +27,10 @@ export class AgentPerceptionSystem {
     this.scene = scene;
     this.manager = manager;
 
-    this.renderTarget = new THREE.WebGLRenderTarget(RENDER_SIZE, RENDER_SIZE, {
+    this.renderTarget = new THREE.RenderTarget(RENDER_SIZE, RENDER_SIZE, {
       format: THREE.RGBAFormat,
       type: THREE.UnsignedByteType,
     });
-
-    this.pixelBuffer = new Uint8Array(RENDER_SIZE * RENDER_SIZE * 4);
 
     // Use a hidden canvas for JPEG encoding
     this.canvas = document.createElement("canvas");
@@ -64,24 +62,23 @@ export class AgentPerceptionSystem {
       this.renderer.render(this.scene, visual.camera);
       this.renderer.setRenderTarget(null);
 
-      // Read pixels
-      this.renderer.readRenderTargetPixels(
+      // Read pixels (async in WebGPU)
+      const pixelBuffer = await this.renderer.readRenderTargetPixelsAsync(
         this.renderTarget,
         0, 0,
         RENDER_SIZE, RENDER_SIZE,
-        this.pixelBuffer,
       );
 
       // Restore visibility
       visual.mesh.visible = true;
 
-      // Flip Y and put into canvas (WebGL reads bottom-to-top)
+      // Flip Y and put into canvas (GPU reads bottom-to-top)
       const imageData = this.ctx.createImageData(RENDER_SIZE, RENDER_SIZE);
       for (let y = 0; y < RENDER_SIZE; y++) {
         const srcRow = (RENDER_SIZE - 1 - y) * RENDER_SIZE * 4;
         const dstRow = y * RENDER_SIZE * 4;
         for (let x = 0; x < RENDER_SIZE * 4; x++) {
-          imageData.data[dstRow + x] = this.pixelBuffer[srcRow + x]!;
+          imageData.data[dstRow + x] = pixelBuffer[srcRow + x]!;
         }
       }
       this.ctx.putImageData(imageData, 0, 0);

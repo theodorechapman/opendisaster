@@ -15,8 +15,20 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@react-three/fiber": "^9.5.0",
+    "@react-three/postprocessing": "^3.0.4",
+    "@types/react": "^19.2.13",
+    "@types/react-dom": "^19.2.3",
     "bitecs": "^0.4.0",
-    "three": "^0.182.0",
-    "three.quarks": "^0.17.0"
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "framer-motion": "^12.33.0",
+    "lucide-react": "^0.563.0",
+    "postprocessing": "^6.38.2",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "tailwind-merge": "^3.4.0",
+    "tailwindcss": "^4.1.18",
+    "three": "^0.182.0"
   }
 }

@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import type { WebGPURenderer } from "three/webgpu";
 import type { AgentManager } from "../agents/AgentManager.ts";
 import { AgentState, Position, AgentFacing } from "../core/Components.ts";
 import type { ReplayRecorder } from "./ReplayRecorder.ts";
@@ -14,19 +15,18 @@ const MAIN_LOOP_FPS = 60;
  * With 8 agents at 60fps main loop: ceil(8 * 20 / 60) = 3 renders per frame.
  */
 export class ReplayCaptureSystem {
-  private renderer: THREE.WebGLRenderer;
+  private renderer: WebGPURenderer;
   private scene: THREE.Scene;
   private manager: AgentManager;
   private recorder: ReplayRecorder;
-  private renderTarget: THREE.WebGLRenderTarget;
-  private pixelBuffer: Uint8Array;
+  private renderTarget: THREE.RenderTarget;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
   private nextAgentIdx = 0;
   private startTime: number;
 
   constructor(
-    renderer: THREE.WebGLRenderer,
+    renderer: WebGPURenderer,
     scene: THREE.Scene,
     manager: AgentManager,
     recorder: ReplayRecorder,
@@ -37,12 +37,10 @@ export class ReplayCaptureSystem {
     this.recorder = recorder;
     this.startTime = performance.now();
 
-    this.renderTarget = new THREE.WebGLRenderTarget(CAPTURE_SIZE, CAPTURE_SIZE, {
+    this.renderTarget = new THREE.RenderTarget(CAPTURE_SIZE, CAPTURE_SIZE, {
       format: THREE.RGBAFormat,
       type: THREE.UnsignedByteType,
     });
-
-    this.pixelBuffer = new Uint8Array(CAPTURE_SIZE * CAPTURE_SIZE * 4);
 
     this.canvas = document.createElement("canvas");
     this.canvas.width = CAPTURE_SIZE;
@@ -51,7 +49,7 @@ export class ReplayCaptureSystem {
   }
 
   /** Capture multiple agents in round-robin to hit ~20fps per agent. Call once per animation frame. */
-  captureNext(): void {
+  async captureNext(): Promise<void> {
     const living = this.manager.getLiving();
     if (living.length === 0) return;
 
@@ -63,11 +61,11 @@ export class ReplayCaptureSystem {
       const agent = living[this.nextAgentIdx]!;
       this.nextAgentIdx = (this.nextAgentIdx + 1) % living.length;
 
-      this.captureAgent(agent);
+      await this.captureAgent(agent);
     }
   }
 
-  private captureAgent(agent: { index: number; eid: number }): void {
+  private async captureAgent(agent: { index: number; eid: number }): Promise<void> {
     const visual = this.manager.visuals.getVisual(agent.index);
     if (!visual) return;
 
@@ -85,11 +83,10 @@ export class ReplayCaptureSystem {
     this.renderer.render(this.scene, visual.camera);
     this.renderer.setRenderTarget(null);
 
-    // Read pixels
-    this.renderer.readRenderTargetPixels(
+    // Read pixels (async in WebGPU)
+    const pixelBuffer = await this.renderer.readRenderTargetPixelsAsync(
       this.renderTarget, 0, 0,
       CAPTURE_SIZE, CAPTURE_SIZE,
-      this.pixelBuffer,
     );
 
     // Restore visibility
@@ -101,7 +98,7 @@ export class ReplayCaptureSystem {
       const srcRow = (CAPTURE_SIZE - 1 - y) * CAPTURE_SIZE * 4;
       const dstRow = y * CAPTURE_SIZE * 4;
       for (let x = 0; x < CAPTURE_SIZE * 4; x++) {
-        imageData.data[dstRow + x] = this.pixelBuffer[srcRow + x]!;
+        imageData.data[dstRow + x] = pixelBuffer[srcRow + x]!;
       }
     }
     this.ctx.putImageData(imageData, 0, 0);

@@ -13,6 +13,9 @@ export interface BuildingRecord {
   centerX: number;
   centerZ: number;
   width: number;
+  /** Axis-aligned half-extents for proper AABB collision. */
+  halfX: number;
+  halfZ: number;
   tiltTargetX?: number;
   tiltTargetZ?: number;
   damageLevel: number;
@@ -150,6 +153,29 @@ export class HeightSampler {
   }
 }
 
+/** Satellite image coverage in local Three.js coordinates (meters from center). */
+export interface SatelliteBounds {
+  xMin: number; xMax: number;
+  zMin: number; zMax: number;
+  width: number; depth: number;
+}
+
+/**
+ * Compute the satellite image's actual coverage in local meters.
+ * The image is centered on (0, 0) in local space.
+ * @param tilesPerAxis — number of tiles stitched per axis (1 = single tile)
+ */
+export function computeSatelliteBounds(lat: number, zoom: number, tilesPerAxis: number = 1): SatelliteBounds {
+  const metersPerPixel = 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, zoom);
+  // scale=2 doubles resolution but NOT geographic coverage — each tile covers 640 * mpp meters
+  const halfSize = tilesPerAxis * 320 * metersPerPixel;
+  return {
+    xMin: -halfSize, xMax: halfSize,
+    zMin: -halfSize, zMax: halfSize,
+    width: halfSize * 2, depth: halfSize * 2,
+  };
+}
+
 // ─── Main entry point ───────────────────────────────────────────────────────
 
 export function buildAllLayers(
@@ -157,6 +183,8 @@ export function buildAllLayers(
   centerLat: number,
   centerLon: number,
   carTemplate?: THREE.Object3D | null,
+  satelliteTexture?: THREE.Texture | null,
+  satelliteBounds?: SatelliteBounds | null,
 ): { group: THREE.Group; heightSampler: HeightSampler } {
   const root = new THREE.Group();
   sceneGroupRef = root;
@@ -178,9 +206,9 @@ export function buildAllLayers(
   roadLinesRef = roadLines;
 
   // All ground features painted directly onto the terrain texture
-  root.add(buildTerrain(data.elevation, centerLat, centerLon, mpd, sampler, parkPolys, waterPolys, roadLines, railLines));
+  root.add(buildTerrain(data.elevation, centerLat, centerLon, mpd, sampler, parkPolys, waterPolys, roadLines, railLines, satelliteTexture, satelliteBounds));
 
-  root.add(buildBuildings(data.buildings, centerLat, centerLon, mpd, sampler));
+  root.add(buildBuildings(data.buildings, centerLat, centerLon, mpd, sampler, satelliteTexture, satelliteBounds));
   root.add(buildWater(data.water, centerLat, centerLon, mpd, sampler));
   root.add(buildTrees(data.trees, centerLat, centerLon, mpd, sampler));
   root.add(buildBarriers(data.barriers, centerLat, centerLon, mpd, sampler));
@@ -450,6 +478,8 @@ function buildTerrain(
   waterPolys: Poly2D[],
   roadLines: RoadLine2D[],
   railLines: RoadLine2D[],
+  satelliteTexture?: THREE.Texture | null,
+  satelliteBounds?: SatelliteBounds | null,
 ): THREE.Mesh {
   const gs = elev.gridSize;
   const xMin = (elev.west - cLon) * mpd.lon;
@@ -541,6 +571,8 @@ function buildTerrain(
   // Displace vertices & manually assign UVs matching world position
   const pos = geo.attributes.position!;
   const uv = geo.attributes.uv!;
+  // Always map UVs to terrain bounds (satellite is composited onto the canvas)
+  const uvBounds = { xMin, xMax, zMin, zMax, width, depth };
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i) + (xMin + xMax) / 2;
     const z = pos.getZ(i) + (zMin + zMax) / 2;
@@ -548,11 +580,23 @@ function buildTerrain(
     pos.setY(i, sampler.sample(x, z));
     pos.setZ(i, z);
 
-    // UV: 0→1 across the terrain extent
-    uv.setXY(i, (x - xMin) / width, (z - zMin) / depth);
+    // UV: 0→1 across the appropriate bounds
+    uv.setXY(i, (x - uvBounds.xMin) / uvBounds.width, (z - uvBounds.zMin) / uvBounds.depth);
   }
 
   geo.computeVertexNormals();
+
+  // Draw satellite imagery onto the canvas so paintGround (tornado wake) works on the same surface
+  if (satelliteTexture && satelliteBounds) {
+    const satImg = satelliteTexture.image as HTMLImageElement;
+    const sx = ((satelliteBounds.xMin - xMin) / width) * TEX_SIZE;
+    const sy = ((satelliteBounds.zMin - zMin) / depth) * TEX_SIZE;
+    const sw = (satelliteBounds.width / width) * TEX_SIZE;
+    const sh = (satelliteBounds.depth / depth) * TEX_SIZE;
+    ctx.drawImage(satImg, sx, sy, sw, sh);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.needsUpdate = true;
+  }
 
   const mat = new THREE.MeshPhongMaterial({
     map: texture,
@@ -570,9 +614,15 @@ function buildTerrain(
 
 // ─── Buildings (extruded polygons on terrain) ───────────────────────────────
 
-function buildBuildings(fc: FeatureCollection, cLat: number, cLon: number, mpd: Proj, sampler: HeightSampler): THREE.Group {
+function buildBuildings(fc: FeatureCollection, cLat: number, cLon: number, mpd: Proj, sampler: HeightSampler, satelliteTexture?: THREE.Texture | null, satelliteBounds?: SatelliteBounds | null): THREE.Group {
   const group = new THREE.Group();
   group.name = "buildings";
+
+  // Share roof material across all buildings to avoid per-building WebGPU pipeline compilation
+  // (each unique material instance triggers a separate pipeline compile, causing freezes)
+  const sharedRoofMat = (satelliteTexture && satelliteBounds)
+    ? new THREE.MeshPhongMaterial({ map: terrainTextureRef!, shininess: 15 })
+    : null;
 
   for (const feature of fc.features) {
     const props = feature.properties;
@@ -616,8 +666,40 @@ function buildBuildings(fc: FeatureCollection, cLat: number, cLon: number, mpd: 
       geo.rotateX(-Math.PI / 2);
       geo.translate(0, terrainY + minHeight, 0);
 
-      const mat = new THREE.MeshPhongMaterial({ color, shininess: 15 });
-      const mesh = new THREE.Mesh(geo, mat);
+      let meshMaterial: THREE.Material | THREE.Material[];
+      if (sharedRoofMat && satelliteBounds) {
+        // Wall material is per-building (tornado damage modifies it)
+        // Roof material is shared (same satellite texture for all)
+        const wallMat = new THREE.MeshPhongMaterial({ color, shininess: 15 });
+        const roofMat = sharedRoofMat;
+
+        // Remap roof cap UVs to terrain canvas coordinates based on world XZ position
+        const uvAttr = geo.attributes.uv!;
+        const posAttr = geo.attributes.position!;
+        const bounds = terrainBoundsRef!;
+
+        // After rotateX(-PI/2) and translate: positions are in world space
+        // Remap cap face UVs (materialIndex 0) to world position in satellite space
+        for (const grp of geo.groups) {
+          if (grp.materialIndex === 0) {
+            for (let i = grp.start; i < grp.start + grp.count; i++) {
+              const idx = geo.index ? geo.index.getX(i) : i;
+              const wx = posAttr.getX(idx);
+              const wz = posAttr.getZ(idx);
+              const u = (wx - bounds.xMin) / bounds.width;
+              const v = (wz - bounds.zMin) / bounds.depth;
+              uvAttr.setXY(idx, u, v);
+            }
+          }
+        }
+        uvAttr.needsUpdate = true;
+
+        // materialIndex 0 = caps (top+bottom), 1 = sides
+        meshMaterial = [roofMat, wallMat];
+      } else {
+        meshMaterial = new THREE.MeshPhongMaterial({ color, shininess: 15 });
+      }
+      const mesh = new THREE.Mesh(geo, meshMaterial);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       group.add(mesh);
@@ -633,6 +715,8 @@ function buildBuildings(fc: FeatureCollection, cLat: number, cLon: number, mpd: 
         centerX: center.x,
         centerZ: center.z,
         width: Math.max(size.x, size.z),
+        halfX: size.x * 0.5,
+        halfZ: size.z * 0.5,
         damageLevel: 0,
         destroyed: false,
         originalColor: new THREE.Color(color),
