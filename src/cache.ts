@@ -33,12 +33,12 @@ try {
 const TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
 /** Round to 4 decimal places (~11m precision) to improve cache hit rate. */
-function cacheKey(lat: number, lon: number): string {
-  return `${lat.toFixed(4)},${lon.toFixed(4)}`;
+function cacheKey(lat: number, lon: number, size = 500): string {
+  return `${lat.toFixed(4)},${lon.toFixed(4)},${size}`;
 }
 
-export function getCached(lat: number, lon: number): LayerData | null {
-  const key = cacheKey(lat, lon);
+export function getCached(lat: number, lon: number, size = 500): LayerData | null {
+  const key = cacheKey(lat, lon, size);
   const row = db
     .query<{ data: string; fetched_at: number }, [string]>(
       "SELECT data, fetched_at FROM cache WHERE key = ?",
@@ -53,8 +53,8 @@ export function getCached(lat: number, lon: number): LayerData | null {
   return JSON.parse(row.data) as LayerData;
 }
 
-export function setCache(lat: number, lon: number, layers: LayerData): void {
-  const key = cacheKey(lat, lon);
+export function setCache(lat: number, lon: number, layers: LayerData, size = 500): void {
+  const key = cacheKey(lat, lon, size);
   db.run("INSERT OR REPLACE INTO cache (key, data, fetched_at) VALUES (?, ?, ?)", [
     key,
     JSON.stringify(layers),

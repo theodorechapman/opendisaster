@@ -22,13 +22,13 @@ if (!buildResult.success) {
 const distDir = join(import.meta.dir, "dist");
 const htmlFile = Bun.file(join(import.meta.dir, "index.html"));
 
-/** Convert lat/lon + 250m offset to a bounding box. */
-function bbox(lat: number, lon: number) {
+/** Convert lat/lon + half-size offset to a bounding box. */
+function bbox(lat: number, lon: number, halfSize: number) {
   const latRad = (lat * Math.PI) / 180;
   const mPerDegLon = (Math.PI / 180) * 6378137 * Math.cos(latRad);
   const mPerDegLat = (Math.PI / 180) * 6378137;
-  const dLon = 250 / mPerDegLon;
-  const dLat = 250 / mPerDegLat;
+  const dLon = halfSize / mPerDegLon;
+  const dLat = halfSize / mPerDegLat;
   return {
     south: lat - dLat,
     north: lat + dLat,
@@ -47,12 +47,13 @@ Bun.serve({
     if (url.pathname === "/api/data") {
       const lat = parseFloat(url.searchParams.get("lat") ?? "");
       const lon = parseFloat(url.searchParams.get("lon") ?? "");
+      const size = Math.max(100, Math.min(2000, parseInt(url.searchParams.get("size") ?? "500") || 500));
       if (isNaN(lat) || isNaN(lon)) {
         return new Response("Missing or invalid lat/lon", { status: 400 });
       }
 
-      // Check cache
-      const cached = getCached(lat, lon);
+      // Check cache (include size in key)
+      const cached = getCached(lat, lon, size);
       if (cached) {
         console.log(`Cache hit for (${lat.toFixed(4)}, ${lon.toFixed(4)})`);
         return Response.json(cached);
@@ -61,7 +62,7 @@ Bun.serve({
       // Fetch Overpass + Elevation in parallel
       console.log(`Cache miss — fetching Overpass + USGS elevation for (${lat.toFixed(4)}, ${lon.toFixed(4)})`);
       try {
-        const { south, west, north, east } = bbox(lat, lon);
+        const { south, west, north, east } = bbox(lat, lon, size / 2);
 
         const [overpassLayers, elevation] = await Promise.all([
           fetchFromOverpass(south, west, north, east),
@@ -73,7 +74,7 @@ Bun.serve({
           elevation,
         };
 
-        setCache(lat, lon, layers);
+        setCache(lat, lon, layers, size);
 
         const counts = Object.entries(overpassLayers)
           .map(([k, v]) => `${k}: ${v.features.length}`)

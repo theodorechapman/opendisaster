@@ -7,11 +7,21 @@ const overlay = document.getElementById("overlay")!;
 const goBtn = document.getElementById("go") as HTMLButtonElement;
 const latInput = document.getElementById("lat") as HTMLInputElement;
 const lonInput = document.getElementById("lon") as HTMLInputElement;
+const sizeInput = document.getElementById("size") as HTMLInputElement;
+const sizeVal = document.getElementById("size-val")!;
+const sizeLabel = document.getElementById("size-label")!;
+const sizeLabel2 = document.getElementById("size-label2")!;
 const addressInput = document.getElementById("address") as HTMLInputElement;
 const lookupBtn = document.getElementById("lookup") as HTMLButtonElement;
 const geocodeError = document.getElementById("geocode-error")!;
 const loading = document.getElementById("loading")!;
 const hud = document.getElementById("hud")!;
+
+sizeInput.addEventListener("input", () => {
+  sizeVal.textContent = sizeInput.value;
+  sizeLabel.textContent = sizeInput.value;
+  sizeLabel2.textContent = sizeInput.value;
+});
 
 // --- Three.js setup ---
 const renderer = new THREE.WebGLRenderer({ antialias: true });
@@ -116,7 +126,8 @@ goBtn.addEventListener("click", async () => {
   loading.style.display = "block";
 
   try {
-    const layers = await fetchLayers(lat, lon);
+    const size = parseInt(sizeInput.value);
+    const layers = await fetchLayers(lat, lon, size);
 
     if (sceneGroup) {
       scene.remove(sceneGroup);
@@ -135,9 +146,10 @@ goBtn.addEventListener("click", async () => {
     sceneGroup = buildAllLayers(layers, lat, lon);
     scene.add(sceneGroup);
 
-    // Reset camera
-    camera.position.set(0, 80, 200);
-    controls.speed = 40;
+    // Reset camera — scale distance with area size
+    const camScale = size / 500;
+    camera.position.set(0, 80 * camScale, 200 * camScale);
+    controls.speed = 40 * camScale;
 
     overlay.classList.add("hidden");
   } catch (err) {

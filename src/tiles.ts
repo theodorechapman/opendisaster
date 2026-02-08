@@ -44,10 +44,11 @@ export interface LayerData {
 }
 
 /**
- * Fetch all GeoJSON layers for a 500m x 500m box centered on (lat, lon).
+ * Fetch all GeoJSON layers for a box centered on (lat, lon).
+ * @param size — side length in meters (default 500)
  */
-export async function fetchLayers(lat: number, lon: number): Promise<LayerData> {
-  const res = await fetch(`/api/data?lat=${lat}&lon=${lon}`);
+export async function fetchLayers(lat: number, lon: number, size = 500): Promise<LayerData> {
+  const res = await fetch(`/api/data?lat=${lat}&lon=${lon}&size=${size}`);
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`Server error ${res.status}: ${text}`);

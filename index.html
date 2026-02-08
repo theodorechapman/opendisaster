@@ -70,13 +70,15 @@
   <div id="overlay">
     <div id="panel">
       <h1>OpenDisaster</h1>
-      <p class="sub">3D Building Viewer — 500m &times; 500m area from OSM</p>
+      <p class="sub">3D Building Viewer — <span id="size-label">500</span>m &times; <span id="size-label2">500</span>m area from OSM</p>
       <label for="address">Address or Google Maps Link</label>
       <div style="display:flex;gap:8px;margin-bottom:14px;">
         <input id="address" type="text" style="margin-bottom:0;flex:1;" placeholder="e.g. 350 5th Ave, New York or maps URL" />
         <button id="lookup" style="width:auto;padding:8px 16px;font-size:13px;white-space:nowrap;">Lookup</button>
       </div>
       <div id="geocode-error" style="color:#e55;font-size:12px;margin:-8px 0 10px;display:none;"></div>
+      <label for="size">Area Size: <strong id="size-val">500</strong>m</label>
+      <input id="size" type="range" min="100" max="2000" step="50" value="500" style="margin-bottom:14px;accent-color:#4361ee;" />
       <div style="display:flex;gap:12px;">
         <div style="flex:1;">
           <label for="lat">Latitude</label>
