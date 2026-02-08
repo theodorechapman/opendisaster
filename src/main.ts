@@ -7,6 +7,9 @@ const overlay = document.getElementById("overlay")!;
 const goBtn = document.getElementById("go") as HTMLButtonElement;
 const latInput = document.getElementById("lat") as HTMLInputElement;
 const lonInput = document.getElementById("lon") as HTMLInputElement;
+const addressInput = document.getElementById("address") as HTMLInputElement;
+const lookupBtn = document.getElementById("lookup") as HTMLButtonElement;
+const geocodeError = document.getElementById("geocode-error")!;
 const loading = document.getElementById("loading")!;
 const hud = document.getElementById("hud")!;
 
@@ -67,6 +70,37 @@ window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Geocode lookup ---
+async function doLookup() {
+  const q = addressInput.value.trim();
+  if (!q) return;
+  geocodeError.style.display = "none";
+  lookupBtn.disabled = true;
+  lookupBtn.textContent = "…";
+  try {
+    const res = await fetch(`/api/geocode?q=${encodeURIComponent(q)}`);
+    const data = await res.json();
+    if (!res.ok || data.error) {
+      geocodeError.textContent = data.error ?? "Lookup failed";
+      geocodeError.style.display = "block";
+      return;
+    }
+    latInput.value = data.lat.toString();
+    lonInput.value = data.lon.toString();
+  } catch {
+    geocodeError.textContent = "Network error";
+    geocodeError.style.display = "block";
+  } finally {
+    lookupBtn.disabled = false;
+    lookupBtn.textContent = "Lookup";
+  }
+}
+
+lookupBtn.addEventListener("click", doLookup);
+addressInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") { e.preventDefault(); doLookup(); }
 });
 
 // --- Load all layers ---

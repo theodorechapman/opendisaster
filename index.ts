@@ -86,6 +86,59 @@ Bun.serve({
       }
     }
 
+    // --- API: geocode address or Google Maps URL ---
+    if (url.pathname === "/api/geocode") {
+      const q = url.searchParams.get("q")?.trim();
+      if (!q) return new Response("Missing ?q=", { status: 400 });
+
+      // If it looks like a URL, try to extract coords from it
+      let resolvedQ = q;
+      if (/^https?:\/\//i.test(q)) {
+        // Follow redirects for short URLs (maps.app.goo.gl, goo.gl/maps, etc.)
+        if (/goo\.gl/i.test(q)) {
+          try {
+            const res = await fetch(q, { redirect: "follow" });
+            resolvedQ = res.url;
+          } catch {
+            // fall through to Nominatim
+          }
+        }
+
+        const mapsCoords =
+          resolvedQ.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*)/) ??
+          resolvedQ.match(/[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)/) ??
+          resolvedQ.match(/[?&]ll=(-?\d+\.?\d*),(-?\d+\.?\d*)/);
+
+        if (mapsCoords) {
+          const lat = parseFloat(mapsCoords[1]);
+          const lon = parseFloat(mapsCoords[2]);
+          if (!isNaN(lat) && !isNaN(lon)) {
+            return Response.json({ lat, lon });
+          }
+        }
+      }
+
+      // Fall back to Nominatim geocoding
+      try {
+        const nominatimUrl = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`;
+        const res = await fetch(nominatimUrl, {
+          headers: { "User-Agent": "OpenDisaster/1.0" },
+        });
+        const results = (await res.json()) as Array<{ lat: string; lon: string; display_name: string }>;
+        if (!results.length) {
+          return Response.json({ error: "Address not found" }, { status: 404 });
+        }
+        return Response.json({
+          lat: parseFloat(results[0].lat),
+          lon: parseFloat(results[0].lon),
+          name: results[0].display_name,
+        });
+      } catch (err) {
+        console.error("Geocode failed:", err);
+        return new Response("Geocode error", { status: 502 });
+      }
+    }
+
     // --- Static: HTML ---
     if (url.pathname === "/" || url.pathname === "/index.html") {
       const html = (await htmlFile.text()).replace("./src/main.ts", "/dist/main.js");

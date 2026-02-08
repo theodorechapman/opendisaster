@@ -227,6 +227,7 @@ function buildTerrain(
   drawPolys(waterPolys, "#3388cc");
 
   const texture = new THREE.CanvasTexture(canvas);
+  texture.flipY = false; // canvas y=0 is top, UV v=0 maps to zMin — keep them aligned
   texture.minFilter = THREE.LinearFilter;
   texture.magFilter = THREE.LinearFilter;
 

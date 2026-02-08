@@ -71,10 +71,22 @@
     <div id="panel">
       <h1>OpenDisaster</h1>
       <p class="sub">3D Building Viewer — 500m &times; 500m area from OSM</p>
-      <label for="lat">Latitude</label>
-      <input id="lat" type="number" step="any" value="40.7484" placeholder="e.g. 40.7484" />
-      <label for="lon">Longitude</label>
-      <input id="lon" type="number" step="any" value="-73.9857" placeholder="e.g. -73.9857" />
+      <label for="address">Address or Google Maps Link</label>
+      <div style="display:flex;gap:8px;margin-bottom:14px;">
+        <input id="address" type="text" style="margin-bottom:0;flex:1;" placeholder="e.g. 350 5th Ave, New York or maps URL" />
+        <button id="lookup" style="width:auto;padding:8px 16px;font-size:13px;white-space:nowrap;">Lookup</button>
+      </div>
+      <div id="geocode-error" style="color:#e55;font-size:12px;margin:-8px 0 10px;display:none;"></div>
+      <div style="display:flex;gap:12px;">
+        <div style="flex:1;">
+          <label for="lat">Latitude</label>
+          <input id="lat" type="number" step="any" value="40.7484" placeholder="e.g. 40.7484" />
+        </div>
+        <div style="flex:1;">
+          <label for="lon">Longitude</label>
+          <input id="lon" type="number" step="any" value="-73.9857" placeholder="e.g. -73.9857" />
+        </div>
+      </div>
       <button id="go">Load Buildings</button>
     </div>
   </div>
