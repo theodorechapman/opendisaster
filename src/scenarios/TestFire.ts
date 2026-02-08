@@ -1,6 +1,6 @@
 /**
  * TestFire scenario — multi-source stochastic fire spread with wind,
- * three.quarks particle visuals (flames, smoke, embers, scorch),
+ * custom InstancedMesh + SpriteNodeMaterial particle visuals (flames, smoke, embers),
  * and per-source event emission.
  *
  * Self-contained and easily removable:
@@ -9,24 +9,17 @@
  */
 
 import * as THREE from "three";
+import { SpriteNodeMaterial } from "three/webgpu";
 import {
-  ParticleSystem,
-  BatchedRenderer,
-  ConeEmitter,
-  SphereEmitter,
-  ConstantValue,
-  IntervalValue,
-  ConstantColor,
-  ColorOverLife,
-  SizeOverLife,
-  ApplyForce,
-  Gradient,
-  PiecewiseBezier,
-  Bezier,
-  RenderMode,
-  Vector3 as QVector3,
-  Vector4 as QVector4,
-} from "three.quarks";
+  instancedBufferAttribute,
+  texture,
+  mix,
+  float,
+  vec3,
+  vec4,
+  smoothstep,
+  uniform,
+} from "three/tsl";
 import type { EventBus } from "../core/EventBus.ts";
 import type { HeightSampler } from "../layers.ts";
 
@@ -85,6 +78,476 @@ function makeEmberTexture(size = 64): THREE.Texture {
   return tex;
 }
 
+/* ── Particle System ──────────────────────────────────────── */
+
+interface Particle {
+  position: THREE.Vector3;
+  velocity: THREE.Vector3;
+  life: number;     // elapsed seconds
+  maxLife: number;   // seconds
+  size: number;
+  baseSize: number;
+  alive: boolean;
+}
+
+type ParticleType = "flame" | "smoke" | "ember";
+
+interface EmitterConfig {
+  type: ParticleType;
+  maxParticles: number;
+  emissionRate: number;       // particles per second (scaled by intensity)
+  lifeRange: [number, number];
+  speedRange: [number, number];
+  sizeRange: [number, number];
+  emitterRadius: number;      // cone/sphere radius
+  emitterShape: "cone" | "sphere";
+  coneAngle?: number;         // radians, half angle for cone
+  blending: THREE.Blending;
+  tex: THREE.Texture;
+  // Force: [x, y, z] applied per second
+  baseForce: THREE.Vector3;
+  // Color gradient: array of [color, t] where t is 0-1 normalized life
+  colorStops: Array<{ color: THREE.Color; t: number }>;
+  // Opacity gradient
+  opacityStops: Array<{ opacity: number; t: number }>;
+  // Size curve: array of [scale, t] where scale multiplies baseSize
+  sizeStops: Array<{ scale: number; t: number }>;
+  renderOrder?: number;
+}
+
+function lerpStops<T extends number>(stops: Array<{ value: T; t: number }>, t: number): T {
+  if (stops.length === 0) return 0 as T;
+  if (t <= stops[0]!.t) return stops[0]!.value;
+  if (t >= stops[stops.length - 1]!.t) return stops[stops.length - 1]!.value;
+  for (let i = 0; i < stops.length - 1; i++) {
+    const a = stops[i]!;
+    const b = stops[i + 1]!;
+    if (t >= a.t && t <= b.t) {
+      const f = (t - a.t) / (b.t - a.t);
+      return (a.value + (b.value - a.value) * f) as T;
+    }
+  }
+  return stops[stops.length - 1]!.value;
+}
+
+function lerpColorStops(stops: Array<{ color: THREE.Color; t: number }>, t: number, out: THREE.Color): THREE.Color {
+  if (stops.length === 0) return out.setRGB(1, 1, 1);
+  if (t <= stops[0]!.t) return out.copy(stops[0]!.color);
+  if (t >= stops[stops.length - 1]!.t) return out.copy(stops[stops.length - 1]!.color);
+  for (let i = 0; i < stops.length - 1; i++) {
+    const a = stops[i]!;
+    const b = stops[i + 1]!;
+    if (t >= a.t && t <= b.t) {
+      const f = (t - a.t) / (b.t - a.t);
+      return out.copy(a.color).lerp(b.color, f);
+    }
+  }
+  return out.copy(stops[stops.length - 1]!.color);
+}
+
+/**
+ * Custom particle emitter backed by InstancedMesh + SpriteNodeMaterial.
+ * CPU manages particle state; per-instance attributes drive the GPU material.
+ */
+class FireParticleEmitter {
+  readonly mesh: THREE.InstancedMesh;
+  private particles: Particle[];
+  private config: EmitterConfig;
+  private spawnAccumulator = 0;
+  currentEmissionRate = 0;
+  currentEmitterRadius: number;
+
+  // Per-instance attribute buffers
+  private lifeArray: Float32Array;
+  private colorArray: Float32Array;   // RGBA per instance
+  private scaleArray: Float32Array;
+
+  private lifeAttr: THREE.InstancedBufferAttribute;
+  private colorAttr: THREE.InstancedBufferAttribute;
+  private scaleAttr: THREE.InstancedBufferAttribute;
+
+  // Wind force override (mutated externally)
+  windForce = new THREE.Vector3();
+
+  private static _tmpColor = new THREE.Color();
+  private static _tmpMatrix = new THREE.Matrix4();
+  private static _tmpVec = new THREE.Vector3();
+
+  constructor(config: EmitterConfig) {
+    this.config = config;
+    this.currentEmitterRadius = config.emitterRadius;
+    const max = config.maxParticles;
+
+    // Allocate particle pool
+    this.particles = [];
+    for (let i = 0; i < max; i++) {
+      this.particles.push({
+        position: new THREE.Vector3(),
+        velocity: new THREE.Vector3(),
+        life: 0,
+        maxLife: 1,
+        size: 1,
+        baseSize: 1,
+        alive: false,
+      });
+    }
+
+    // Per-instance buffers
+    this.lifeArray = new Float32Array(max);
+    this.colorArray = new Float32Array(max * 4);
+    this.scaleArray = new Float32Array(max);
+
+    this.lifeAttr = new THREE.InstancedBufferAttribute(this.lifeArray, 1);
+    this.lifeAttr.setUsage(THREE.DynamicDrawUsage);
+    this.colorAttr = new THREE.InstancedBufferAttribute(this.colorArray, 4);
+    this.colorAttr.setUsage(THREE.DynamicDrawUsage);
+    this.scaleAttr = new THREE.InstancedBufferAttribute(this.scaleArray, 1);
+    this.scaleAttr.setUsage(THREE.DynamicDrawUsage);
+
+    // Geometry: unit plane
+    const geo = new THREE.PlaneGeometry(1, 1);
+    geo.setAttribute("aLife", this.lifeAttr);
+    geo.setAttribute("aColor", this.colorAttr);
+    geo.setAttribute("aScale", this.scaleAttr);
+
+    // SpriteNodeMaterial with TSL nodes
+    const mat = new SpriteNodeMaterial();
+    mat.transparent = true;
+    mat.depthWrite = false;
+    mat.blending = config.blending;
+    if (config.renderOrder !== undefined) {
+      mat.depthTest = true;
+    }
+
+    // TSL: read per-instance attributes
+    const iColor = instancedBufferAttribute(this.colorAttr, "vec4");
+    const iScale = instancedBufferAttribute(this.scaleAttr, "float");
+
+    // Texture map
+    const texNode = texture(config.tex);
+
+    // Color: instance color RGB * texture
+    mat.colorNode = vec4(
+      vec3(iColor.x, iColor.y, iColor.z).mul(texNode.rgb),
+      texNode.a.mul(iColor.w),
+    );
+    mat.opacityNode = texNode.a.mul(iColor.w);
+    mat.scaleNode = iScale;
+
+    // InstancedMesh
+    this.mesh = new THREE.InstancedMesh(geo, mat, max);
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.count = 0;
+    this.mesh.frustumCulled = false;
+    if (config.renderOrder !== undefined) {
+      this.mesh.renderOrder = config.renderOrder;
+    }
+  }
+
+  update(dt: number, origin: THREE.Vector3): void {
+    const cfg = this.config;
+    const tmpColor = FireParticleEmitter._tmpColor;
+    const tmpMat = FireParticleEmitter._tmpMatrix;
+
+    // Total force = base + wind
+    const forceX = cfg.baseForce.x + this.windForce.x;
+    const forceY = cfg.baseForce.y + this.windForce.y;
+    const forceZ = cfg.baseForce.z + this.windForce.z;
+
+    // Update alive particles
+    let visibleCount = 0;
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i]!;
+      if (!p.alive) continue;
+
+      p.life += dt;
+      if (p.life >= p.maxLife) {
+        p.alive = false;
+        continue;
+      }
+
+      // Apply force
+      p.velocity.x += forceX * dt;
+      p.velocity.y += forceY * dt;
+      p.velocity.z += forceZ * dt;
+
+      // Integrate position
+      p.position.x += p.velocity.x * dt;
+      p.position.y += p.velocity.y * dt;
+      p.position.z += p.velocity.z * dt;
+
+      // Normalized life
+      const t = p.life / p.maxLife;
+
+      // Size over life
+      const sizeScale = lerpStops(
+        cfg.sizeStops.map((s) => ({ value: s.scale, t: s.t })),
+        t,
+      );
+      const finalSize = p.baseSize * sizeScale;
+
+      // Color over life
+      lerpColorStops(cfg.colorStops, t, tmpColor);
+
+      // Opacity over life
+      const opacity = lerpStops(
+        cfg.opacityStops.map((s) => ({ value: s.opacity, t: s.t })),
+        t,
+      );
+
+      // Write per-instance data
+      this.scaleArray[visibleCount] = finalSize;
+      const ci = visibleCount * 4;
+      this.colorArray[ci] = tmpColor.r;
+      this.colorArray[ci + 1] = tmpColor.g;
+      this.colorArray[ci + 2] = tmpColor.b;
+      this.colorArray[ci + 3] = opacity;
+      this.lifeArray[visibleCount] = t;
+
+      // Instance matrix: translation only (SpriteNodeMaterial handles billboard)
+      tmpMat.makeTranslation(p.position.x, p.position.y, p.position.z);
+      this.mesh.setMatrixAt(visibleCount, tmpMat);
+
+      visibleCount++;
+    }
+
+    this.mesh.count = visibleCount;
+    if (visibleCount > 0) {
+      this.mesh.instanceMatrix.needsUpdate = true;
+      this.lifeAttr.needsUpdate = true;
+      this.colorAttr.needsUpdate = true;
+      this.scaleAttr.needsUpdate = true;
+    }
+
+    // Spawn new particles
+    this.spawnAccumulator += this.currentEmissionRate * dt;
+    while (this.spawnAccumulator >= 1) {
+      this.spawnAccumulator -= 1;
+      this.spawnOne(origin);
+    }
+  }
+
+  private spawnOne(origin: THREE.Vector3): void {
+    // Find dead particle
+    let p: Particle | null = null;
+    for (const candidate of this.particles) {
+      if (!candidate.alive) {
+        p = candidate;
+        break;
+      }
+    }
+    if (!p) return;
+
+    const cfg = this.config;
+    const r = this.currentEmitterRadius;
+
+    // Position within emitter shape
+    if (cfg.emitterShape === "cone") {
+      const angle = cfg.coneAngle ?? 0.3;
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.random() * angle;
+      const dist = Math.random() * r;
+      p.position.set(
+        origin.x + Math.sin(phi) * Math.cos(theta) * dist,
+        origin.y,
+        origin.z + Math.sin(phi) * Math.sin(theta) * dist,
+      );
+      // Velocity: upward cone
+      const speed = cfg.speedRange[0] + Math.random() * (cfg.speedRange[1] - cfg.speedRange[0]);
+      p.velocity.set(
+        Math.sin(phi) * Math.cos(theta) * speed * 0.3,
+        speed,
+        Math.sin(phi) * Math.sin(theta) * speed * 0.3,
+      );
+    } else {
+      // Sphere
+      const theta = Math.random() * Math.PI * 2;
+      const phi = Math.acos(2 * Math.random() - 1);
+      const dist = Math.random() * r;
+      p.position.set(
+        origin.x + Math.sin(phi) * Math.cos(theta) * dist,
+        origin.y + Math.cos(phi) * dist * 0.5,
+        origin.z + Math.sin(phi) * Math.sin(theta) * dist,
+      );
+      const speed = cfg.speedRange[0] + Math.random() * (cfg.speedRange[1] - cfg.speedRange[0]);
+      p.velocity.set(
+        Math.sin(phi) * Math.cos(theta) * speed,
+        Math.abs(Math.cos(phi)) * speed,
+        Math.sin(phi) * Math.sin(theta) * speed,
+      );
+    }
+
+    p.maxLife = cfg.lifeRange[0] + Math.random() * (cfg.lifeRange[1] - cfg.lifeRange[0]);
+    p.life = 0;
+    p.baseSize = cfg.sizeRange[0] + Math.random() * (cfg.sizeRange[1] - cfg.sizeRange[0]);
+    p.size = p.baseSize;
+    p.alive = true;
+  }
+
+  dispose(): void {
+    this.mesh.geometry.dispose();
+    (this.mesh.material as THREE.Material).dispose();
+  }
+}
+
+/* ── Fire source particle group ─────────────────────────── */
+
+class FireParticleGroup {
+  flame: FireParticleEmitter;
+  smoke: FireParticleEmitter;
+  ember: FireParticleEmitter;
+  readonly group: THREE.Group;
+
+  private origin = new THREE.Vector3();
+
+  constructor(
+    flameTex: THREE.Texture,
+    smokeTex: THREE.Texture,
+    emberTex: THREE.Texture,
+  ) {
+    this.group = new THREE.Group();
+
+    this.flame = new FireParticleEmitter({
+      type: "flame",
+      maxParticles: 300,
+      emissionRate: 0,
+      lifeRange: [0.4, 1.2],
+      speedRange: [3, 7],
+      sizeRange: [3, 7],
+      emitterRadius: 2,
+      emitterShape: "cone",
+      coneAngle: 0.3,
+      blending: THREE.AdditiveBlending,
+      tex: flameTex,
+      baseForce: new THREE.Vector3(0, 3, 0), // buoyancy
+      colorStops: [
+        { color: new THREE.Color(1, 1, 0.6), t: 0 },
+        { color: new THREE.Color(1, 0.6, 0), t: 0.3 },
+        { color: new THREE.Color(1, 0.2, 0), t: 0.6 },
+        { color: new THREE.Color(0.6, 0, 0), t: 1 },
+      ],
+      opacityStops: [
+        { opacity: 1, t: 0 },
+        { opacity: 1, t: 0.3 },
+        { opacity: 0.6, t: 0.7 },
+        { opacity: 0, t: 1 },
+      ],
+      sizeStops: [
+        { scale: 0.5, t: 0 },
+        { scale: 1, t: 0.3 },
+        { scale: 0.8, t: 0.5 },
+        { scale: 0, t: 1 },
+      ],
+    });
+
+    this.smoke = new FireParticleEmitter({
+      type: "smoke",
+      maxParticles: 200,
+      emissionRate: 0,
+      lifeRange: [2, 5],
+      speedRange: [1, 3],
+      sizeRange: [4, 10],
+      emitterRadius: 2,
+      emitterShape: "sphere",
+      blending: THREE.NormalBlending,
+      tex: smokeTex,
+      baseForce: new THREE.Vector3(0, 1.5, 0), // buoyancy
+      colorStops: [
+        { color: new THREE.Color(0.15, 0.15, 0.15), t: 0 },
+        { color: new THREE.Color(0.3, 0.3, 0.3), t: 0.5 },
+        { color: new THREE.Color(0.4, 0.4, 0.4), t: 1 },
+      ],
+      opacityStops: [
+        { opacity: 0.5, t: 0 },
+        { opacity: 0.4, t: 0.3 },
+        { opacity: 0.2, t: 0.7 },
+        { opacity: 0, t: 1 },
+      ],
+      sizeStops: [
+        { scale: 1, t: 0 },
+        { scale: 1.5, t: 0.3 },
+        { scale: 2, t: 0.6 },
+        { scale: 3, t: 1 },
+      ],
+      renderOrder: -1,
+    });
+
+    this.ember = new FireParticleEmitter({
+      type: "ember",
+      maxParticles: 150,
+      emissionRate: 0,
+      lifeRange: [1, 3],
+      speedRange: [5, 12],
+      sizeRange: [0.4, 0.8],
+      emitterRadius: 1,
+      emitterShape: "sphere",
+      blending: THREE.AdditiveBlending,
+      tex: emberTex,
+      baseForce: new THREE.Vector3(0, -9.8, 0), // gravity
+      colorStops: [
+        { color: new THREE.Color(1, 0.7, 0.2), t: 0 },
+        { color: new THREE.Color(0.8, 0.2, 0), t: 0.5 },
+        { color: new THREE.Color(0.3, 0, 0), t: 1 },
+      ],
+      opacityStops: [
+        { opacity: 1, t: 0 },
+        { opacity: 0.8, t: 0.5 },
+        { opacity: 0, t: 1 },
+      ],
+      sizeStops: [
+        { scale: 1, t: 0 },
+        { scale: 0.8, t: 0.3 },
+        { scale: 0.4, t: 0.6 },
+        { scale: 0, t: 1 },
+      ],
+    });
+
+    this.group.add(this.flame.mesh);
+    this.group.add(this.smoke.mesh);
+    this.group.add(this.ember.mesh);
+  }
+
+  setOrigin(pos: THREE.Vector3): void {
+    this.origin.copy(pos);
+  }
+
+  update(dt: number): void {
+    // Flame origin slightly above ground
+    const flameOrigin = FireParticleGroup._tmpVec.copy(this.origin);
+    flameOrigin.y += 1;
+    this.flame.update(dt, flameOrigin);
+
+    // Smoke origin higher
+    const smokeOrigin = FireParticleGroup._tmpVec2.copy(this.origin);
+    smokeOrigin.y += 3;
+    this.smoke.update(dt, smokeOrigin);
+
+    // Ember origin mid
+    const emberOrigin = FireParticleGroup._tmpVec3.copy(this.origin);
+    emberOrigin.y += 2;
+    this.ember.update(dt, emberOrigin);
+  }
+
+  setWindForce(wx: number, wz: number): void {
+    // Flame: wind + upward
+    this.flame.windForce.set(wx, 0, wz);
+    // Smoke: stronger wind drift
+    this.smoke.windForce.set(wx * 2, 0, wz * 2);
+    // Ember: wind (gravity is in baseForce)
+    this.ember.windForce.set(wx, 0, wz);
+  }
+
+  dispose(): void {
+    this.flame.dispose();
+    this.smoke.dispose();
+    this.ember.dispose();
+  }
+
+  private static _tmpVec = new THREE.Vector3();
+  private static _tmpVec2 = new THREE.Vector3();
+  private static _tmpVec3 = new THREE.Vector3();
+}
+
 /* ── Constants ─────────────────────────────────────────────── */
 
 const DELAY_SEC = 10;
@@ -114,15 +577,8 @@ interface FireSource {
   scorchMesh: THREE.Mesh;
   scorchMat: THREE.MeshBasicMaterial;
 
-  // particle systems
-  flameSystem: ParticleSystem;
-  smokeSystem: ParticleSystem;
-  emberSystem: ParticleSystem;
-
-  // mutable behavior refs for wind updates
-  flameForce: ApplyForce;
-  smokeForce: ApplyForce;
-  emberForce: ApplyForce;
+  // particle group
+  particles: FireParticleGroup;
 }
 
 interface WindState {
@@ -141,7 +597,6 @@ class FireSourceManager {
   private sampler?: HeightSampler;
   private wind: WindState;
   private systemElapsed = 0;
-  private batchedRenderer: BatchedRenderer;
   private maxFires: number;
 
   // Shared textures (created once, reused across all fire sources)
@@ -154,10 +609,6 @@ class FireSourceManager {
     this.eventBus = eventBus;
     this.sampler = sampler;
     this.maxFires = maxFires ?? MAX_FIRES;
-
-    // BatchedRenderer manages GPU-instanced particle rendering
-    this.batchedRenderer = new BatchedRenderer();
-    this.scene.add(this.batchedRenderer);
 
     // Create procedural textures once
     this.flameTex = makeFlameTexture();
@@ -199,161 +650,11 @@ class FireSourceManager {
     const scorchMesh = new THREE.Mesh(new THREE.CircleGeometry(1, 24), scorchMat);
     scorchMesh.visible = false;
 
-    // Wind force direction (shared across particle systems, updated per frame)
-    const windDir = new QVector3(
-      this.wind.direction.x * this.wind.speed,
-      0,
-      this.wind.direction.y * this.wind.speed,
-    );
-
-    // ── Flame particle system ──
-    const flameForce = new ApplyForce(
-      new QVector3(windDir.x, 1, windDir.z), // upward + wind
-      new ConstantValue(3),
-    );
-    const flameMat = new THREE.MeshBasicMaterial({
-      map: this.flameTex,
-      color: 0xffffff,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const flameSystem = new ParticleSystem({
-      duration: 5,
-      looping: true,
-      worldSpace: true,
-      shape: new ConeEmitter({ radius: 2, angle: 0.3 }), // narrow upward cone
-      startLife: new IntervalValue(0.4, 1.2),
-      startSpeed: new IntervalValue(3, 7),
-      startSize: new IntervalValue(3, 7),
-      startColor: new ConstantColor(new QVector4(1, 1, 0.7, 1)), // warm yellow-white
-      emissionOverTime: new ConstantValue(0), // starts at 0, scaled with intensity
-      material: flameMat,
-      renderMode: RenderMode.BillBoard,
-      behaviors: [
-        new ColorOverLife(new Gradient(
-          [
-            [new QVector3(1, 1, 0.6), 0],    // yellow-white
-            [new QVector3(1, 0.6, 0), 0.3],  // orange
-            [new QVector3(1, 0.2, 0), 0.6],  // red-orange
-            [new QVector3(0.6, 0, 0), 1],    // dark red
-          ],
-          [
-            [1, 0],
-            [1, 0.3],
-            [0.6, 0.7],
-            [0, 1],
-          ],
-        )),
-        new SizeOverLife(new PiecewiseBezier([
-          [new Bezier(0.5, 1, 1, 0.8), 0.5],   // grow
-          [new Bezier(0.8, 0.6, 0.3, 0), 1],    // shrink
-        ])),
-        flameForce,
-      ],
-    });
-    flameSystem.emitter.position.set(0, 1, 0);
-    group.add(flameSystem.emitter);
-    this.batchedRenderer.addSystem(flameSystem);
-
-    // ── Smoke particle system ──
-    const smokeForce = new ApplyForce(
-      new QVector3(windDir.x * 2, 1.5, windDir.z * 2), // stronger wind drift + buoyancy
-      new ConstantValue(2),
-    );
-    const smokeMat = new THREE.MeshBasicMaterial({
-      map: this.smokeTex,
-      color: 0x888888,
-      transparent: true,
-      opacity: 0.8,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const smokeSystem = new ParticleSystem({
-      duration: 5,
-      looping: true,
-      worldSpace: true,
-      shape: new SphereEmitter({ radius: 2 }),
-      startLife: new IntervalValue(2, 5),
-      startSpeed: new IntervalValue(1, 3),
-      startSize: new IntervalValue(4, 10),
-      startColor: new ConstantColor(new QVector4(0.15, 0.15, 0.15, 0.5)), // dark gray
-      emissionOverTime: new ConstantValue(0),
-      material: smokeMat,
-      renderMode: RenderMode.BillBoard,
-      renderOrder: -1, // render behind flames
-      behaviors: [
-        new ColorOverLife(new Gradient(
-          [
-            [new QVector3(0.15, 0.15, 0.15), 0],  // dark gray
-            [new QVector3(0.3, 0.3, 0.3), 0.5],   // lighter gray
-            [new QVector3(0.4, 0.4, 0.4), 1],     // light gray
-          ],
-          [
-            [0.5, 0],
-            [0.4, 0.3],
-            [0.2, 0.7],
-            [0, 1],
-          ],
-        )),
-        new SizeOverLife(new PiecewiseBezier([
-          [new Bezier(1, 1.5, 2, 3), 1], // expand over lifetime
-        ])),
-        smokeForce,
-      ],
-    });
-    smokeSystem.emitter.position.set(0, 3, 0);
-    group.add(smokeSystem.emitter);
-    this.batchedRenderer.addSystem(smokeSystem);
-
-    // ── Ember particle system ──
-    const emberForce = new ApplyForce(
-      new QVector3(windDir.x, -9.8, windDir.z), // gravity + wind
-      new ConstantValue(1),
-    );
-    const emberMat = new THREE.MeshBasicMaterial({
-      map: this.emberTex,
-      color: 0xffffff,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const emberSystem = new ParticleSystem({
-      duration: 5,
-      looping: true,
-      worldSpace: true,
-      shape: new SphereEmitter({ radius: 1 }),
-      startLife: new IntervalValue(1, 3),
-      startSpeed: new IntervalValue(5, 12),
-      startSize: new IntervalValue(0.4, 0.8),
-      startColor: new ConstantColor(new QVector4(1, 0.7, 0.2, 1)), // orange-yellow
-      emissionOverTime: new ConstantValue(0),
-      material: emberMat,
-      renderMode: RenderMode.BillBoard,
-      behaviors: [
-        new ColorOverLife(new Gradient(
-          [
-            [new QVector3(1, 0.7, 0.2), 0],   // bright orange
-            [new QVector3(0.8, 0.2, 0), 0.5],  // dim red
-            [new QVector3(0.3, 0, 0), 1],      // dark red
-          ],
-          [
-            [1, 0],
-            [0.8, 0.5],
-            [0, 1],
-          ],
-        )),
-        new SizeOverLife(new PiecewiseBezier([
-          [new Bezier(1, 0.8, 0.4, 0), 1], // shrink over life
-        ])),
-        emberForce,
-      ],
-    });
-    emberSystem.emitter.position.set(0, 2, 0);
-    group.add(emberSystem.emitter);
-    this.batchedRenderer.addSystem(emberSystem);
+    // Particle group
+    const particles = new FireParticleGroup(this.flameTex, this.smokeTex, this.emberTex);
+    particles.setOrigin(pos);
+    // Add particle meshes directly to scene (world space)
+    this.scene.add(particles.group);
 
     this.scene.add(group);
 
@@ -372,12 +673,7 @@ class FireSourceManager {
       light,
       scorchMesh,
       scorchMat,
-      flameSystem,
-      smokeSystem,
-      emberSystem,
-      flameForce,
-      smokeForce,
-      emberForce,
+      particles,
     };
 
     this.sources.push(source);
@@ -395,8 +691,11 @@ class FireSourceManager {
       this.trySpawnChildren(src, dt);
     }
 
-    // Update all particle systems through the batched renderer
-    this.batchedRenderer.update(dt);
+    // Update all particle groups
+    for (const src of this.sources) {
+      if (src.isDead) continue;
+      src.particles.update(dt);
+    }
   }
 
   emitEvents(): void {
@@ -498,30 +797,22 @@ class FireSourceManager {
     const flicker = 0.85 + 0.15 * Math.sin(age * 12);
 
     // Scale emission rates with intensity
-    src.flameSystem.emissionOverTime = new ConstantValue(t * 60);
-    src.smokeSystem.emissionOverTime = new ConstantValue(t * 15);
-    src.emberSystem.emissionOverTime = new ConstantValue(t * 12);
+    src.particles.flame.currentEmissionRate = t * 60;
+    src.particles.smoke.currentEmissionRate = t * 15;
+    src.particles.ember.currentEmissionRate = t * 12;
 
     // Scale emitter radius with fire spread
-    const emitterShape = src.flameSystem.emitterShape;
-    if (emitterShape instanceof ConeEmitter) {
-      emitterShape.radius = Math.max(1, src.radius * 0.3);
-    }
-    const smokeShape = src.smokeSystem.emitterShape;
-    if (smokeShape instanceof SphereEmitter) {
-      smokeShape.radius = Math.max(1, src.radius * 0.3);
-    }
-    const emberShape = src.emberSystem.emitterShape;
-    if (emberShape instanceof SphereEmitter) {
-      emberShape.radius = Math.max(0.5, src.radius * 0.15);
-    }
+    src.particles.flame.currentEmitterRadius = Math.max(1, src.radius * 0.3);
+    src.particles.smoke.currentEmitterRadius = Math.max(1, src.radius * 0.3);
+    src.particles.ember.currentEmitterRadius = Math.max(0.5, src.radius * 0.15);
 
     // Update wind force directions
     const wx = this.wind.direction.x * this.wind.speed;
     const wz = this.wind.direction.y * this.wind.speed;
-    src.flameForce.direction.set(wx, 1, wz);
-    src.smokeForce.direction.set(wx * 2, 1.5, wz * 2);
-    src.emberForce.direction.set(wx, -9.8, wz);
+    src.particles.setWindForce(wx, wz);
+
+    // Update origin (in case position changes)
+    src.particles.setOrigin(src.position);
 
     // Light
     src.light.intensity = src.intensity * 80 * flicker;

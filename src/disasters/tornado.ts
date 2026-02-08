@@ -11,6 +11,15 @@
  */
 
 import * as THREE from "three";
+import { SpriteNodeMaterial, MeshBasicNodeMaterial } from "three/webgpu";
+import {
+  uniform, attribute,
+  float, vec2, vec3, vec4,
+  sin, cos, fract, floor, dot, mix, smoothstep, pow, abs, clamp, length,
+  uv, positionLocal, cameraProjectionMatrix, modelViewMatrix, modelWorldMatrix,
+  Fn, Discard,
+  varying,
+} from "three/tsl";
 import type { BuildingRecord, TreeRecord, CarRecord } from "../layers.ts";
 import {
   getTerrainHeight,
@@ -54,157 +63,60 @@ const FUNNEL_PARTICLES = 12000;
 const MAX_DEBRIS       = 350;
 const FUNNEL_HEIGHT    = 280;
 
-// ─── Shaders ────────────────────────────────────────────────────────────────
+// ─── TSL noise helpers ──────────────────────────────────────────────────────
 
-// Particle shaders
-const VERT_SHADER = /* glsl */ `
-  uniform float uTime;
-  attribute float pSize;
-  attribute float pAlpha;
-  attribute vec3  pColor;
-  varying float vAlpha;
-  varying vec3  vColor;
+/** hash21: vec2 → float (value noise hash) */
+const hash21_tsl = /*#__PURE__*/ Fn(([p_immutable]: [any]) => {
+  const p = vec2(p_immutable);
+  return fract(sin(dot(p, vec2(127.1, 311.7))).mul(43758.5453));
+});
 
-  void main() {
-    float pulse = 1.0 + 0.18 * sin(uTime * 3.5 + position.y * 0.06 + position.x * 0.12);
-    vAlpha = pAlpha * pulse;
-    vColor = pColor;
-    vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
-    float dist = length(mvPos.xyz);
-    gl_PointSize = pSize * pulse * (400.0 / max(dist, 40.0));
-    gl_PointSize = clamp(gl_PointSize, 1.5, 140.0);
-    gl_Position  = projectionMatrix * mvPos;
-  }
-`;
+/** noise2d: vec2 → float (value noise) */
+const noise2d_tsl = /*#__PURE__*/ Fn(([p_immutable]: [any]) => {
+  const p = vec2(p_immutable);
+  const i = floor(p);
+  const f = fract(p);
+  const a = hash21_tsl(i);
+  const b = hash21_tsl(i.add(vec2(1.0, 0.0)));
+  const c = hash21_tsl(i.add(vec2(0.0, 1.0)));
+  const d = hash21_tsl(i.add(vec2(1.0, 1.0)));
+  const u = f.mul(f).mul(float(3.0).sub(f.mul(2.0)));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+});
 
-const FRAG_SHADER = /* glsl */ `
-  varying float vAlpha;
-  varying vec3  vColor;
+/** hash22: vec2 → vec2 (gradient noise hash) */
+const hash22_tsl = /*#__PURE__*/ Fn(([p_immutable]: [any]) => {
+  const p = vec2(p_immutable);
+  const px = dot(p, vec2(127.1, 311.7));
+  const py = dot(p, vec2(269.5, 183.3));
+  return fract(sin(vec2(px, py)).mul(43758.5453)).mul(2.0).sub(1.0);
+});
 
-  float hash21(vec2 p) {
-    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
-  }
+/** gradient noise2d for funnel mesh */
+const gradNoise2d_tsl = /*#__PURE__*/ Fn(([p_immutable]: [any]) => {
+  const p = vec2(p_immutable);
+  const i = floor(p);
+  const f = fract(p);
+  const u = f.mul(f).mul(float(3.0).sub(f.mul(2.0)));
+  const a = dot(hash22_tsl(i), f);
+  const b = dot(hash22_tsl(i.add(vec2(1.0, 0.0))), f.sub(vec2(1.0, 0.0)));
+  const c = dot(hash22_tsl(i.add(vec2(0.0, 1.0))), f.sub(vec2(0.0, 1.0)));
+  const d = dot(hash22_tsl(i.add(vec2(1.0, 1.0))), f.sub(vec2(1.0, 1.0)));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+});
 
-  float noise2d(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    float a = hash21(i);
-    float b = hash21(i + vec2(1.0, 0.0));
-    float c = hash21(i + vec2(0.0, 1.0));
-    float d = hash21(i + vec2(1.0, 1.0));
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-  }
-
-  void main() {
-    float d = length(gl_PointCoord - vec2(0.5));
-    if (d > 0.5) discard;
-    float edge = smoothstep(0.5, 0.0, d);
-    float grain = noise2d(gl_PointCoord * 8.0 + vColor.xy * 10.0);
-    float alpha = vAlpha * edge * (0.75 + 0.4 * grain);
-    vec3 col = vColor * (0.85 + 0.3 * grain);
-    gl_FragColor = vec4(col, alpha);
-  }
-`;
-
-// Funnel mesh shaders — procedural swirling wind texture
-const FUNNEL_VERT = /* glsl */ `
-  uniform float uTime;
-  uniform vec2  uBendDir;
-  uniform float uBendStrength;
-  varying vec2  vUv;
-  varying vec3  vWorldPos;
-  varying float vHeightNorm;
-
-  void main() {
-    vUv = uv;
-    vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
-    // v goes 0→1 bottom→top in the LatheGeometry
-    vHeightNorm = uv.y;
-    vec3 pos = position;
-    float bend = pow(vHeightNorm, 1.6) * uBendStrength;
-    pos.x += uBendDir.x * bend;
-    pos.z += uBendDir.y * bend;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
-  }
-`;
-
-const FUNNEL_FRAG = /* glsl */ `
-  uniform float uTime;
-  uniform float uDarkness;   // 0 = light/wispy, 1 = very dark
-  uniform float uOpacity;    // overall opacity multiplier
-  uniform float uTopFade;    // height (0-1) where top fade begins
-  varying vec2  vUv;
-  varying vec3  vWorldPos;
-  varying float vHeightNorm;
-
-  // Simplex-like hash noise
-  vec2 hash22(vec2 p) {
-    p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
-    return -1.0 + 2.0 * fract(sin(p) * 43758.5453);
-  }
-
-  float noise2d(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    return mix(
-      mix(dot(hash22(i + vec2(0,0)), f - vec2(0,0)),
-          dot(hash22(i + vec2(1,0)), f - vec2(1,0)), u.x),
-      mix(dot(hash22(i + vec2(0,1)), f - vec2(0,1)),
-          dot(hash22(i + vec2(1,1)), f - vec2(1,1)), u.x),
-      u.y
-    );
-  }
-
-  float fbm(vec2 p) {
-    float v = 0.0;
-    float a = 0.5;
-    for (int i = 0; i < 4; i++) {
-      v += a * noise2d(p);
-      p *= 2.1;
-      a *= 0.5;
-    }
-    return v;
-  }
-
-  void main() {
-    float h = vHeightNorm;
-
-    // Swirling wind bands: scroll around the funnel and upward
-    float angle = vUv.x * 6.2832;  // 0→2π around circumference
-    float windU = angle * 1.5 + uTime * 2.5 + h * 3.0;
-    float windV = h * 8.0 - uTime * 1.8;
-
-    // Multi-octave noise for turbulent wind texture
-    float n1 = fbm(vec2(windU, windV) * 0.8);
-    float n2 = fbm(vec2(windU * 1.3 + 5.0, windV * 0.7 + 3.0) * 1.2);
-    float n3 = noise2d(vec2(windU * 2.0, windV * 1.5) + uTime * 0.5);
-
-    float windPattern = n1 * 0.5 + n2 * 0.3 + n3 * 0.2;
-    float streak = abs(sin(windU * 1.6 + windV * 0.8));
-    float detail = mix(0.7, 1.2, streak) * (0.8 + 0.2 * windPattern);
-
-    // Colour: dark core with lighter wind streaks
-    float baseBright = 0.08 + (1.0 - uDarkness) * 0.25;
-    float streaks = baseBright + windPattern * (0.12 + (1.0 - uDarkness) * 0.08);
-    streaks *= detail;
-    // Slight blue-grey tint
-    vec3 col = vec3(streaks, streaks, streaks + 0.03);
-
-    // Alpha: solid at base, fading toward top; wind bands modulate
-    float baseAlpha = mix(0.9, 0.3, h * h);
-    float windAlpha = (1.0 + windPattern * 0.3) * (0.85 + 0.35 * detail);
-    float alpha = baseAlpha * windAlpha * uOpacity;
-    float groundBoost = smoothstep(0.0, 0.15, h) * (1.0 - h);
-    alpha *= 1.0 + groundBoost * 0.35;
-
-    // Edge softening — fade at the very edges of the mesh
-    alpha *= smoothstep(0.0, 0.06, h) * smoothstep(1.0, uTopFade, h);
-
-    gl_FragColor = vec4(col, clamp(alpha, 0.0, 1.0));
-  }
-`;
+/** fbm: 4-octave fractal Brownian motion */
+const fbm_tsl = /*#__PURE__*/ Fn(([p_immutable]: [any]) => {
+  let p = vec2(p_immutable);
+  const v0 = gradNoise2d_tsl(p).mul(0.5);
+  const p1 = p.mul(2.1);
+  const v1 = gradNoise2d_tsl(p1).mul(0.25);
+  const p2 = p1.mul(2.1);
+  const v2 = gradNoise2d_tsl(p2).mul(0.125);
+  const p3 = p2.mul(2.1);
+  const v3 = gradNoise2d_tsl(p3).mul(0.0625);
+  return v0.add(v1).add(v2).add(v3);
+});
 
 // ─── Internal types ─────────────────────────────────────────────────────────
 
@@ -264,12 +176,27 @@ export class TornadoSimulator {
   private tornadoGroup: THREE.Group;
   private debrisGroup: THREE.Group;
   private cloudGroup!: THREE.Group;
-  private funnelPoints!: THREE.Points;
-  private funnelMat!: THREE.ShaderMaterial;
+  private funnelPoints!: THREE.InstancedMesh;
+  private funnelMat!: SpriteNodeMaterial;
   private coneMesh!: THREE.Mesh;
-  private coneMat!: THREE.ShaderMaterial;
+  private coneMat!: MeshBasicNodeMaterial;
   private innerConeMesh!: THREE.Mesh;
-  private innerConeMat!: THREE.ShaderMaterial;
+  private innerConeMat!: MeshBasicNodeMaterial;
+  // TSL uniform nodes for funnel mesh shaders
+  private coneTimeUniform = uniform(0.0);
+  private coneDarknessUniform = uniform(0.0);
+  private coneOpacityUniform = uniform(1.0);
+  private coneBendDirUniform = uniform(new THREE.Vector2(1, 0));
+  private coneBendStrengthUniform = uniform(0.0);
+  private coneTopFadeUniform = uniform(0.92);
+  private innerConeTimeUniform = uniform(0.0);
+  private innerConeDarknessUniform = uniform(0.0);
+  private innerConeOpacityUniform = uniform(1.0);
+  private innerConeBendDirUniform = uniform(new THREE.Vector2(1, 0));
+  private innerConeBendStrengthUniform = uniform(0.0);
+  private innerConeTopFadeUniform = uniform(0.72);
+  // TSL uniform for particle system
+  private particleTimeUniform = uniform(0.0);
   private cloudScale = 1;
   private pathWidthMeters = 0;
   private bendDir = new THREE.Vector2(1, 0);
@@ -317,16 +244,16 @@ export class TornadoSimulator {
     this.tornadoGroup.add(this.funnelPoints);
 
     // Smooth LatheGeometry funnel meshes — procedural wind-texture shader
-    const outer = this.createFunnelMesh(1.1, this.efOpacityOuter());
+    const outer = this.createFunnelMesh(1.1, this.efOpacityOuter(), this.coneTimeUniform, this.coneDarknessUniform, this.coneOpacityUniform, this.coneBendDirUniform, this.coneBendStrengthUniform, this.coneTopFadeUniform);
     this.coneMesh = outer.mesh;
     this.coneMat  = outer.mat;
-    this.coneMat.uniforms.uTopFade.value = 0.92;
+    this.coneTopFadeUniform.value = 0.92;
     this.tornadoGroup.add(this.coneMesh);
 
-    const inner = this.createFunnelMesh(0.55, this.efOpacityInner());
+    const inner = this.createFunnelMesh(0.55, this.efOpacityInner(), this.innerConeTimeUniform, this.innerConeDarknessUniform, this.innerConeOpacityUniform, this.innerConeBendDirUniform, this.innerConeBendStrengthUniform, this.innerConeTopFadeUniform);
     this.innerConeMesh = inner.mesh;
     this.innerConeMat  = inner.mat;
-    this.innerConeMat.uniforms.uTopFade.value = 0.72;
+    this.innerConeTopFadeUniform.value = 0.72;
     this.tornadoGroup.add(this.innerConeMesh);
 
     // Storm cloud base at the top of the funnel
@@ -368,12 +295,12 @@ export class TornadoSimulator {
   private updateFunnelAppearance() {
     const d = this.efDarkness();
     if (this.coneMat) {
-      this.coneMat.uniforms.uDarkness.value = d;
-      this.coneMat.uniforms.uOpacity.value  = this.efOpacityOuter();
+      this.coneDarknessUniform.value = d;
+      this.coneOpacityUniform.value  = this.efOpacityOuter();
     }
     if (this.innerConeMat) {
-      this.innerConeMat.uniforms.uDarkness.value = d;
-      this.innerConeMat.uniforms.uOpacity.value  = this.efOpacityInner();
+      this.innerConeDarknessUniform.value = d;
+      this.innerConeOpacityUniform.value  = this.efOpacityInner();
     }
     // Cloud darkness/opacity scale with EF
     if (this.cloudOuterMat) {
@@ -547,27 +474,78 @@ export class TornadoSimulator {
   // Funnel particle system
   // ─────────────────────────────────────────────────────────────────────────
 
-  private createFunnelSystem(): THREE.Points {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(FUNNEL_PARTICLES * 3), 3));
-    geo.setAttribute("pSize",    new THREE.BufferAttribute(new Float32Array(FUNNEL_PARTICLES), 1));
-    geo.setAttribute("pAlpha",   new THREE.BufferAttribute(new Float32Array(FUNNEL_PARTICLES), 1));
-    geo.setAttribute("pColor",   new THREE.BufferAttribute(new Float32Array(FUNNEL_PARTICLES * 3), 3));
+  private createFunnelSystem(): THREE.InstancedMesh {
+    // Use a small quad as base geometry for each particle (replaces GL_POINTS)
+    const quadGeo = new THREE.PlaneGeometry(1, 1);
 
-    this.funnelMat = new THREE.ShaderMaterial({
-      uniforms: { uTime: { value: 0.0 } },
-      vertexShader: VERT_SHADER,
-      fragmentShader: FRAG_SHADER,
-      transparent: true,
-      depthWrite: false,
-      blending: THREE.NormalBlending,
-    });
+    // Per-instance attributes
+    const positionAttr = new THREE.InstancedBufferAttribute(new Float32Array(FUNNEL_PARTICLES * 3), 3);
+    const pSizeAttr    = new THREE.InstancedBufferAttribute(new Float32Array(FUNNEL_PARTICLES), 1);
+    const pAlphaAttr   = new THREE.InstancedBufferAttribute(new Float32Array(FUNNEL_PARTICLES), 1);
+    const pColorAttr   = new THREE.InstancedBufferAttribute(new Float32Array(FUNNEL_PARTICLES * 3), 3);
 
-    return new THREE.Points(geo, this.funnelMat);
+    quadGeo.setAttribute("instancePosition", positionAttr);
+    quadGeo.setAttribute("pSize",            pSizeAttr);
+    quadGeo.setAttribute("pAlpha",           pAlphaAttr);
+    quadGeo.setAttribute("pColor",           pColorAttr);
+
+    const uTime = this.particleTimeUniform;
+
+    // TSL material
+    this.funnelMat = new SpriteNodeMaterial();
+    this.funnelMat.transparent = true;
+    this.funnelMat.depthWrite = false;
+    this.funnelMat.blending = THREE.NormalBlending;
+
+    // Read per-instance attributes
+    const instPos   = attribute("instancePosition");
+    const instSize  = attribute("pSize");
+    const instAlpha = attribute("pAlpha");
+    const instColor = attribute("pColor");
+
+    // Vertex: billboard quad scaled by pSize with pulse and distance attenuation
+    const pulse = float(1.0).add(float(0.18).mul(sin(uTime.mul(3.5).add(instPos.y.mul(0.06)).add(instPos.x.mul(0.12)))));
+    const mvPos = modelViewMatrix.mul(vec4(instPos, 1.0));
+    const dist = length(mvPos.xyz);
+    const rawSize = instSize.mul(pulse).mul(float(400.0).div(dist.max(40.0)));
+    const finalSize = clamp(rawSize, 1.5, 140.0);
+
+    // SpriteNodeMaterial uses scaleNode to control sprite size
+    this.funnelMat.scaleNode = vec2(finalSize, finalSize);
+
+    // Pass varyings to fragment
+    const vAlpha = varying(instAlpha.mul(pulse), "vAlpha");
+    const vColor = varying(instColor, "vColor");
+
+    // Position node: use instanced position
+    this.funnelMat.positionNode = instPos;
+
+    // Fragment: radial falloff, noise grain, color modulation
+    const uvCoord = uv();
+    const d = length(uvCoord.sub(vec2(0.5, 0.5)));
+    const edge = smoothstep(0.5, 0.0, d);
+    const grain = noise2d_tsl(uvCoord.mul(8.0).add(vColor.xy.mul(10.0)));
+    const alpha = vAlpha.mul(edge).mul(float(0.75).add(grain.mul(0.4)));
+    const col = vColor.mul(float(0.85).add(grain.mul(0.3)));
+
+    // Discard pixels outside the circle
+    Discard(d.greaterThan(0.5));
+
+    this.funnelMat.colorNode = col;
+    this.funnelMat.opacityNode = alpha;
+
+    const mesh = new THREE.InstancedMesh(quadGeo, this.funnelMat, FUNNEL_PARTICLES);
+    mesh.frustumCulled = false;
+    return mesh;
   }
 
-  /** Smooth LatheGeometry funnel with procedural wind-texture shader. */
-  private createFunnelMesh(radiusScale: number, opacity: number): { mesh: THREE.Mesh; mat: THREE.ShaderMaterial } {
+  /** Smooth LatheGeometry funnel with procedural wind-texture TSL shader. */
+  private createFunnelMesh(
+    radiusScale: number, opacity: number,
+    uTime: ReturnType<typeof uniform>, uDarkness: ReturnType<typeof uniform>,
+    uOpacity: ReturnType<typeof uniform>, uBendDir: ReturnType<typeof uniform>,
+    uBendStrength: ReturnType<typeof uniform>, uTopFade: ReturnType<typeof uniform>,
+  ): { mesh: THREE.Mesh; mat: MeshBasicNodeMaterial } {
     const pts: THREE.Vector2[] = [];
     const segs = 48;
     for (let i = 0; i <= segs; i++) {
@@ -578,21 +556,57 @@ export class TornadoSimulator {
     const geo = new THREE.LatheGeometry(pts, 128);
 
     const darkness = this.efDarkness();
-    const mat = new THREE.ShaderMaterial({
-      uniforms: {
-        uTime:     { value: 0.0 },
-        uDarkness: { value: darkness },
-        uOpacity:  { value: opacity },
-        uBendDir:  { value: new THREE.Vector2(1, 0) },
-        uBendStrength: { value: 0.0 },
-        uTopFade: { value: 0.92 },
-      },
-      vertexShader: FUNNEL_VERT,
-      fragmentShader: FUNNEL_FRAG,
-      transparent: true,
-      depthWrite: false,
-      side: THREE.DoubleSide,
-    });
+    uDarkness.value = darkness;
+    uOpacity.value = opacity;
+
+    const mat = new MeshBasicNodeMaterial();
+    mat.transparent = true;
+    mat.depthWrite = false;
+    mat.side = THREE.DoubleSide;
+
+    // ── Vertex: bend offset based on height ──
+    const uvNode = uv();
+    const heightNorm = uvNode.y; // 0→1 bottom→top in LatheGeometry
+    const bendAmount = pow(heightNorm, 1.6).mul(uBendStrength);
+    const pos = positionLocal.toVar();
+    const bentPos = vec3(
+      pos.x.add(uBendDir.x.mul(bendAmount)),
+      pos.y,
+      pos.z.add(uBendDir.y.mul(bendAmount)),
+    );
+    mat.positionNode = bentPos;
+
+    // ── Fragment: FBM noise wind patterns ──
+    const h = heightNorm;
+    const angle = uvNode.x.mul(6.2832); // 0→2π around circumference
+    const windU = angle.mul(1.5).add(uTime.mul(2.5)).add(h.mul(3.0));
+    const windV = h.mul(8.0).sub(uTime.mul(1.8));
+
+    // Multi-octave noise for turbulent wind texture
+    const n1 = fbm_tsl(vec2(windU, windV).mul(0.8));
+    const n2 = fbm_tsl(vec2(windU.mul(1.3).add(5.0), windV.mul(0.7).add(3.0)).mul(1.2));
+    const n3 = noise2d_tsl(vec2(windU.mul(2.0), windV.mul(1.5)).add(uTime.mul(0.5)));
+
+    const windPattern = n1.mul(0.5).add(n2.mul(0.3)).add(n3.mul(0.2));
+    const streak = abs(sin(windU.mul(1.6).add(windV.mul(0.8))));
+    const detail = mix(float(0.7), float(1.2), streak).mul(float(0.8).add(windPattern.mul(0.2)));
+
+    // Colour: dark core with lighter wind streaks
+    const baseBright = float(0.08).add(float(1.0).sub(uDarkness).mul(0.25));
+    const streaks = baseBright.add(windPattern.mul(float(0.12).add(float(1.0).sub(uDarkness).mul(0.08)))).mul(detail);
+    // Slight blue-grey tint
+    const col = vec3(streaks, streaks, streaks.add(0.03));
+
+    // Alpha: solid at base, fading toward top; wind bands modulate
+    const baseAlpha = mix(float(0.9), float(0.3), h.mul(h));
+    const windAlpha = float(1.0).add(windPattern.mul(0.3)).mul(float(0.85).add(detail.mul(0.35)));
+    const groundBoost = smoothstep(0.0, 0.15, h).mul(float(1.0).sub(h));
+    const alpha = baseAlpha.mul(windAlpha).mul(uOpacity).mul(float(1.0).add(groundBoost.mul(0.35)));
+    // Edge softening
+    const finalAlpha = alpha.mul(smoothstep(0.0, 0.06, h)).mul(smoothstep(1.0, uTopFade, h));
+
+    mat.colorNode = col;
+    mat.opacityNode = clamp(finalAlpha, 0.0, 1.0);
 
     return { mesh: new THREE.Mesh(geo, mat), mat };
   }
@@ -758,9 +772,9 @@ export class TornadoSimulator {
 
   private initFunnel() {
     this.funnelData = [];
-    const sArr = (this.funnelPoints.geometry.attributes.pSize  as THREE.BufferAttribute).array as Float32Array;
-    const aArr = (this.funnelPoints.geometry.attributes.pAlpha as THREE.BufferAttribute).array as Float32Array;
-    const cArr = (this.funnelPoints.geometry.attributes.pColor as THREE.BufferAttribute).array as Float32Array;
+    const sArr = (this.funnelPoints.geometry.attributes.pSize  as THREE.InstancedBufferAttribute).array as Float32Array;
+    const aArr = (this.funnelPoints.geometry.attributes.pAlpha as THREE.InstancedBufferAttribute).array as Float32Array;
+    const cArr = (this.funnelPoints.geometry.attributes.pColor as THREE.InstancedBufferAttribute).array as Float32Array;
     const sizeScale = THREE.MathUtils.clamp(this.coreRadius / 50, 0.35, 2.4);
 
     for (let i = 0; i < FUNNEL_PARTICLES; i++) {
@@ -841,16 +855,16 @@ export class TornadoSimulator {
       }
     }
 
-    (this.funnelPoints.geometry.attributes.pSize  as THREE.BufferAttribute).needsUpdate = true;
-    (this.funnelPoints.geometry.attributes.pAlpha as THREE.BufferAttribute).needsUpdate = true;
-    (this.funnelPoints.geometry.attributes.pColor as THREE.BufferAttribute).needsUpdate = true;
+    (this.funnelPoints.geometry.attributes.pSize  as THREE.InstancedBufferAttribute).needsUpdate = true;
+    (this.funnelPoints.geometry.attributes.pAlpha as THREE.InstancedBufferAttribute).needsUpdate = true;
+    (this.funnelPoints.geometry.attributes.pColor as THREE.InstancedBufferAttribute).needsUpdate = true;
   }
 
   private updateFunnel(dt: number) {
-    this.funnelMat.uniforms.uTime!.value = this.time;
+    this.particleTimeUniform.value = this.time;
     this.updateBend(dt);
 
-    const posArr = (this.funnelPoints.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array;
+    const posArr = (this.funnelPoints.geometry.attributes.instancePosition as THREE.InstancedBufferAttribute).array as Float32Array;
     for (let i = 0; i < FUNNEL_PARTICLES; i++) {
       const p = this.funnelData[i]!;
       p.angle += p.angularSpeed * dt;
@@ -864,15 +878,15 @@ export class TornadoSimulator {
       posArr[i * 3 + 1] = Math.max(0, h);
       posArr[i * 3 + 2] = r * Math.sin(p.angle) + bend.y;
     }
-    (this.funnelPoints.geometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
+    (this.funnelPoints.geometry.attributes.instancePosition as THREE.InstancedBufferAttribute).needsUpdate = true;
 
     // Tick funnel shader time uniforms
-    this.coneMat.uniforms.uTime.value = this.time;
-    this.innerConeMat.uniforms.uTime.value = this.time;
-    this.coneMat.uniforms.uBendDir.value.copy(this.bendDir);
-    this.innerConeMat.uniforms.uBendDir.value.copy(this.bendDir);
-    this.coneMat.uniforms.uBendStrength.value = this.bendStrength;
-    this.innerConeMat.uniforms.uBendStrength.value = this.bendStrength * 0.9;
+    this.coneTimeUniform.value = this.time;
+    this.innerConeTimeUniform.value = this.time;
+    (this.coneBendDirUniform.value as THREE.Vector2).copy(this.bendDir);
+    (this.innerConeBendDirUniform.value as THREE.Vector2).copy(this.bendDir);
+    this.coneBendStrengthUniform.value = this.bendStrength;
+    this.innerConeBendStrengthUniform.value = this.bendStrength * 0.9;
 
     // Animate cone meshes
     this.coneMesh.rotation.y      += 0.5 * dt;

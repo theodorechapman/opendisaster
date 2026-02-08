@@ -1,4 +1,5 @@
 import * as THREE from "three";
+import { WebGPURenderer } from "three/webgpu";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { fetchLayers } from "./tiles.ts";
 import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, resetCarsToBase, sceneGroupRef, roadLinesRef } from "./layers.ts";
@@ -23,17 +24,18 @@ import { RoadGraph } from "./agents/RoadGraph.ts";
 import { Position } from "./core/Components.ts";
 import { ReplayCaptureSystem } from "./replay/ReplayCaptureSystem.ts";
 
-const overlay = document.getElementById("overlay")!;
-const goBtn = document.getElementById("go") as HTMLButtonElement;
-const latInput = document.getElementById("lat") as HTMLInputElement;
-const lonInput = document.getElementById("lon") as HTMLInputElement;
-const sizeInput = document.getElementById("size") as HTMLInputElement;
-const sizeVal = document.getElementById("size-val")!;
-const sizeLabel = document.getElementById("size-label")!;
-const sizeLabel2 = document.getElementById("size-label2")!;
-const addressInput = document.getElementById("address") as HTMLInputElement;
-const lookupBtn = document.getElementById("lookup") as HTMLButtonElement;
-const geocodeError = document.getElementById("geocode-error")!;
+// React landing overlay
+import React from "react";
+import { createRoot } from "react-dom/client";
+import { LandingOverlay } from "./ui/LandingOverlay.tsx";
+
+// --- Landing page state (will be set by React callbacks) ---
+let landingLat = 40.7484;
+let landingLon = -73.9857;
+let landingSize = 500;
+let landingScenario = "fire";
+let landingAddress = "";
+
 const loading = document.getElementById("loading")!;
 const hud = document.getElementById("hud")!;
 const info = document.getElementById("info")!;
@@ -113,25 +115,25 @@ const floodRadiusVal = document.getElementById("flood-radius-val")!;
 const spawnFloodBtn = document.getElementById("spawn-flood-btn") as HTMLButtonElement;
 const stopFloodBtn = document.getElementById("stop-flood-btn") as HTMLButtonElement;
 
-sizeInput.addEventListener("input", () => {
-  sizeVal.textContent = sizeInput.value;
-  sizeLabel.textContent = sizeInput.value;
-  sizeLabel2.textContent = sizeInput.value;
-});
+// (size input is now handled by React)
 
 // --- Three.js setup ---
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new WebGPURenderer({ antialias: true });
+await renderer.init();
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.0;
+renderer.domElement.style.position = "fixed";
+renderer.domElement.style.inset = "0";
+renderer.domElement.style.zIndex = "1";
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 const skyColor = 0x87ceeb;
 scene.background = new THREE.Color(skyColor);
-scene.fog = new THREE.Fog(skyColor, 300, 800);
+// No fog
 
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.5, 1000);
 camera.position.set(0, 80, 200);
@@ -240,11 +242,7 @@ const _lerpColor = new THREE.Color();
 function updateAtmosphere(t: number) {
   _lerpColor.copy(clearSky.bg).lerp(stormSky.bg, t);
   (scene.background as THREE.Color).copy(_lerpColor);
-  const fogColor = _lerpColor.clone();
-  scene.fog = new THREE.Fog(fogColor,
-    clearSky.fogNear + (stormSky.fogNear - clearSky.fogNear) * t,
-    clearSky.fogFar  + (stormSky.fogFar  - clearSky.fogFar) * t,
-  );
+  scene.fog = null;
   sun.intensity = clearSky.sunIntensity + (stormSky.sunIntensity - clearSky.sunIntensity) * t;
   sun.color.copy(clearSky.sunColor).lerp(stormSky.sunColor, t);
   hemi.intensity = clearSky.hemiIntensity + (stormSky.hemiIntensity - clearSky.hemiIntensity) * t;
@@ -325,7 +323,7 @@ spawnFloodBtn.addEventListener("click", spawnFloodAtCrosshair);
 stopFloodBtn.addEventListener("click", stopFlood);
 
 window.addEventListener("keydown", (e) => {
-  if (!overlay.classList.contains("hidden")) return;
+  if (landingRoot && landingRoot.firstChild) return; // landing still visible
   if (activeDisasterType === "tornado") {
     if (e.code === "KeyT") spawnTornadoAtCrosshair();
     if (e.code === "KeyX") stopTornado();
@@ -338,39 +336,20 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// --- Geocode lookup ---
-async function doLookup() {
-  const q = addressInput.value.trim();
-  if (!q) return;
-  geocodeError.style.display = "none";
-  lookupBtn.disabled = true;
-  lookupBtn.textContent = "…";
+// --- Geocode lookup (called from React) ---
+async function doLookup(q: string): Promise<{ lat: number; lon: number } | { error: string }> {
+  if (!q.trim()) return { error: "Empty address" };
   try {
     const res = await fetch(`/api/geocode?q=${encodeURIComponent(q)}`);
     const data = await res.json();
     if (!res.ok || data.error) {
-      geocodeError.textContent = data.error ?? "Lookup failed";
-      geocodeError.style.display = "block";
-      return;
+      return { error: data.error ?? "Lookup failed" };
     }
-    latInput.value = data.lat.toString();
-    lonInput.value = data.lon.toString();
+    return { lat: data.lat, lon: data.lon };
   } catch {
-    geocodeError.textContent = "Network error";
-    geocodeError.style.display = "block";
-  } finally {
-    lookupBtn.disabled = false;
-    lookupBtn.textContent = "Lookup";
+    return { error: "Network error" };
   }
 }
-
-lookupBtn.addEventListener("click", doLookup);
-addressInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
-    e.preventDefault();
-    void doLookup();
-  }
-});
 
 // --- Scenario registry ---
 interface ScenarioDefinition {
@@ -673,10 +652,7 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
   // 3. Create perception, recorder, stepped simulation
   const perception = new AgentPerceptionSystem(renderer, scene, agentManager);
   const recorder = new AgentRecorder(agentManager);
-  const locAddr = addressInput.value.trim();
-  const locLat = latInput.value;
-  const locLon = lonInput.value;
-  const locationStr = locAddr || `${locLat}, ${locLon}`;
+  const locationStr = landingAddress || `${landingLat}, ${landingLon}`;
 
   const replayRecorder = new ReplayRecorder(agentManager, locationStr);
 
@@ -789,14 +765,21 @@ stopSimBtn.addEventListener("click", async () => {
 
 // --- Load all layers ---
 let sceneGroup: THREE.Group | null = null;
+const landingRoot = document.getElementById("landing-root")!;
+let reactRoot: ReturnType<typeof createRoot> | null = null;
 
-goBtn.addEventListener("click", async () => {
-  const lat = parseFloat(latInput.value);
-  const lon = parseFloat(lonInput.value);
-  if (isNaN(lat) || isNaN(lon)) return;
+let landingEnableAgents = true;
 
-  goBtn.disabled = true;
-  goBtn.textContent = "Loading…";
+async function loadScene(lat: number, lon: number, size: number, scenarioId: string, enableAgents: boolean = true) {
+  landingEnableAgents = enableAgents;
+  // Unmount React landing overlay
+  if (reactRoot) {
+    reactRoot.unmount();
+    reactRoot = null;
+  }
+  landingRoot.innerHTML = "";
+  landingRoot.style.display = "none";
+
   loading.style.display = "block";
 
   // Clean up previous agent system
@@ -826,8 +809,13 @@ goBtn.addEventListener("click", async () => {
   activeDisasterType = null;
   flood.setEventBus(null);
 
+  // Store for later use by agent system
+  landingLat = lat;
+  landingLon = lon;
+  landingSize = size;
+  landingScenario = scenarioId;
+
   try {
-    const size = parseInt(sizeInput.value);
     const layers = await fetchLayers(lat, lon, size);
     await carTemplatePromise;
 
@@ -853,34 +841,54 @@ goBtn.addEventListener("click", async () => {
     flood.despawn();
     stopFlood();
 
-  const buildResult = buildAllLayers(layers, lat, lon, carTemplate);
-  sceneGroup = buildResult.group;
-  heightSampler = buildResult.heightSampler;
-  resetCarsToBase();
-  scene.add(sceneGroup);
-  flood.setTerrainContext(layers, lat, lon, sun, sceneGroup);
+    const buildResult = buildAllLayers(layers, lat, lon, carTemplate);
+    sceneGroup = buildResult.group;
+    heightSampler = buildResult.heightSampler;
+    resetCarsToBase();
+    scene.add(sceneGroup);
+    flood.setTerrainContext(layers, lat, lon, sun, sceneGroup);
+
     // Reset camera — scale distance with area size
     const camScale = size / 500;
     camera.position.set(0, 80 * camScale, 200 * camScale);
     controls.speed = 40 * camScale;
 
-    overlay.classList.add("hidden");
-
-    // Initialize exploration phase (no agents yet)
-    await initExploration(sceneGroup, size, heightSampler);
-
-    // Show scenario selection panel
-    buildScenarioPanel();
-    scenarioPanel.classList.add("visible");
+    // Initialize exploration phase and launch selected scenario directly
+    if (landingEnableAgents) {
+      await initExploration(sceneGroup, size, heightSampler);
+      // Launch the scenario chosen on the landing page (skip scenario panel)
+      launchScenario(scenarioId);
+    } else {
+      // No agents — just launch the disaster directly
+      const scenario = scenarios.find(s => s.id === scenarioId);
+      if (scenario?.available) {
+        sharedEventBus = new EventBus();
+        heightSampler = heightSampler;
+        scenario.launch(scene, sharedEventBus, heightSampler!);
+      }
+      info.textContent = "Disaster active (agents disabled)";
+    }
   } catch (err) {
     console.error("Failed to load:", err);
     alert("Failed to load data. Check console for details.");
   } finally {
-    goBtn.disabled = false;
-    goBtn.textContent = "Load Buildings";
     loading.style.display = "none";
   }
-});
+}
+
+// --- Mount React landing overlay ---
+reactRoot = createRoot(landingRoot);
+reactRoot.render(
+  React.createElement(LandingOverlay, {
+    defaultLat: 40.7484,
+    defaultLon: -73.9857,
+    onLookup: doLookup,
+    onLaunch: (lat: number, lon: number, size: number, scenario: string, enableAgents: boolean) => {
+      landingAddress = "";
+      void loadScene(lat, lon, size, scenario, enableAgents);
+    },
+  })
+);
 
 // --- Render loop ---
 let lastTime = performance.now();

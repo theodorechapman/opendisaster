@@ -1,4 +1,12 @@
 import * as THREE from "three";
+import { NodeMaterial } from "three/webgpu";
+import {
+  uniform, attribute, float, vec2, vec3, vec4,
+  sin, cos, fract, floor, dot, mix, smoothstep, pow, abs, clamp, length, normalize, cross, reflect, exp, max, min,
+  uv, positionLocal, positionWorld, cameraPosition,
+  Fn, If, Discard,
+  varying,
+} from "three/tsl";
 import type { FloodRaster } from "./FloodTypes.ts";
 
 export interface FloodSurfaceSolverState {
@@ -15,6 +23,54 @@ type ImpactPulse = {
   radiusMeters: number;
 };
 
+// --- TSL helper functions (replacing GLSL) ---
+
+const hash21 = Fn(({ p_in }: { p_in: any }) => {
+  const p = fract(p_in.mul(vec2(123.34, 456.21))).toVar();
+  p.addAssign(dot(p, p.add(45.32)));
+  return fract(p.x.mul(p.y));
+});
+
+const noise2 = Fn(({ p }: { p: any }) => {
+  const i = floor(p);
+  const f = fract(p);
+  const a = hash21({ p_in: i });
+  const b = hash21({ p_in: i.add(vec2(1.0, 0.0)) });
+  const c = hash21({ p_in: i.add(vec2(0.0, 1.0)) });
+  const d = hash21({ p_in: i.add(vec2(1.0, 1.0)) });
+  const u = f.mul(f).mul(float(3.0).sub(f.mul(2.0)));
+  return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+});
+
+const fbm = Fn(({ p_in }: { p_in: any }) => {
+  const v = float(0.0).toVar();
+  const a = float(0.5).toVar();
+  const p = p_in.toVar();
+  // Unrolled 4 iterations
+  v.addAssign(a.mul(noise2({ p })));
+  p.assign(p.mul(2.03).add(vec2(19.37, -7.11)));
+  a.mulAssign(0.5);
+
+  v.addAssign(a.mul(noise2({ p })));
+  p.assign(p.mul(2.03).add(vec2(19.37, -7.11)));
+  a.mulAssign(0.5);
+
+  v.addAssign(a.mul(noise2({ p })));
+  p.assign(p.mul(2.03).add(vec2(19.37, -7.11)));
+  a.mulAssign(0.5);
+
+  v.addAssign(a.mul(noise2({ p })));
+  return v;
+});
+
+const skyColor = Fn(({ dir }: { dir: any }) => {
+  const t = clamp(dir.y.mul(0.5).add(0.5), 0.0, 1.0);
+  const skyTop = vec3(0.42, 0.63, 0.90);
+  const skyHorizon = vec3(0.88, 0.93, 0.99);
+  const groundTint = vec3(0.20, 0.24, 0.30);
+  return mix(mix(skyHorizon, skyTop, pow(t, 0.7)), groundTint, pow(float(1.0).sub(t), 5.0));
+});
+
 export class FloodWaterSurface {
   readonly mesh: THREE.Mesh;
 
@@ -24,7 +80,7 @@ export class FloodWaterSurface {
   private readonly velocityAttr: THREE.BufferAttribute;
   private readonly rippleAttr: THREE.BufferAttribute;
   private readonly vertexToCell: Uint32Array;
-  private readonly material: THREE.ShaderMaterial;
+  private readonly material: NodeMaterial;
   private depthScale = 1;
   private readonly baseYOffset = 0.12;
   private rippleHeight: Float32Array;
@@ -32,6 +88,13 @@ export class FloodWaterSurface {
   private rippleNextHeight: Float32Array;
   private rippleNextVelocity: Float32Array;
   private readonly pendingImpacts: ImpactPulse[] = [];
+
+  // TSL uniform nodes
+  private readonly uDepthScale;
+  private readonly uLightDir;
+  private readonly uSunColor;
+  private readonly uSourceXZ;
+  private readonly uTime;
 
   constructor(raster: FloodRaster, sunLight?: THREE.DirectionalLight) {
     this.raster = raster;
@@ -48,15 +111,15 @@ export class FloodWaterSurface {
     geo.translate((raster.xMin + raster.xMax) * 0.5, 0, (raster.zMin + raster.zMax) * 0.5);
 
     const pos = geo.getAttribute("position") as THREE.BufferAttribute;
-    const uv = geo.getAttribute("uv") as THREE.BufferAttribute;
+    const uvAttr = geo.getAttribute("uv") as THREE.BufferAttribute;
     for (let i = 0; i < pos.count; i++) {
       const x = pos.getX(i);
       const z = pos.getZ(i);
       const u = (x - raster.xMin) / widthMeters;
       const v = (z - raster.zMin) / depthMeters;
-      uv.setXY(i, u, v);
+      uvAttr.setXY(i, u, v);
     }
-    uv.needsUpdate = true;
+    uvAttr.needsUpdate = true;
 
     this.positionAttr = geo.getAttribute("position") as THREE.BufferAttribute;
     this.depthAttr = new THREE.BufferAttribute(new Float32Array(this.positionAttr.count), 1);
@@ -70,8 +133,8 @@ export class FloodWaterSurface {
     geo.setAttribute("aRipple", this.rippleAttr);
     this.vertexToCell = new Uint32Array(this.positionAttr.count);
     for (let i = 0; i < this.positionAttr.count; i++) {
-      const u = uv.getX(i);
-      const v = uv.getY(i);
+      const u = uvAttr.getX(i);
+      const v = uvAttr.getY(i);
       const ci = clampInt(Math.round(u * (raster.width - 1)), 0, raster.width - 1);
       const cj = clampInt(Math.round(v * (raster.height - 1)), 0, raster.height - 1);
       this.vertexToCell[i] = cj * raster.width + ci;
@@ -83,166 +146,117 @@ export class FloodWaterSurface {
     this.rippleNextHeight = new Float32Array(cellCount);
     this.rippleNextVelocity = new Float32Array(cellCount);
 
-    this.material = new THREE.ShaderMaterial({
-      transparent: true,
-      depthWrite: false,
-      depthTest: true,
-      polygonOffset: true,
-      polygonOffsetFactor: -2,
-      polygonOffsetUnits: -2,
-      uniforms: {
-        uDepthScale: { value: this.depthScale },
-        uLightDir: {
-          value: sunLight
-            ? sunLight.position.clone().normalize()
-            : new THREE.Vector3(0.35, 0.86, 0.36).normalize(),
-        },
-        uSunColor: { value: new THREE.Color(1.0, 0.95, 0.82) },
-        uSourceXZ: { value: new THREE.Vector2(0, 0) },
-        uTime: { value: 0 },
-      },
-      vertexShader: `
-        attribute float aDepth;
-        attribute vec2 aVelocity;
-        attribute float aRipple;
-        uniform float uDepthScale;
-        varying float vDepth;
-        varying vec2 vVelocity;
-        varying float vRipple;
-        varying vec2 vUv;
-        varying vec3 vWorldPos;
+    // --- TSL uniforms ---
+    this.uDepthScale = uniform(this.depthScale);
+    this.uLightDir = uniform(
+      sunLight
+        ? sunLight.position.clone().normalize()
+        : new THREE.Vector3(0.35, 0.86, 0.36).normalize()
+    );
+    this.uSunColor = uniform(new THREE.Color(1.0, 0.95, 0.82));
+    this.uSourceXZ = uniform(new THREE.Vector2(0, 0));
+    this.uTime = uniform(0.0);
 
-        void main() {
-          // Keep visibility controlled by physical water depth only.
-          vDepth = max(0.0, aDepth * uDepthScale);
-          vVelocity = aVelocity;
-          vRipple = aRipple;
-          vUv = uv;
-          vec4 world = modelMatrix * vec4(position, 1.0);
-          vWorldPos = world.xyz;
-          gl_Position = projectionMatrix * viewMatrix * world;
-        }
-      `,
-      fragmentShader: `
-        precision highp float;
-        varying float vDepth;
-        varying vec2 vVelocity;
-        varying float vRipple;
-        varying vec2 vUv;
-        varying vec3 vWorldPos;
-        uniform vec3 uLightDir;
-        uniform vec3 uSunColor;
-        uniform vec2 uSourceXZ;
-        uniform float uTime;
+    // --- Build the NodeMaterial ---
+    const mat = new NodeMaterial();
+    mat.transparent = true;
+    mat.depthWrite = false;
+    mat.depthTest = true;
+    mat.polygonOffset = true;
+    mat.polygonOffsetFactor = -2;
+    mat.polygonOffsetUnits = -2;
 
-        float hash21(vec2 p) {
-          p = fract(p * vec2(123.34, 456.21));
-          p += dot(p, p + 45.32);
-          return fract(p.x * p.y);
-        }
+    // Vertex: pass varyings
+    const aDepth = attribute("aDepth", "float");
+    const aVelocity = attribute("aVelocity", "vec2");
+    const aRipple = attribute("aRipple", "float");
 
-        float noise2(vec2 p) {
-          vec2 i = floor(p);
-          vec2 f = fract(p);
-          float a = hash21(i);
-          float b = hash21(i + vec2(1.0, 0.0));
-          float c = hash21(i + vec2(0.0, 1.0));
-          float d = hash21(i + vec2(1.0, 1.0));
-          vec2 u = f * f * (3.0 - 2.0 * f);
-          return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-        }
+    const vDepth = varying(max(float(0.0), aDepth.mul(this.uDepthScale)), "vDepth");
+    const vVelocity = varying(aVelocity, "vVelocity");
+    const vRipple = varying(aRipple, "vRipple");
+    const vUv = varying(uv(), "vUv");
+    const vWorldPos = varying(positionWorld, "vWorldPos");
 
-        float fbm(vec2 p) {
-          float v = 0.0;
-          float a = 0.5;
-          for (int i = 0; i < 4; i++) {
-            v += a * noise2(p);
-            p = p * 2.03 + vec2(19.37, -7.11);
-            a *= 0.5;
-          }
-          return v;
-        }
+    // Fragment shader as colorNode + opacityNode
+    const fragmentColor = Fn(() => {
+      // Discard dry pixels
+      Discard(vDepth.lessThan(0.01));
 
-        vec3 skyColor(vec3 dir) {
-          float t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
-          vec3 skyTop = vec3(0.42, 0.63, 0.90);
-          vec3 skyHorizon = vec3(0.88, 0.93, 0.99);
-          vec3 groundTint = vec3(0.20, 0.24, 0.30);
-          return mix(mix(skyHorizon, skyTop, pow(t, 0.7)), groundTint, pow(1.0 - t, 5.0));
-        }
+      const toPoint = vWorldPos.xz.sub(this.uSourceXZ);
+      const radialDist = length(toPoint);
+      const radialDir = normalize(toPoint.add(vec2(1e-6, 1e-6)));
+      const sourceInfluence = smoothstep(float(140.0), float(0.0), radialDist);
 
-        void main() {
-          if (vDepth < 0.01) discard;
+      const physicalFlow = vVelocity;
+      const advectFlow = physicalFlow.add(radialDir.mul(float(0.25).mul(sourceInfluence)));
+      const flowDir = normalize(advectFlow.add(vec2(1e-6, 1e-6)));
+      const flowSpeed = length(physicalFlow);
+      const flow = flowDir.mul(float(0.06).add(float(0.14).mul(min(float(5.0), flowSpeed))));
 
-          vec2 toPoint = vWorldPos.xz - uSourceXZ;
-          float radialDist = length(toPoint);
-          vec2 radialDir = normalize(toPoint + vec2(1e-6));
-          float sourceInfluence = smoothstep(140.0, 0.0, radialDist);
+      const uvA = vUv.mul(10.0).add(flow.mul(this.uTime.mul(0.8)));
+      const uvB = vUv.mul(22.0).add(vec2(flowDir.y, flowDir.x.negate()).mul(this.uTime.mul(0.9)));
+      const e = float(0.0015);
 
-          vec2 physicalFlow = vVelocity;
-          vec2 advectFlow = physicalFlow + radialDir * (0.25 * sourceInfluence);
-          vec2 flowDir = normalize(advectFlow + vec2(1e-6));
-          float flowSpeed = length(physicalFlow);
-          vec2 flow = flowDir * (0.06 + 0.14 * min(5.0, flowSpeed));
+      const hL = fbm({ p_in: uvA.sub(vec2(e, 0.0)) }).mul(0.7).add(fbm({ p_in: uvB.sub(vec2(e, 0.0)) }).mul(0.3));
+      const hR = fbm({ p_in: uvA.add(vec2(e, 0.0)) }).mul(0.7).add(fbm({ p_in: uvB.add(vec2(e, 0.0)) }).mul(0.3));
+      const hD = fbm({ p_in: uvA.sub(vec2(0.0, e)) }).mul(0.7).add(fbm({ p_in: uvB.sub(vec2(0.0, e)) }).mul(0.3));
+      const hU = fbm({ p_in: uvA.add(vec2(0.0, e)) }).mul(0.7).add(fbm({ p_in: uvB.add(vec2(0.0, e)) }).mul(0.3));
+      const dHx = hR.sub(hL).div(e.mul(2.0));
+      const dHz = hU.sub(hD).div(e.mul(2.0));
 
-          vec2 uvA = vUv * 10.0 + flow * (uTime * 0.8);
-          vec2 uvB = vUv * 22.0 + vec2(flowDir.y, -flowDir.x) * (uTime * 0.9);
-          float e = 0.0015;
-          float hL = fbm(uvA - vec2(e, 0.0)) * 0.7 + fbm(uvB - vec2(e, 0.0)) * 0.3;
-          float hR = fbm(uvA + vec2(e, 0.0)) * 0.7 + fbm(uvB + vec2(e, 0.0)) * 0.3;
-          float hD = fbm(uvA - vec2(0.0, e)) * 0.7 + fbm(uvB - vec2(0.0, e)) * 0.3;
-          float hU = fbm(uvA + vec2(0.0, e)) * 0.7 + fbm(uvB + vec2(0.0, e)) * 0.3;
-          float dHx = (hR - hL) / (2.0 * e);
-          float dHz = (hU - hD) / (2.0 * e);
+      // Normals
+      const baseNormal = normalize(cross(vWorldPos.dFdx(), vWorldPos.dFdy()));
+      const flowNormal = normalize(vec3(vVelocity.x.mul(-0.02), 1.0, vVelocity.y.mul(-0.02)));
+      const microNormal = normalize(vec3(dHx.mul(-0.50), 1.0, dHz.mul(-0.50)));
+      const normal = normalize(baseNormal.mul(0.58).add(flowNormal.mul(0.18)).add(microNormal.mul(0.62)));
 
-          vec3 baseNormal = normalize(cross(dFdx(vWorldPos), dFdy(vWorldPos)));
-          vec3 flowNormal = normalize(vec3(-vVelocity.x * 0.02, 1.0, -vVelocity.y * 0.02));
-          vec3 microNormal = normalize(vec3(-dHx * 0.50, 1.0, -dHz * 0.50));
-          vec3 normal = normalize(baseNormal * 0.58 + flowNormal * 0.18 + microNormal * 0.62);
+      const viewDir = normalize(cameraPosition.sub(vWorldPos));
+      const lightDir = normalize(this.uLightDir);
+      const reflDir = reflect(viewDir.negate(), normal);
+      const halfDir = normalize(lightDir.add(viewDir));
 
-          vec3 viewDir = normalize(cameraPosition - vWorldPos);
-          vec3 lightDir = normalize(uLightDir);
-          vec3 reflDir = reflect(-viewDir, normal);
-          vec3 halfDir = normalize(lightDir + viewDir);
+      const ndotV = max(dot(normal, viewDir), 0.0);
+      const ndotL = max(dot(normal, lightDir), 0.0);
+      const fresnel = float(0.02).add(float(0.98).mul(pow(float(1.0).sub(ndotV), 5.0)));
 
-          float ndotV = max(dot(normal, viewDir), 0.0);
-          float ndotL = max(dot(normal, lightDir), 0.0);
-          float fresnel = 0.02 + 0.98 * pow(1.0 - ndotV, 5.0);
+      const depthMix = clamp(vDepth.div(6.0), 0.0, 1.0);
+      const absorb = exp(vDepth.mul(-0.55));
+      const shallowCol = vec3(0.07, 0.25, 0.44);
+      const deepCol = vec3(0.00, 0.03, 0.12);
+      const subsurface = mix(deepCol, shallowCol, absorb);
+      const refracted = subsurface.mul(float(0.25).add(float(0.75).mul(ndotL))).mul(mix(float(1.0), float(0.82), depthMix));
 
-          float depthMix = clamp(vDepth / 6.0, 0.0, 1.0);
-          float absorb = exp(-vDepth * 0.55);
-          vec3 shallowCol = vec3(0.07, 0.25, 0.44);
-          vec3 deepCol = vec3(0.00, 0.03, 0.12);
-          vec3 subsurface = mix(deepCol, shallowCol, absorb);
-          vec3 refracted = subsurface * (0.25 + 0.75 * ndotL) * mix(1.0, 0.82, depthMix);
+      const envRefl = skyColor({ dir: reflDir }).toVar();
+      const sunRefl = pow(max(dot(reflDir, lightDir), 0.0), 1300.0);
+      envRefl.addAssign(this.uSunColor.mul(sunRefl).mul(6.0));
 
-          vec3 envRefl = skyColor(reflDir);
-          float sunRefl = pow(max(dot(reflDir, lightDir), 0.0), 1300.0);
-          envRefl += uSunColor * sunRefl * 6.0;
+      const color = mix(refracted, envRefl, fresnel).toVar();
 
-          vec3 color = mix(refracted, envRefl, fresnel);
+      const spec = pow(max(dot(normal, halfDir), 0.0), 190.0).mul(float(0.2).add(float(0.8).mul(ndotL)));
+      const glitter = pow(max(dot(normalize(reflDir.add(lightDir)), viewDir), 0.0), 300.0);
+      color.addAssign(this.uSunColor.mul(spec.mul(0.85).add(glitter.mul(0.32))));
 
-          float spec = pow(max(dot(normal, halfDir), 0.0), 190.0) * (0.2 + 0.8 * ndotL);
-          float glitter = pow(max(dot(normalize(reflDir + lightDir), viewDir), 0.0), 300.0);
-          color += uSunColor * (spec * 0.85 + glitter * 0.32);
+      // Foam
+      const speed = length(vVelocity);
+      const vort = abs(vVelocity.y.dFdx().sub(vVelocity.x.dFdy()));
+      const rippleEnergy = abs(vRipple);
+      const shorelineFoam = float(1.0).sub(smoothstep(float(0.03), float(0.30), vDepth));
+      const turbulenceFoam = smoothstep(float(0.9), float(2.7), speed.add(vort.mul(1.8)).add(rippleEnergy.mul(6.5)));
+      const foamNoise = fbm({ p_in: vUv.mul(36.0).add(flow.mul(this.uTime).mul(1.5)) });
+      const streak = float(0.5).add(float(0.5).mul(sin(dot(vUv.mul(200.0).add(flow.mul(this.uTime).mul(8.0)), vec2(flowDir.y.negate(), flowDir.x)))));
+      const foam = clamp(shorelineFoam.mul(0.8).add(turbulenceFoam.mul(0.65)), 0.0, 1.0)
+        .mul(foamNoise).mul(float(0.62).add(float(0.38).mul(streak)));
+      color.assign(mix(color, vec3(0.94, 0.97, 1.0), foam.mul(0.5)));
 
-          float speed = length(vVelocity);
-          float vort = abs(dFdx(vVelocity.y) - dFdy(vVelocity.x));
-          float rippleEnergy = abs(vRipple);
-          float shorelineFoam = 1.0 - smoothstep(0.03, 0.30, vDepth);
-          float turbulenceFoam = smoothstep(0.9, 2.7, speed + vort * 1.8 + rippleEnergy * 6.5);
-          float foamNoise = fbm(vUv * 36.0 + flow * uTime * 1.5);
-          float streak = 0.5 + 0.5 * sin(dot(vUv * 200.0 + flow * uTime * 8.0, vec2(-flowDir.y, flowDir.x)));
-          float foam = clamp(shorelineFoam * 0.8 + turbulenceFoam * 0.65, 0.0, 1.0) *
-                       foamNoise * (0.62 + 0.38 * streak);
-          color = mix(color, vec3(0.94, 0.97, 1.0), foam * 0.5);
+      color.assign(clamp(color, vec3(0.0, 0.0, 0.0), vec3(1.0, 1.0, 1.0)));
+      const alpha = clamp(float(0.82).add(vDepth.mul(0.05)).add(fresnel.mul(0.02)), 0.84, 0.93);
 
-          color = clamp(color, vec3(0.0), vec3(1.0));
-          float alpha = clamp(0.82 + vDepth * 0.05 + fresnel * 0.02, 0.84, 0.93);
-          gl_FragColor = vec4(color, alpha);
-        }
-      `,
+      return vec4(color, alpha);
     });
+
+    mat.colorNode = fragmentColor();
+
+    this.material = mat;
 
     this.mesh = new THREE.Mesh(geo, this.material);
     this.mesh.frustumCulled = false;
@@ -280,25 +294,25 @@ export class FloodWaterSurface {
     this.depthAttr.needsUpdate = true;
     this.velocityAttr.needsUpdate = true;
     this.rippleAttr.needsUpdate = true;
-    this.material.uniforms.uTime.value += dt;
+    this.uTime.value += dt;
     this.mesh.visible = wetCount > 0;
   }
 
   setDepthScale(scale: number): void {
     this.depthScale = Math.max(0.1, Math.min(4, scale));
-    this.material.uniforms.uDepthScale.value = this.depthScale;
+    this.uDepthScale.value = this.depthScale;
   }
 
   setLightDirection(dir: THREE.Vector3): void {
-    this.material.uniforms.uLightDir.value.copy(dir).normalize();
+    (this.uLightDir.value as THREE.Vector3).copy(dir).normalize();
     const nY = Math.max(0, Math.min(1, dir.clone().normalize().y));
     const warm = new THREE.Color(1.0, 0.95, 0.82);
     const cool = new THREE.Color(0.82, 0.90, 1.0);
-    this.material.uniforms.uSunColor.value.copy(cool).lerp(warm, Math.sqrt(nY));
+    (this.uSunColor.value as THREE.Color).copy(cool).lerp(warm, Math.sqrt(nY));
   }
 
   setSourcePosition(x: number, z: number): void {
-    this.material.uniforms.uSourceXZ.value.set(x, z);
+    (this.uSourceXZ.value as THREE.Vector2).set(x, z);
   }
 
   addImpactAtWorld(x: number, z: number, strength = 1, radiusMeters = 5): void {

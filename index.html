@@ -3,44 +3,17 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>OpenDisaster — 3D Building Viewer</title>
+  <title>OpenDisaster — 3D Disaster Simulation</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <script src="https://cdn.tailwindcss.com"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body { background: #111; color: #eee; font-family: system-ui, sans-serif; overflow: hidden; }
+    body { background: #000; color: #eee; font-family: 'IBM Plex Mono', monospace, system-ui, sans-serif; overflow: hidden; }
     canvas { display: block; }
 
-    #overlay {
-      position: fixed; inset: 0;
-      display: flex; align-items: center; justify-content: center;
-      background: rgba(0,0,0,0.85);
-      z-index: 10;
-    }
-    #overlay.hidden { display: none; }
-
-    #panel {
-      background: #1a1a2e; border: 1px solid #333;
-      border-radius: 12px; padding: 32px 40px;
-      max-width: 400px; width: 90%;
-    }
-    #panel h1 { font-size: 20px; margin-bottom: 4px; }
-    #panel p.sub { font-size: 13px; color: #888; margin-bottom: 20px; }
-    #panel label { display: block; font-size: 13px; color: #aaa; margin-bottom: 4px; }
-    #panel input:not([type="range"]) {
-      width: 100%; padding: 8px 12px; margin-bottom: 14px;
-      background: #0d0d1a; border: 1px solid #444; border-radius: 6px;
-      color: #eee; font-size: 15px;
-    }
-    #panel input[type="range"] {
-      width: 100%; cursor: pointer;
-    }
-    #panel button {
-      width: 100%; padding: 10px;
-      background: #4361ee; border: none; border-radius: 6px;
-      color: #fff; font-size: 15px; cursor: pointer;
-      transition: background 0.15s;
-    }
-    #panel button:hover { background: #3a56d4; }
-    #panel button:disabled { opacity: 0.5; cursor: not-allowed; }
+    /* Landing is rendered by React into #landing-root */
 
 
     #hud {
@@ -325,31 +298,7 @@
   </style>
 </head>
 <body>
-  <div id="overlay">
-    <div id="panel">
-      <h1>OpenDisaster</h1>
-      <p class="sub">3D Building Viewer — <span id="size-label">500</span>m &times; <span id="size-label2">500</span>m area from OSM</p>
-      <label for="address">Address or Google Maps Link</label>
-      <div style="display:flex;gap:8px;margin-bottom:14px;">
-        <input id="address" type="text" style="margin-bottom:0;flex:1;" placeholder="e.g. 350 5th Ave, New York or maps URL" />
-        <button id="lookup" style="width:auto;padding:8px 16px;font-size:13px;white-space:nowrap;">Lookup</button>
-      </div>
-      <div id="geocode-error" style="color:#e55;font-size:12px;margin:-8px 0 10px;display:none;"></div>
-      <label for="size">Area Size: <strong id="size-val">500</strong>m</label>
-      <input id="size" type="range" min="100" max="2000" step="50" value="500" style="margin-bottom:14px;accent-color:#4361ee;" />
-      <div style="display:flex;gap:12px;">
-        <div style="flex:1;">
-          <label for="lat">Latitude</label>
-          <input id="lat" type="number" step="any" value="40.7484" placeholder="e.g. 40.7484" />
-        </div>
-        <div style="flex:1;">
-          <label for="lon">Longitude</label>
-          <input id="lon" type="number" step="any" value="-73.9857" placeholder="e.g. -73.9857" />
-        </div>
-      </div>
-      <button id="go">Load Buildings</button>
-    </div>
-  </div>
+  <div id="landing-root" style="position:fixed;inset:0;z-index:20;"></div>
   <div id="scenario-panel">
     <h2>Scenarios</h2>
   </div>
