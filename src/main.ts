@@ -62,15 +62,7 @@ scene.add(hemi);
 const ambient = new THREE.AmbientLight(0xffffff, 0.3);
 scene.add(ambient);
 
-// Ground plane (fallback, terrain mesh replaces this in the loaded area)
-const ground = new THREE.Mesh(
-  new THREE.PlaneGeometry(2000, 2000),
-  new THREE.MeshPhongMaterial({ color: 0x445522 }),
-);
-ground.rotation.x = -Math.PI / 2;
-ground.position.y = -0.5;
-ground.receiveShadow = true;
-scene.add(ground);
+
 
 // Controls
 const controls = new FlyControls(camera, renderer.domElement);
