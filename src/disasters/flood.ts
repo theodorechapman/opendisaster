@@ -59,11 +59,11 @@ const DEFAULT_FLOOD_PARAMS: FloodSolverParams = {
   maxDt: 0.05,
   maxSubsteps: 28,
   manningN: 0.0008,
-  infiltrationRate: 0.0,
-  drainageRate: 0.00015,
+  infiltrationRate: 0,
+  drainageRate: 0,
   wetThreshold: 0.001,
   sourceEnabled: true,
-  sourceFlowRate: 30,
+  sourceFlowRate: 34,
   sourceRadiusCells: 2,
   rainRate: 0,
 };
@@ -92,9 +92,9 @@ function buildFloodRaster(
   sourceOverride?: { x: number; z: number },
 ): FloodRaster {
   const opts = {
-    targetCellSizeMeters: 2.4,
+    targetCellSizeMeters: 2.0,
     minResolution: 96,
-    maxResolution: 220,
+    maxResolution: 320,
     ...options,
   };
   const { layers, centerLat, centerLon } = ctx;
@@ -427,8 +427,8 @@ class ShallowWaterSolver {
   private sourceZ: number;
   private sourceY: number;
   private sourceIndex: number;
-  private sourceDepthMeters = 2.0;
-  private readonly minSourceDepthMeters = 0.5;
+  private sourceDepthMeters = 10.0;
+  private readonly minSourceDepthMeters = 10.0;
   private readonly slopeForceScale = 0.32;
   private readonly baseEddyViscosity = 0.18;
   private readonly maxFroude = 2.8;
@@ -526,15 +526,82 @@ class ShallowWaterSolver {
     return { x: this.sourceX, z: this.sourceZ, y: this.sourceY };
   }
 
-  sampleStateAtWorld(x: number, z: number): { depth: number; u: number; v: number; terrainY: number; surfaceY: number } {
+  cellIndexToWorld(idx: number): { x: number; z: number } {
+    const i = idx % this.width;
+    const j = Math.floor(idx / this.width);
+    return { x: this.xMin + i * this.dx, z: this.zMin + j * this.dz };
+  }
+
+  sampleStateAtWorld(
+    x: number,
+    z: number,
+    preferOpen = true,
+    searchRadiusCells = 2,
+  ): {
+    idx: number;
+    depth: number;
+    u: number;
+    v: number;
+    terrainY: number;
+    surfaceY: number;
+    obstacle: boolean;
+  } {
     const i = clampInt(Math.round((x - this.xMin) / Math.max(1e-6, this.dx)), 0, this.width - 1);
     const j = clampInt(Math.round((z - this.zMin) / Math.max(1e-6, this.dz)), 0, this.height - 1);
-    const idx = j * this.width + i;
+    let idx = j * this.width + i;
+
+    if (preferOpen && this.obstacle[idx] !== 0) {
+      idx = this.findNearestOpenCell(i, j, searchRadiusCells, idx);
+    }
+
     const depth = this.depth[idx]!;
-    const u = depth > this.params.wetThreshold ? this.mx[idx]! / depth : 0;
-    const v = depth > this.params.wetThreshold ? this.my[idx]! / depth : 0;
+    const obstacle = this.obstacle[idx] !== 0;
+    const u = !obstacle && depth > this.params.wetThreshold ? this.mx[idx]! / depth : 0;
+    const v = !obstacle && depth > this.params.wetThreshold ? this.my[idx]! / depth : 0;
     const terrainY = this.terrain[idx]!;
-    return { depth, u, v, terrainY, surfaceY: terrainY + depth };
+    const surfaceY = terrainY + depth;
+    return { idx, depth, u, v, terrainY, surfaceY, obstacle };
+  }
+
+  clearObstaclesInAabb(minX: number, maxX: number, minZ: number, maxZ: number): void {
+    const iMin = clampInt(Math.floor((Math.min(minX, maxX) - this.xMin) / this.dx), 0, this.width - 1);
+    const iMax = clampInt(Math.ceil((Math.max(minX, maxX) - this.xMin) / this.dx), 0, this.width - 1);
+    const jMin = clampInt(Math.floor((Math.min(minZ, maxZ) - this.zMin) / this.dz), 0, this.height - 1);
+    const jMax = clampInt(Math.ceil((Math.max(minZ, maxZ) - this.zMin) / this.dz), 0, this.height - 1);
+    for (let j = jMin; j <= jMax; j++) {
+      for (let i = iMin; i <= iMax; i++) {
+        this.obstacle[j * this.width + i] = 0;
+      }
+    }
+  }
+
+  injectMomentumImpulse(
+    x: number,
+    z: number,
+    vx: number,
+    vz: number,
+    radiusMeters: number,
+    strength = 1,
+  ): void {
+    const rCells = Math.max(1, Math.ceil(radiusMeters / Math.max(1e-6, Math.min(this.dx, this.dz))));
+    const ci = clampInt(Math.round((x - this.xMin) / this.dx), 0, this.width - 1);
+    const cj = clampInt(Math.round((z - this.zMin) / this.dz), 0, this.height - 1);
+    const r2 = rCells * rCells;
+
+    for (let j = Math.max(0, cj - rCells); j <= Math.min(this.height - 1, cj + rCells); j++) {
+      for (let i = Math.max(0, ci - rCells); i <= Math.min(this.width - 1, ci + rCells); i++) {
+        const di = i - ci;
+        const dj = j - cj;
+        const d2 = di * di + dj * dj;
+        if (d2 > r2) continue;
+        const idx = j * this.width + i;
+        if (this.obstacle[idx] !== 0) continue;
+        const w = Math.exp(-d2 / Math.max(1, r2 * 0.5)) * strength;
+        const d = Math.max(this.depth[idx]!, this.params.wetThreshold);
+        this.mx[idx] = (this.mx[idx] ?? 0) + vx * w * d;
+        this.my[idx] = (this.my[idx] ?? 0) + vz * w * d;
+      }
+    }
   }
 
   step(frameDt: number): void {
@@ -604,6 +671,31 @@ class ShallowWaterSolver {
     return this.params.sourceFlowRate / (cellArea * this.sourceWeightSum);
   }
 
+  private findNearestOpenCell(i0: number, j0: number, maxRadius: number, fallbackIdx: number): number {
+    if (this.obstacle[fallbackIdx] === 0) return fallbackIdx;
+
+    for (let r = 1; r <= Math.max(1, maxRadius); r++) {
+      const iMin = Math.max(0, i0 - r);
+      const iMax = Math.min(this.width - 1, i0 + r);
+      const jMin = Math.max(0, j0 - r);
+      const jMax = Math.min(this.height - 1, j0 + r);
+
+      for (let i = iMin; i <= iMax; i++) {
+        const topIdx = jMin * this.width + i;
+        if (this.obstacle[topIdx] === 0) return topIdx;
+        const bottomIdx = jMax * this.width + i;
+        if (this.obstacle[bottomIdx] === 0) return bottomIdx;
+      }
+      for (let j = jMin + 1; j < jMax; j++) {
+        const leftIdx = j * this.width + iMin;
+        if (this.obstacle[leftIdx] === 0) return leftIdx;
+        const rightIdx = j * this.width + iMax;
+        if (this.obstacle[rightIdx] === 0) return rightIdx;
+      }
+    }
+    return fallbackIdx;
+  }
+
   private computeTerrainSlopes(): void {
     const w = this.width;
     const h = this.height;
@@ -639,7 +731,7 @@ class ShallowWaterSolver {
   }
 
   private sourceJetSpeed(sourceRateMetersPerSec: number): number {
-    return Math.min(8.5, 2.4 + Math.sqrt(Math.max(0, sourceRateMetersPerSec)));
+    return Math.min(8.5, 2.8 + Math.sqrt(Math.max(0, sourceRateMetersPerSec)));
   }
 
   private applySourceDepthFloor(): void {
@@ -1456,12 +1548,667 @@ class FloodWaterSurface {
   }
 }
 
+// --- Environment effects (trees carried by currents) ---
+
+type TreeTarget = {
+  trunk: THREE.Mesh;
+  canopy?: THREE.Mesh;
+  uprooted: boolean;
+  depthThreshold: number;
+  forceThreshold: number;
+  trunkRadius: number;
+  height: number;
+  submergedTime: number;
+  damage: number;
+};
+
+type UprootTarget = {
+  mesh: THREE.Mesh;
+  kind: "small";
+  uprooted: boolean;
+  depthThreshold: number;
+  speedThreshold: number;
+};
+
+type DebrisBodyKind = "tree" | "small";
+
+type DebrisBody = {
+  object: THREE.Object3D;
+  kind: DebrisBodyKind;
+  velocity: THREE.Vector3;
+  angularVelocity: THREE.Vector3;
+  buoyancy: number;
+  drag: number;
+  angularDrag: number;
+  floatOffset: number;
+  ttl: number;
+  characteristicHeight: number;
+  crossSection: number;
+  wasInWater: boolean;
+  impactCooldown: number;
+  disposableGeometries: THREE.BufferGeometry[];
+  disposableMaterials: THREE.Material[];
+};
+
+const WORLD_UP = new THREE.Vector3(0, 1, 0);
+
+class FloodEnvironmentEffectsRealistic {
+  private readonly root: THREE.Group;
+  private readonly solver: ShallowWaterSolver;
+  private readonly surface: FloodWaterSurface;
+  private readonly debrisGroup: THREE.Group;
+
+  private readonly treeTargets: TreeTarget[] = [];
+  private readonly uprootTargets: UprootTarget[] = [];
+  private readonly debrisBodies: DebrisBody[] = [];
+
+  private checkTimer = 0;
+  private wallImpactTimer = 0;
+
+  private readonly tmpBox = new THREE.Box3();
+  private readonly tmpSize = new THREE.Vector3();
+  private readonly tmpPos = new THREE.Vector3();
+  private readonly tmpVecA = new THREE.Vector3();
+  private readonly tmpVecB = new THREE.Vector3();
+  private readonly tmpVecC = new THREE.Vector3();
+  private readonly tmpQuat = new THREE.Quaternion();
+  private readonly tmpMat = new THREE.Matrix4();
+
+  constructor(root: THREE.Group, solver: ShallowWaterSolver, surface: FloodWaterSurface) {
+    this.root = root;
+    this.solver = solver;
+    this.surface = surface;
+
+    this.debrisGroup = new THREE.Group();
+    this.debrisGroup.name = "flood-debris";
+    this.root.add(this.debrisGroup);
+
+    this.collectTreeTargets();
+    this.collectSmallUprootTargets();
+  }
+
+  update(simDt: number): void {
+    this.checkTimer += simDt;
+    if (this.checkTimer >= 0.08) {
+      this.checkTimer = 0;
+      this.evaluateTreeTargets();
+      this.evaluateSmallUprootTargets();
+    }
+
+    this.emitWallImpacts(simDt);
+    this.updateDebrisBodies(simDt);
+  }
+
+  reset(): void {
+    for (const target of this.treeTargets) {
+      target.uprooted = false;
+      target.submergedTime = 0;
+      target.damage = 0;
+      target.trunk.visible = true;
+      if (target.canopy) target.canopy.visible = true;
+    }
+    for (const target of this.uprootTargets) {
+      target.uprooted = false;
+      target.mesh.visible = true;
+    }
+    this.clearDebris();
+    this.checkTimer = 0;
+    this.wallImpactTimer = 0;
+  }
+
+  dispose(): void {
+    this.clearDebris();
+    this.root.remove(this.debrisGroup);
+  }
+
+  private collectTreeTargets(): void {
+    const trees = this.root.getObjectByName("trees");
+    if (!trees) return;
+
+    type TreeCandidate = {
+      mesh: THREE.Mesh;
+      center: THREE.Vector3;
+      size: THREE.Vector3;
+    };
+
+    const trunkCandidates: TreeCandidate[] = [];
+    const canopyCandidates: TreeCandidate[] = [];
+    const allCandidates: TreeCandidate[] = [];
+
+    trees.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      this.tmpBox.setFromObject(obj);
+      if (!Number.isFinite(this.tmpBox.min.x) || !Number.isFinite(this.tmpBox.max.x)) return;
+
+      const size = this.tmpBox.getSize(new THREE.Vector3());
+      const center = this.tmpBox.getCenter(new THREE.Vector3());
+      allCandidates.push({ mesh: obj, center, size });
+      const horizontalSize = Math.max(size.x, size.z);
+      const slenderness = size.y / Math.max(0.001, horizontalSize);
+
+      if (slenderness >= 2.2 && size.y >= 1.5) {
+        trunkCandidates.push({ mesh: obj, center, size });
+      } else {
+        canopyCandidates.push({ mesh: obj, center, size });
+      }
+    });
+
+    const usedCanopies = new Set<THREE.Mesh>();
+    const claimedMeshes = new Set<THREE.Mesh>();
+
+    for (const trunk of trunkCandidates) {
+      let bestCanopy: TreeCandidate | undefined;
+      let bestScore = Number.POSITIVE_INFINITY;
+
+      for (const canopy of canopyCandidates) {
+        if (usedCanopies.has(canopy.mesh)) continue;
+
+        const dx = canopy.center.x - trunk.center.x;
+        const dz = canopy.center.z - trunk.center.z;
+        const dy = canopy.center.y - trunk.center.y;
+        const horizontalDist2 = dx * dx + dz * dz;
+        const maxHorizontal = Math.max(2.4, trunk.size.y * 0.95);
+        if (horizontalDist2 > maxHorizontal * maxHorizontal) continue;
+        if (dy < trunk.size.y * 0.12 || dy > trunk.size.y * 2.8) continue;
+
+        const score = horizontalDist2 + Math.abs(dy - trunk.size.y * 1.25) * 0.35;
+        if (score < bestScore) {
+          bestScore = score;
+          bestCanopy = canopy;
+        }
+      }
+
+      if (bestCanopy) {
+        usedCanopies.add(bestCanopy.mesh);
+        claimedMeshes.add(bestCanopy.mesh);
+      }
+      claimedMeshes.add(trunk.mesh);
+
+      const trunkRadius = Math.max(0.18, Math.min(1.1, Math.max(trunk.size.x, trunk.size.z) * 0.5));
+      const canopyHeight = bestCanopy?.size.y ?? 0;
+      const totalHeight = Math.max(2.2, trunk.size.y + canopyHeight * 0.55);
+      const depthThreshold = Math.max(0.20, Math.min(0.68, 0.16 + trunkRadius * 0.42));
+      const forceThreshold = Math.max(0.18, Math.min(0.90, 0.14 + trunkRadius * 0.46));
+
+      this.treeTargets.push({
+        trunk: trunk.mesh,
+        canopy: bestCanopy?.mesh,
+        uprooted: false,
+        depthThreshold,
+        forceThreshold,
+        trunkRadius,
+        height: totalHeight,
+        submergedTime: 0,
+        damage: 0,
+      });
+    }
+
+    for (const candidate of allCandidates) {
+      if (claimedMeshes.has(candidate.mesh)) continue;
+      const fallbackRadius = Math.max(0.16, Math.min(1.25, Math.max(candidate.size.x, candidate.size.z) * 0.5));
+      this.treeTargets.push({
+        trunk: candidate.mesh,
+        canopy: undefined,
+        uprooted: false,
+        depthThreshold: Math.max(0.18, Math.min(0.72, 0.14 + fallbackRadius * 0.40)),
+        forceThreshold: Math.max(0.16, Math.min(0.95, 0.12 + fallbackRadius * 0.46)),
+        trunkRadius: fallbackRadius,
+        height: Math.max(1.2, candidate.size.y),
+        submergedTime: 0,
+        damage: 0,
+      });
+    }
+  }
+
+  private collectSmallUprootTargets(): void {
+    const barriers = this.root.getObjectByName("barriers");
+    if (!barriers) return;
+
+    barriers.traverse((obj) => {
+      if (!(obj instanceof THREE.Mesh)) return;
+      this.uprootTargets.push({
+        mesh: obj,
+        kind: "small",
+        uprooted: false,
+        depthThreshold: 0.7,
+        speedThreshold: 1.6,
+      });
+    });
+  }
+
+  private evaluateTreeTargets(): void {
+    const evalDt = 0.08;
+    for (const target of this.treeTargets) {
+      if (target.uprooted || !target.trunk.visible) continue;
+
+      target.trunk.getWorldPosition(this.tmpPos);
+      const state = this.solver.sampleStateAtWorld(this.tmpPos.x, this.tmpPos.z, true, 3);
+      if (state.obstacle) continue;
+
+      const speed = Math.hypot(state.u, state.v);
+      const hydrodynamicForce = state.depth * speed * speed;
+      const momentumLoad = state.depth * speed;
+      const wet = state.depth > 0.08;
+
+      if (wet) {
+        target.submergedTime = Math.min(12, target.submergedTime + evalDt);
+      } else {
+        target.submergedTime = Math.max(0, target.submergedTime - evalDt * 1.6);
+      }
+
+      const damageDecay = wet ? 0.965 : 0.90;
+      target.damage =
+        target.damage * damageDecay +
+        hydrodynamicForce * 0.22 +
+        momentumLoad * 0.12 +
+        (wet ? 0.035 : 0);
+
+      const depthTrigger = state.depth >= target.depthThreshold;
+      const forceTrigger = hydrodynamicForce >= target.forceThreshold;
+      const depthSpeedTrigger = depthTrigger && speed >= 0.22;
+      const sustainedTrigger =
+        target.submergedTime >= 1.2 && state.depth >= target.depthThreshold * 0.65;
+      const damageTrigger = target.damage >= target.forceThreshold * 1.65;
+      const extremeDepthTrigger = state.depth >= Math.max(1.25, target.depthThreshold * 2.0);
+
+      if (!(forceTrigger || depthSpeedTrigger || sustainedTrigger || damageTrigger || extremeDepthTrigger)) {
+        continue;
+      }
+
+      target.uprooted = true;
+      this.spawnUprootedTree(target, state, speed);
+
+      this.surface.addImpactAtWorld(this.tmpPos.x, this.tmpPos.z, 1.1 + speed * 0.30, 5.6);
+      this.solver.injectMomentumImpulse(this.tmpPos.x, this.tmpPos.z, state.u * 0.28, state.v * 0.28, 4.0, 0.6);
+    }
+  }
+
+  private evaluateSmallUprootTargets(): void {
+    for (const target of this.uprootTargets) {
+      if (target.uprooted || !target.mesh.visible) continue;
+
+      target.mesh.getWorldPosition(this.tmpPos);
+      const state = this.solver.sampleStateAtWorld(this.tmpPos.x, this.tmpPos.z, true, 3);
+      if (state.obstacle) continue;
+
+      const speed = Math.hypot(state.u, state.v);
+      if (state.depth < target.depthThreshold || speed < target.speedThreshold) continue;
+
+      target.uprooted = true;
+      this.spawnSmallDebris(target.mesh, state, speed);
+
+      this.surface.addImpactAtWorld(this.tmpPos.x, this.tmpPos.z, 0.9 + speed * 0.25, 4.2);
+      this.solver.injectMomentumImpulse(this.tmpPos.x, this.tmpPos.z, state.u * 0.24, state.v * 0.24, 3.4, 0.5);
+    }
+  }
+
+  private spawnUprootedTree(
+    target: TreeTarget,
+    state: ReturnType<ShallowWaterSolver["sampleStateAtWorld"]>,
+    speed: number,
+  ): void {
+    target.trunk.getWorldPosition(this.tmpPos);
+    this.tmpBox.setFromObject(target.trunk);
+    const baseY = this.tmpBox.min.y + target.trunkRadius * 0.32;
+
+    const treeBody = new THREE.Group();
+    treeBody.name = "uprooted-tree";
+    treeBody.position.set(this.tmpPos.x, baseY, this.tmpPos.z);
+    this.debrisGroup.add(treeBody);
+
+    const trunkClone = this.cloneMeshIntoParent(target.trunk, treeBody);
+    trunkClone.castShadow = true;
+    trunkClone.receiveShadow = true;
+
+    if (target.canopy) {
+      const canopyClone = this.cloneMeshIntoParent(target.canopy, treeBody);
+      canopyClone.castShadow = true;
+      canopyClone.receiveShadow = true;
+    }
+
+    const rootBallGeo = new THREE.IcosahedronGeometry(target.trunkRadius * 1.35, 0);
+    const rootBallMat = new THREE.MeshPhongMaterial({ color: 0x4b3522, flatShading: true });
+    const rootBall = new THREE.Mesh(rootBallGeo, rootBallMat);
+    rootBall.castShadow = true;
+    rootBall.receiveShadow = true;
+    rootBall.position.set(0, target.trunkRadius * 0.28, 0);
+    treeBody.add(rootBall);
+
+    target.trunk.visible = false;
+    if (target.canopy) target.canopy.visible = false;
+
+    this.tmpVecA.set(state.u, 0, state.v);
+    let flowSpeed = this.tmpVecA.length();
+    if (flowSpeed < 1e-4) {
+      this.tmpVecA.set(Math.random() - 0.5, 0, Math.random() - 0.5);
+      flowSpeed = this.tmpVecA.length();
+    }
+    if (flowSpeed > 1e-6) this.tmpVecA.multiplyScalar(1 / flowSpeed);
+
+    const launch = 0.65 + speed * 0.55;
+    const velocity = new THREE.Vector3(
+      this.tmpVecA.x * launch,
+      0.35 + Math.min(0.7, speed * 0.16),
+      this.tmpVecA.z * launch,
+    );
+
+    this.debrisBodies.push({
+      object: treeBody,
+      kind: "tree",
+      velocity,
+      angularVelocity: new THREE.Vector3(
+        (Math.random() - 0.5) * 0.6,
+        (Math.random() - 0.5) * 1.2,
+        (Math.random() - 0.5) * 0.6,
+      ),
+      buoyancy: 5.8,
+      drag: 2.9,
+      angularDrag: 1.05,
+      floatOffset: 0.18,
+      ttl: Number.POSITIVE_INFINITY,
+      characteristicHeight: Math.max(2.5, target.height),
+      crossSection: Math.max(0.35, target.trunkRadius * 2),
+      wasInWater: state.depth > 0.03,
+      impactCooldown: 0,
+      disposableGeometries: [rootBallGeo],
+      disposableMaterials: [rootBallMat],
+    });
+  }
+
+  private spawnSmallDebris(
+    sourceMesh: THREE.Mesh,
+    state: ReturnType<ShallowWaterSolver["sampleStateAtWorld"]>,
+    speed: number,
+  ): void {
+    this.tmpBox.setFromObject(sourceMesh);
+    this.tmpBox.getSize(this.tmpSize);
+
+    const debris = sourceMesh;
+    debris.visible = true;
+    debris.castShadow = true;
+    debris.receiveShadow = true;
+
+    const baseSize = Math.max(this.tmpSize.x, this.tmpSize.y, this.tmpSize.z, 0.2);
+    this.debrisBodies.push({
+      object: debris,
+      kind: "small",
+      velocity: new THREE.Vector3(
+        state.u * 1.1,
+        0.45 + Math.random() * 0.3,
+        state.v * 1.1,
+      ),
+      angularVelocity: new THREE.Vector3(
+        (Math.random() - 0.5) * 4.0,
+        (Math.random() - 0.5) * 4.0,
+        (Math.random() - 0.5) * 4.0,
+      ),
+      buoyancy: 3.1,
+      drag: 2.5,
+      angularDrag: 0.88,
+      floatOffset: 0.18,
+      ttl: Number.POSITIVE_INFINITY,
+      characteristicHeight: Math.max(0.3, this.tmpSize.y),
+      crossSection: baseSize,
+      wasInWater: state.depth > 0.03,
+      impactCooldown: 0,
+      disposableGeometries: [],
+      disposableMaterials: [],
+    });
+  }
+
+  private updateDebrisBodies(simDt: number): void {
+    const rm: DebrisBody[] = [];
+    const boundsPad = 90;
+    const xMinBound = this.solver.xMin - boundsPad;
+    const xMaxBound = this.solver.xMax + boundsPad;
+    const zMinBound = this.solver.zMin - boundsPad;
+    const zMaxBound = this.solver.zMax + boundsPad;
+
+    for (const body of this.debrisBodies) {
+      const removable = body.kind === "small";
+      if (removable) {
+        body.ttl -= simDt;
+      }
+      body.impactCooldown = Math.max(0, body.impactCooldown - simDt);
+      if (removable && body.ttl <= 0) {
+        rm.push(body);
+        continue;
+      }
+
+      const pos = body.object.position;
+      const state = this.solver.sampleStateAtWorld(pos.x, pos.z, true, 3);
+
+      if (body.kind === "tree") {
+        this.integrateTreeDebris(body, state, simDt);
+      } else {
+        this.integrateGenericDebris(body, state, simDt);
+      }
+
+      const inWater = state.depth > 0.04 && !state.obstacle;
+      if (!body.wasInWater && inWater && Math.abs(body.velocity.y) > 0.45 && body.impactCooldown <= 0) {
+        const splashStrength = Math.min(3.0, 0.9 + Math.abs(body.velocity.y) * 0.6 + state.depth * 0.25);
+        this.surface.addImpactAtWorld(pos.x, pos.z, splashStrength, 3.4 + Math.min(8, body.crossSection * 2.8));
+        body.impactCooldown = 0.55;
+      }
+      body.wasInWater = inWater;
+
+      if (pos.x < xMinBound || pos.x > xMaxBound || pos.z < zMinBound || pos.z > zMaxBound) {
+        if (removable) {
+          rm.push(body);
+        } else {
+          pos.x = Math.max(xMinBound, Math.min(xMaxBound, pos.x));
+          pos.z = Math.max(zMinBound, Math.min(zMaxBound, pos.z));
+          body.velocity.x = 0;
+          body.velocity.z = 0;
+        }
+      }
+    }
+
+    for (const body of rm) this.removeDebrisBody(body);
+  }
+
+  private integrateTreeDebris(
+    body: DebrisBody,
+    state: ReturnType<ShallowWaterSolver["sampleStateAtWorld"]>,
+    simDt: number,
+  ): void {
+    const pos = body.object.position;
+    const flowSpeed = Math.hypot(state.u, state.v);
+    const submerged = clamp01(
+      (state.depth + body.characteristicHeight * 0.08) /
+        Math.max(0.8, body.characteristicHeight * 0.72),
+    );
+
+    const targetVX = state.u * (1.02 + submerged * 0.38);
+    const targetVZ = state.v * (1.02 + submerged * 0.38);
+    const align = Math.min(1, body.drag * (0.55 + submerged * 0.8) * simDt);
+    body.velocity.x += (targetVX - body.velocity.x) * align;
+    body.velocity.z += (targetVZ - body.velocity.z) * align;
+
+    const targetY =
+      state.surfaceY +
+      body.floatOffset -
+      (1 - submerged) * 0.16 * Math.max(1, body.characteristicHeight * 0.35);
+    body.velocity.y += (targetY - pos.y) * body.buoyancy * simDt;
+    body.velocity.y -= 9.81 * (1 - submerged * 0.92) * simDt;
+
+    const turbulence = Math.min(2.0, flowSpeed * 0.22 + state.depth * 0.08);
+    body.velocity.x += (Math.random() - 0.5) * turbulence * simDt;
+    body.velocity.z += (Math.random() - 0.5) * turbulence * simDt;
+
+    this.tmpVecA.set(state.u, 0.18 + 0.24 * (1 - submerged), state.v);
+    if (this.tmpVecA.lengthSq() < 1e-6) {
+      this.tmpVecA.copy(WORLD_UP);
+    } else {
+      this.tmpVecA.normalize();
+    }
+
+    this.tmpVecB.copy(WORLD_UP).applyQuaternion(body.object.quaternion).normalize();
+    this.tmpVecC.crossVectors(this.tmpVecB, this.tmpVecA);
+    const torqueStrength = (1.8 + flowSpeed * 0.9) * Math.max(0.25, submerged);
+    body.angularVelocity.addScaledVector(this.tmpVecC, torqueStrength * simDt);
+    body.angularVelocity.y += (Math.random() - 0.5) * (0.08 + flowSpeed * 0.12) * simDt;
+
+    body.object.position.addScaledVector(body.velocity, simDt);
+    this.integrateAngular(body, simDt);
+
+    const groundY = state.terrainY + 0.05;
+    if (body.object.position.y < groundY) {
+      body.object.position.y = groundY;
+      if (body.velocity.y < 0) body.velocity.y *= -0.12;
+      body.velocity.x *= 0.92;
+      body.velocity.z *= 0.92;
+    }
+
+    body.angularVelocity.multiplyScalar(Math.max(0, 1 - body.angularDrag * simDt));
+  }
+
+  private integrateGenericDebris(
+    body: DebrisBody,
+    state: ReturnType<ShallowWaterSolver["sampleStateAtWorld"]>,
+    simDt: number,
+  ): void {
+    const pos = body.object.position;
+    const speedFlow = Math.hypot(state.u, state.v);
+
+    if (state.depth > 0.02 && !state.obstacle) {
+      const targetY =
+        state.surfaceY +
+        body.floatOffset +
+        Math.sin(performance.now() * 0.0013 + pos.x * 0.07) * 0.06;
+      body.velocity.y += (targetY - pos.y) * body.buoyancy * simDt;
+
+      const align = Math.min(1, body.drag * simDt);
+      body.velocity.x += (state.u * 1.25 - body.velocity.x) * align;
+      body.velocity.z += (state.v * 1.25 - body.velocity.z) * align;
+
+      const turbulence = Math.min(1.7, speedFlow * 0.18);
+      body.velocity.x += (Math.random() - 0.5) * turbulence * simDt;
+      body.velocity.z += (Math.random() - 0.5) * turbulence * simDt;
+    } else {
+      body.velocity.y -= 9.81 * simDt;
+      body.velocity.x *= Math.max(0, 1 - 0.55 * simDt);
+      body.velocity.z *= Math.max(0, 1 - 0.55 * simDt);
+
+      const groundY = state.terrainY + 0.08;
+      if (pos.y < groundY) {
+        pos.y = groundY;
+        if (body.velocity.y < 0) body.velocity.y *= -0.18;
+        body.velocity.x *= 0.85;
+        body.velocity.z *= 0.85;
+      }
+    }
+
+    body.object.position.addScaledVector(body.velocity, simDt);
+    this.integrateAngular(body, simDt);
+    body.angularVelocity.multiplyScalar(Math.max(0, 1 - body.angularDrag * simDt));
+  }
+
+  private integrateAngular(body: DebrisBody, simDt: number): void {
+    const w = body.angularVelocity.length();
+    if (w < 1e-6) return;
+    this.tmpVecA.copy(body.angularVelocity).multiplyScalar(1 / w);
+    this.tmpQuat.setFromAxisAngle(this.tmpVecA, w * simDt);
+    body.object.quaternion.premultiply(this.tmpQuat).normalize();
+  }
+
+  private emitWallImpacts(simDt: number): void {
+    this.wallImpactTimer += simDt;
+    if (this.wallImpactTimer < 0.18) return;
+    this.wallImpactTimer = 0;
+
+    const total = this.solver.width * this.solver.height;
+    for (let n = 0; n < 120; n++) {
+      const idx = (Math.random() * total) | 0;
+      if (this.solver.obstacle[idx] !== 0) continue;
+
+      const d = this.solver.depth[idx]!;
+      if (d < 1.0) continue;
+      const mx = this.solver.mx[idx]!;
+      const my = this.solver.my[idx]!;
+      const speed = d > 1e-5 ? Math.hypot(mx / d, my / d) : 0;
+      if (speed < 2.2) continue;
+
+      const i = idx % this.solver.width;
+      const j = Math.floor(idx / this.solver.width);
+      const nearWall =
+        (i > 0 && this.solver.obstacle[idx - 1] !== 0) ||
+        (i < this.solver.width - 1 && this.solver.obstacle[idx + 1] !== 0) ||
+        (j > 0 && this.solver.obstacle[idx - this.solver.width] !== 0) ||
+        (j < this.solver.height - 1 && this.solver.obstacle[idx + this.solver.width] !== 0);
+      if (!nearWall) continue;
+
+      const wp = this.solver.cellIndexToWorld(idx);
+      const impactStrength = Math.min(2.6, speed * 0.33 + d * 0.14);
+      this.surface.addImpactAtWorld(
+        wp.x,
+        wp.z,
+        impactStrength,
+        3 + Math.min(5, speed * 0.9),
+      );
+      this.solver.injectMomentumImpulse(
+        wp.x,
+        wp.z,
+        (mx / Math.max(d, 1e-5)) * 0.2,
+        (my / Math.max(d, 1e-5)) * 0.2,
+        2.8,
+        0.6,
+      );
+    }
+  }
+
+  private cloneMeshIntoParent(source: THREE.Mesh, parent: THREE.Object3D): THREE.Mesh {
+    const clone = source.clone(false) as THREE.Mesh;
+    clone.geometry = source.geometry;
+    clone.material = source.material;
+    clone.visible = true;
+    parent.add(clone);
+    this.copyWorldTransformToParent(source, parent, clone);
+    return clone;
+  }
+
+  private copyWorldTransformToParent(
+    source: THREE.Object3D,
+    parent: THREE.Object3D,
+    target: THREE.Object3D,
+  ): void {
+    this.root.updateMatrixWorld(true);
+    source.updateMatrixWorld(true);
+    parent.updateMatrixWorld(true);
+    this.tmpMat.copy(parent.matrixWorld).invert().multiply(source.matrixWorld);
+    this.tmpMat.decompose(target.position, target.quaternion, target.scale);
+  }
+
+  private clearDebris(): void {
+    while (this.debrisBodies.length > 0) {
+      const body = this.debrisBodies.pop()!;
+      this.destroyDebrisBody(body);
+    }
+  }
+
+  private removeDebrisBody(body: DebrisBody): void {
+    const idx = this.debrisBodies.indexOf(body);
+    if (idx >= 0) this.debrisBodies.splice(idx, 1);
+    this.destroyDebrisBody(body);
+  }
+
+  private destroyDebrisBody(body: DebrisBody): void {
+    this.debrisGroup.remove(body.object);
+    for (const geo of body.disposableGeometries) geo.dispose();
+    for (const mat of body.disposableMaterials) mat.dispose();
+  }
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
 // --- Public simulator ---
 
 export class FloodSimulator {
   active = false;
   position = new THREE.Vector3();
-  maxHeight = 2.0;
+  maxHeight = 10.0;
   affectedRadiusMeters = 0;
 
   private scene: THREE.Scene;
@@ -1469,8 +2216,9 @@ export class FloodSimulator {
   private context: FloodInitContext | null = null;
   private solver: ShallowWaterSolver | null = null;
   private surface: FloodWaterSurface | null = null;
+  private environment: FloodEnvironmentEffectsRealistic | null = null;
   private running = false;
-  private flowSpeed = 3.0;
+  private flowSpeed = 3.2;
   private lastEmit = 0;
 
   constructor(scene: THREE.Scene) {
@@ -1486,7 +2234,7 @@ export class FloodSimulator {
   }
 
   setMaxHeight(meters: number) {
-    this.maxHeight = clamp(meters, 0.5, 8.0);
+    this.maxHeight = Math.max(10, meters);
     if (this.solver) {
       this.solver.setSourceDepthMeters(this.maxHeight);
     }
@@ -1518,6 +2266,7 @@ export class FloodSimulator {
 
     const parent = this.context.parent ?? sceneGroupRef ?? this.scene;
     parent.add(this.surface.mesh);
+    this.environment = new FloodEnvironmentEffectsRealistic(parent as THREE.Group, this.solver, this.surface);
 
     this.active = true;
     this.running = true;
@@ -1541,6 +2290,7 @@ export class FloodSimulator {
     const simDt = dt * this.flowSpeed;
     this.solver.step(simDt);
     this.surface.updateFromSolver(this.solver, dt);
+    if (this.environment) this.environment.update(simDt);
 
     const stats = this.solver.stats;
     if (stats.wetCellCount > 0) {
@@ -1553,7 +2303,7 @@ export class FloodSimulator {
     if (this.eventBus && this.lastEmit >= 0.5) {
       this.lastEmit = 0;
       const src = this.solver.getSourcePosition();
-      const state = this.solver.sampleStateAtWorld(src.x, src.z);
+      const state = this.solver.sampleStateAtWorld(src.x, src.z, true, 0);
       this.eventBus.emit({
         type: "FLOOD_LEVEL",
         position: [src.x, state.surfaceY, src.z],
@@ -1564,6 +2314,10 @@ export class FloodSimulator {
   }
 
   private disposeInternal() {
+    if (this.environment) {
+      this.environment.dispose();
+      this.environment = null;
+    }
     if (this.surface) {
       const parent = this.context?.parent ?? sceneGroupRef ?? this.scene;
       parent.remove(this.surface.mesh);
