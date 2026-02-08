@@ -4,6 +4,11 @@ import { MapPin, Flame, CloudLightning, Mountain, Waves, Rocket, Search, Users }
 import { DitherCityBackground } from "./DitherCity.tsx";
 import { cn } from "./cn.ts";
 
+export type LoadingStep = {
+  label: string;
+  status: "pending" | "active" | "done" | "error";
+};
+
 interface LandingOverlayProps {
   onLookup: (address: string) => Promise<{ lat: number; lon: number } | { error: string }>;
   onLaunch: (lat: number, lon: number, size: number, scenario: string, enableAgents: boolean) => void;
@@ -16,19 +21,46 @@ const SCENARIOS = [
   { id: "tornado", name: "Tornado", icon: CloudLightning, color: "text-purple-400", available: true },
   { id: "earthquake", name: "Earthquake", icon: Mountain, color: "text-yellow-400", available: true },
   { id: "flood", name: "Flood", icon: Waves, color: "text-blue-400", available: true },
-  { id: "tsunami", name: "Tsunami", icon: Waves, color: "text-cyan-400", available: false },
 ];
 
+const STORAGE_KEY = "opendisaster-landing";
+
+function loadSaved() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function saveState(vals: Record<string, unknown>) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(vals)); } catch {}
+}
+
+// Global ref so main.ts can push loading updates into React
+let _setLoadingStepsGlobal: ((steps: LoadingStep[]) => void) | null = null;
+
+export function updateLoadingSteps(steps: LoadingStep[]) {
+  _setLoadingStepsGlobal?.(steps);
+}
+
 export function LandingOverlay({ onLookup, onLaunch, defaultLat, defaultLon }: LandingOverlayProps) {
-  const [lat, setLat] = useState(defaultLat.toString());
-  const [lon, setLon] = useState(defaultLon.toString());
-  const [size, setSize] = useState(500);
-  const [address, setAddress] = useState("");
+  const saved = useRef(loadSaved()).current;
+  const [lat, setLat] = useState(saved?.lat ?? defaultLat.toString());
+  const [lon, setLon] = useState(saved?.lon ?? defaultLon.toString());
+  const [size, setSize] = useState(saved?.size ?? 500);
+  const [address, setAddress] = useState(saved?.address ?? "");
   const [lookupError, setLookupError] = useState("");
   const [lookupLoading, setLookupLoading] = useState(false);
-  const [selectedScenario, setSelectedScenario] = useState("fire");
-  const [enableAgents, setEnableAgents] = useState(true);
+  const [selectedScenario, setSelectedScenario] = useState(saved?.scenario ?? "fire");
+  const [enableAgents, setEnableAgents] = useState(saved?.enableAgents ?? true);
+  const [isLoading, setIsLoading] = useState(false);
+  const [loadingSteps, setLoadingSteps] = useState<LoadingStep[]>([]);
   const addressRef = useRef<HTMLInputElement>(null);
+
+  // Register global setter for loading steps
+  _setLoadingStepsGlobal = (steps: LoadingStep[]) => {
+    setLoadingSteps(steps);
+  };
 
   async function handleLookup() {
     if (!address.trim()) return;
@@ -53,7 +85,71 @@ export function LandingOverlay({ onLookup, onLaunch, defaultLat, defaultLon }: L
     const la = parseFloat(lat);
     const lo = parseFloat(lon);
     if (isNaN(la) || isNaN(lo)) return;
+    saveState({ lat, lon, size, address, scenario: selectedScenario, enableAgents });
+    setIsLoading(true);
     onLaunch(la, lo, size, selectedScenario, enableAgents);
+  }
+
+  if (isLoading) {
+    const doneCount = loadingSteps.filter(s => s.status === "done").length;
+    const totalCount = loadingSteps.length || 1;
+    const activeStep = loadingSteps.find(s => s.status === "active");
+    const progress = totalCount > 0 ? (doneCount / totalCount) * 100 : 0;
+
+    return (
+      <div className="fixed inset-0 z-[10] flex items-center justify-center" style={{ fontFamily: "'IBM Plex Mono', monospace" }}>
+        <DitherCityBackground />
+
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4 }}
+          className={cn(
+            "relative z-[1] flex flex-col items-center gap-6 p-8 max-w-[500px] w-[90%]",
+            "rounded-2xl bg-white/[0.04] border border-white/[0.08] backdrop-blur-xl"
+          )}
+        >
+          <h1 className="text-2xl font-bold text-white tracking-tight">Loading</h1>
+
+          {/* Progress bar */}
+          <div className="w-full h-1.5 bg-white/[0.08] rounded-full overflow-hidden">
+            <motion.div
+              className="h-full bg-white rounded-full"
+              initial={{ width: 0 }}
+              animate={{ width: `${progress}%` }}
+              transition={{ duration: 0.3, ease: "easeOut" }}
+            />
+          </div>
+
+          {/* Step list */}
+          <div className="w-full space-y-2">
+            {loadingSteps.map((step, i) => (
+              <div key={i} className="flex items-center gap-3 text-sm">
+                <div className={cn(
+                  "w-1.5 h-1.5 rounded-full shrink-0",
+                  step.status === "done" && "bg-green-400",
+                  step.status === "active" && "bg-white animate-pulse",
+                  step.status === "pending" && "bg-white/20",
+                  step.status === "error" && "bg-red-400",
+                )} />
+                <span className={cn(
+                  step.status === "done" && "text-neutral-500",
+                  step.status === "active" && "text-white",
+                  step.status === "pending" && "text-neutral-600",
+                  step.status === "error" && "text-red-400",
+                )}>
+                  {step.label}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {activeStep && (
+            <p className="text-xs text-neutral-500">{activeStep.label}...</p>
+          )}
+        </motion.div>
+      </div>
+    );
   }
 
   return (

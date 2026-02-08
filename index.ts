@@ -352,6 +352,53 @@ Bun.serve({
       }
     }
 
+    // --- API: satellite imagery proxy ---
+    if (url.pathname === "/api/satellite") {
+      const lat = parseFloat(url.searchParams.get("lat") ?? "");
+      const lon = parseFloat(url.searchParams.get("lon") ?? "");
+      const size = Math.max(100, Math.min(2000, parseInt(url.searchParams.get("size") ?? "500") || 500));
+      if (isNaN(lat) || isNaN(lon)) {
+        return new Response("Missing or invalid lat/lon", { status: 400 });
+      }
+
+      const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+      if (!apiKey) {
+        return new Response("No GOOGLE_MAPS_API_KEY configured", { status: 501 });
+      }
+
+      try {
+        // Use explicit zoom if provided, otherwise compute from size
+        let zoom: number;
+        if (url.searchParams.has("zoom")) {
+          zoom = Math.min(21, Math.max(1, parseInt(url.searchParams.get("zoom")!)));
+        } else {
+          const metersPerPixelNeeded = size / 640;
+          zoom = Math.min(21, Math.max(1, Math.round(
+            Math.log2(156543.03392 * Math.cos(lat * Math.PI / 180) / metersPerPixelNeeded)
+          )));
+        }
+
+        const mapsUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${lat},${lon}&zoom=${zoom}&size=640x640&scale=2&maptype=satellite&key=${apiKey}`;
+        const res = await fetch(mapsUrl);
+        if (!res.ok) {
+          const text = await res.text();
+          return new Response(`Google Maps API error: ${text}`, { status: 502 });
+        }
+
+        const imageBytes = await res.arrayBuffer();
+        return new Response(imageBytes, {
+          headers: {
+            "Content-Type": res.headers.get("Content-Type") ?? "image/png",
+            "Cache-Control": "public, max-age=3600",
+            "X-Satellite-Zoom": String(zoom),
+          },
+        });
+      } catch (err) {
+        console.error("Satellite fetch failed:", err);
+        return new Response(`Satellite fetch error: ${err}`, { status: 502 });
+      }
+    }
+
     // --- Static: Replay viewer ---
     if (url.pathname === "/replay") {
       const file = Bun.file(join(import.meta.dir, "public", "replay.html"));

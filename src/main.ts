@@ -1,8 +1,9 @@
 import * as THREE from "three";
 import { WebGPURenderer } from "three/webgpu";
+import { CSMShadowNode } from "three/examples/jsm/csm/CSMShadowNode.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { fetchLayers } from "./tiles.ts";
-import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, terrainMeshRef, resetCarsToBase, sceneGroupRef, roadLinesRef } from "./layers.ts";
+import { fetchLayers, fetchSatelliteImage } from "./tiles.ts";
+import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, terrainMeshRef, resetCarsToBase, sceneGroupRef, roadLinesRef, computeSatelliteBounds } from "./layers.ts";
 import { FlyControls } from "./controls.ts";
 import { TornadoSimulator, EF_SCALE } from "./disasters/tornado.ts";
 import { EarthquakeSimulator } from "./disasters/earthquake.ts";
@@ -27,7 +28,7 @@ import { ReplayCaptureSystem } from "./replay/ReplayCaptureSystem.ts";
 // React landing overlay
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { LandingOverlay } from "./ui/LandingOverlay.tsx";
+import { LandingOverlay, updateLoadingSteps, type LoadingStep } from "./ui/LandingOverlay.tsx";
 
 // --- Landing page state (will be set by React callbacks) ---
 let landingLat = 40.7484;
@@ -132,7 +133,7 @@ scene.background = new THREE.Color(skyColor);
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.5, 1000);
 camera.position.set(0, 80, 200);
 
-// Lighting — sun directional light with shadows
+// Lighting — sun directional light with cascaded shadow maps (WebGPU)
 const sun = new THREE.DirectionalLight(0xfff4e0, 1.5);
 sun.position.set(200, 400, 300);
 sun.castShadow = true;
@@ -140,10 +141,14 @@ sun.shadow.mapSize.width = 2048;
 sun.shadow.mapSize.height = 2048;
 sun.shadow.camera.near = 1;
 sun.shadow.camera.far = 1000;
-sun.shadow.camera.left = -300;
-sun.shadow.camera.right = 300;
-sun.shadow.camera.top = 300;
-sun.shadow.camera.bottom = -300;
+
+const csm = new CSMShadowNode(sun, {
+  cascades: 4,
+  maxFar: 1000,
+  mode: "practical",
+});
+csm.fade = true;
+sun.shadow.shadowNode = csm;
 scene.add(sun);
 
 // Hemisphere light: sky blue from above, warm ground bounce from below
@@ -165,7 +170,7 @@ window.addEventListener("resize", () => {
 });
 
 // --- Tornado, Earthquake, Flood simulators ---
-const tornado = new TornadoSimulator(scene);
+const tornado = new TornadoSimulator(scene, renderer);
 const quake = new EarthquakeSimulator(scene);
 const flood = new FloodSimulator(scene);
 const fire = new FireSimulator(scene);
@@ -204,7 +209,9 @@ updateMagnitudeDisplay();
 
 function updateFloodDisplay() {
   const h = parseFloat(floodHeightSlider.value);
-  floodHeightVal.textContent = h.toFixed(1);
+  const t = (h - 10) / 20;
+  const vol = 20000 + t * 180000;
+  floodHeightVal.textContent = vol >= 1000 ? `${Math.round(vol / 1000)}k` : `${Math.round(vol)}`;
   flood.setMaxHeight(h);
   floodRadiusVal.textContent = `${Math.round(flood.affectedRadiusMeters)} m`;
 }
@@ -867,15 +874,21 @@ function mountLandingOverlay() {
 
 async function loadScene(lat: number, lon: number, size: number, scenarioId: string, enableAgents: boolean = true) {
   landingEnableAgents = enableAgents;
-  // Unmount React landing overlay
-  if (reactRoot) {
-    reactRoot.unmount();
-    reactRoot = null;
-  }
-  landingRoot.innerHTML = "";
-  landingRoot.style.display = "none";
 
-  loading.style.display = "block";
+  // Build loading steps
+  const steps: LoadingStep[] = [
+    { label: "Fetching map data (OpenStreetMap + USGS elevation)", status: "active" },
+    { label: "Fetching satellite imagery", status: "active" },
+    { label: "Loading vehicle models", status: "pending" },
+    { label: "Building 3D scene", status: "pending" },
+  ];
+  if (enableAgents) {
+    steps.push({ label: "Loading agent models", status: "pending" });
+    steps.push({ label: "Spawning agents & launching scenario", status: "pending" });
+  } else {
+    steps.push({ label: "Launching scenario", status: "pending" });
+  }
+  updateLoadingSteps([...steps]);
 
   // Clean up previous agent system
   if (replayCaptureSystem) {
@@ -912,9 +925,44 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
   landingSize = size;
   landingScenario = scenarioId;
 
+  function markStep(index: number, status: LoadingStep["status"]) {
+    steps[index]!.status = status;
+    updateLoadingSteps([...steps]);
+  }
+
   try {
-    const layers = await fetchLayers(lat, lon, size);
+    // Steps 0 & 1 run in parallel (map data + satellite)
+    const layersPromise = fetchLayers(lat, lon, size).then(result => {
+      markStep(0, "done");
+      return result;
+    });
+    const satellitePromise = fetchSatelliteImage(lat, lon, size).then(result => {
+      markStep(1, "done");
+      return result;
+    });
+
+    const [layers, satelliteResult] = await Promise.all([layersPromise, satellitePromise]);
+
+    // Step 2: car model
+    markStep(2, "active");
     await carTemplatePromise;
+    markStep(2, "done");
+
+    // Load satellite texture from blob URL if available
+    let satelliteTexture: THREE.Texture | null = null;
+    let satBounds: ReturnType<typeof computeSatelliteBounds> | null = null;
+    if (satelliteResult) {
+      try {
+        satelliteTexture = await new THREE.TextureLoader().loadAsync(satelliteResult.blobUrl);
+        satBounds = computeSatelliteBounds(lat, satelliteResult.zoom, satelliteResult.tilesPerAxis);
+        console.log(`[Satellite] Loaded texture, zoom=${satelliteResult.zoom}, ${satelliteResult.tilesPerAxis}x${satelliteResult.tilesPerAxis} tiles, coverage=${satBounds.width.toFixed(0)}m`);
+      } catch (err) {
+        console.warn("[Satellite] Failed to load texture:", err);
+      }
+    }
+
+    // Step 3: Build scene
+    markStep(3, "active");
 
     if (sceneGroup) {
       scene.remove(sceneGroup);
@@ -939,12 +987,13 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
   stopFlood();
   stopFire();
 
-    const buildResult = buildAllLayers(layers, lat, lon, carTemplate);
+    const buildResult = buildAllLayers(layers, lat, lon, carTemplate, satelliteTexture, satBounds);
     sceneGroup = buildResult.group;
     heightSampler = buildResult.heightSampler;
     resetCarsToBase();
     scene.add(sceneGroup);
     flood.setTerrainContext(layers, lat, lon, sun, sceneGroup);
+    markStep(3, "done");
 
     // Reset camera — scale distance with area size
     const camScale = size / 500;
@@ -953,11 +1002,18 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
 
     // Initialize exploration phase and launch selected scenario directly
     if (landingEnableAgents) {
+      // Step 4: Load agent models
+      markStep(4, "active");
       await initExploration(sceneGroup, size, heightSampler);
-      // Launch the scenario chosen on the landing page (skip scenario panel)
+      markStep(4, "done");
+
+      // Step 5: Spawn & launch
+      markStep(5, "active");
       launchScenario(scenarioId);
+      markStep(5, "done");
     } else {
-      // No agents — just launch the disaster directly
+      // Step 4: Launch scenario (no agents)
+      markStep(4, "active");
       const scenario = scenarios.find(s => s.id === scenarioId);
       if (scenario?.available) {
         sharedEventBus = new EventBus();
@@ -965,14 +1021,24 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
         scenario.launch(scene, sharedEventBus, heightSampler!);
       }
       info.textContent = "Disaster active (agents disabled)";
+      markStep(4, "done");
     }
     exitSimBtn.style.display = "block";
   } catch (err) {
     console.error("Failed to load:", err);
-    alert("Failed to load data. Check console for details.");
-  } finally {
-    loading.style.display = "none";
+    // Mark current active step as error
+    const activeIdx = steps.findIndex(s => s.status === "active");
+    if (activeIdx >= 0) markStep(activeIdx, "error");
+    return; // keep overlay visible so user sees the error
   }
+
+  // All done — unmount landing overlay
+  if (reactRoot) {
+    reactRoot.unmount();
+    reactRoot = null;
+  }
+  landingRoot.innerHTML = "";
+  landingRoot.style.display = "none";
 }
 
 // --- Mount React landing overlay ---
