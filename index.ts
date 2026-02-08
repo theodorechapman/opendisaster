@@ -123,7 +123,7 @@ async function callVLM(frameBase64: string, apiKey: string, disasterType: string
 }
 
 function hasDanger(observation: string): boolean {
-  return /\bDANGER\s*$/i.test(observation.trim());
+  return /\bDANGER[\s*_\]\)!."]*$/i.test(observation.trim());
 }
 
 async function pooled<T>(tasks: (() => Promise<T>)[], concurrency: number): Promise<T[]> {
@@ -194,7 +194,7 @@ async function processPayloads(payloads: any[], step: number, disasterType: stri
   return payloads.map((payload: any, idx: number) => {
     const observation = observations[idx]!;
     const danger = hasDanger(observation);
-    const cleanObs = observation.replace(/\s*DANGER\s*$/i, "").trim();
+    const cleanObs = observation.replace(/[\s*_\]\)!."]*\bDANGER[\s*_\]\)!."]*$/i, "").trim();
 
     if (danger) {
       logEntry("danger_detected", payload.name, {

@@ -624,6 +624,13 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
   const scenario = scenarios.find((s) => s.id === scenarioId);
   if (!scenario || !scenario.available) return;
 
+  // Set disaster type early so SteppedSimulation picks it up before scenario.launch()
+  if (scenarioId === "tornado" || scenarioId === "earthquake" || scenarioId === "flood") {
+    activeDisasterType = scenarioId;
+  } else {
+    activeDisasterType = null;
+  }
+
   const sampler = heightSampler;
   const sceneHalfSize = sharedSceneSize / 2;
 
