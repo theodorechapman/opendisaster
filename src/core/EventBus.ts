@@ -44,6 +44,14 @@ export type WindFieldUpdateEvent = {
   maxWindSpeed: number;
 };
 
+export type AgentDamagedEvent = {
+  type: "AGENT_DAMAGED";
+  agentIndex: number;
+  position: Vec3;
+  damage: number;
+  source: string;
+};
+
 export type AgentDeathEvent = {
   type: "AGENT_DEATH";
   agentIndex: number;
@@ -58,6 +66,7 @@ export type DisasterEvent =
   | FloodLevelEvent
   | FireSpreadEvent
   | WindFieldUpdateEvent
+  | AgentDamagedEvent
   | AgentDeathEvent;
 
 export type EventType = DisasterEvent["type"] | "*";

@@ -22,6 +22,9 @@ import type { AgentConfig } from "./agents/types.ts";
 import { RoadGraph } from "./agents/RoadGraph.ts";
 import { Position } from "./core/Components.ts";
 import { ReplayCaptureSystem } from "./replay/ReplayCaptureSystem.ts";
+import { SimulationStats, type SimulationStatsData } from "./stats/SimulationStats.ts";
+import { HeatmapOverlay } from "./stats/HeatmapOverlay.ts";
+import { StatsOverlay } from "./stats/StatsOverlay.ts";
 
 const overlay = document.getElementById("overlay")!;
 const goBtn = document.getElementById("go") as HTMLButtonElement;
@@ -451,6 +454,9 @@ let agentManager: AgentManager | null = null;
 let steppedSim: SteppedSimulation | null = null;
 let heightSampler: HeightSampler | null = null;
 let replayCaptureSystem: ReplayCaptureSystem | null = null;
+let simStats: SimulationStats | null = null;
+let heatmapOverlay: HeatmapOverlay | null = null;
+let statsOverlay: StatsOverlay | null = null;
 
 // Exploration phase shared state
 let explorationReady = false;
@@ -689,11 +695,27 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
 
   const replayRecorder = new ReplayRecorder(agentManager, locationStr);
 
+  // Create stats collector, heatmap overlay, and stats overlay
+  const bounds = {
+    xMin: -sceneHalfSize,
+    xMax: sceneHalfSize,
+    zMin: -sceneHalfSize,
+    zMax: sceneHalfSize,
+  };
+  simStats = new SimulationStats(sharedEventBus, agentManager, bounds);
+  heatmapOverlay = new HeatmapOverlay(scene, bounds, 30);
+  statsOverlay = new StatsOverlay();
+
+  const onSimulationEnd = (data: SimulationStatsData) => {
+    statsOverlay!.show(data, heatmapOverlay!);
+  };
+
   steppedSim = new SteppedSimulation(world, agentManager, perception, recorder, sharedEventBus, replayRecorder, {
     stepDurationSec: 1,
     enabled: true,
     disasterType: activeDisasterType ?? "fire",
-  });
+    maxDurationSec: 60,
+  }, simStats, onSimulationEnd);
 
   // 3b. Create replay capture system
   replayCaptureSystem = new ReplayCaptureSystem(renderer, scene, agentManager, replayRecorder);
@@ -773,6 +795,12 @@ stopSimBtn.addEventListener("click", async () => {
   await steppedSim.stop();
   steppedSim = null;
 
+  // Clean up stats (overlay stays visible until user closes it)
+  if (simStats) {
+    simStats.dispose();
+    simStats = null;
+  }
+
   // Clean up any active disaster
   if (activeDisasterType === "tornado") {
     tornado.reset();
@@ -820,6 +848,9 @@ goBtn.addEventListener("click", async () => {
     await steppedSim.stop();
     steppedSim = null;
   }
+  if (simStats) { simStats.dispose(); simStats = null; }
+  if (heatmapOverlay) { heatmapOverlay.dispose(); heatmapOverlay = null; }
+  if (statsOverlay) { statsOverlay.dispose(); statsOverlay = null; }
   stopSimBtn.style.display = "none";
   world = null;
   agentManager = null;

@@ -8,6 +8,7 @@ import { AgentState, AgentAction, AgentFacing, Position, ActionType } from "../c
 import type { EventBus, FireSpreadEvent } from "../core/EventBus.ts";
 import { agentLog } from "./AgentLogger.ts";
 import type { ReplayRecorder } from "../replay/ReplayRecorder.ts";
+import type { SimulationStats, SimulationStatsData } from "../stats/SimulationStats.ts";
 
 const ACTION_NAMES: Record<number, string> = {
   [ActionType.IDLE]: "IDLE",
@@ -19,6 +20,7 @@ export interface SteppedSimConfig {
   stepDurationSec: number;  // seconds of sim time per step
   enabled: boolean;
   disasterType?: string;
+  maxDurationSec?: number;  // auto-end timer (default: 120)
 }
 
 interface Snapshot {
@@ -61,6 +63,12 @@ export class SteppedSimulation {
   private activeFireSources: { x: number; z: number; radius: number }[] = [];
   /** Replay recorder for persisting session data to IndexedDB. */
   private replayRecorder: ReplayRecorder;
+  /** Stats collector. */
+  private stats: SimulationStats | null = null;
+  /** Callback when simulation ends. */
+  private onSimulationEnd: ((stats: SimulationStatsData) => void) | null = null;
+  /** Max simulation duration in seconds. */
+  private maxDurationSec: number;
 
   constructor(
     world: SimWorld,
@@ -70,6 +78,8 @@ export class SteppedSimulation {
     eventBus: EventBus,
     replayRecorder: ReplayRecorder,
     config: SteppedSimConfig = { stepDurationSec: 1, enabled: true },
+    stats?: SimulationStats,
+    onSimulationEnd?: (stats: SimulationStatsData) => void,
   ) {
     this.world = world;
     this.manager = manager;
@@ -77,6 +87,9 @@ export class SteppedSimulation {
     this.recorder = recorder;
     this.config = config;
     this.replayRecorder = replayRecorder;
+    this.stats = stats ?? null;
+    this.onSimulationEnd = onSimulationEnd ?? null;
+    this.maxDurationSec = config.maxDurationSec ?? 120;
 
     // Subscribe to FIRE_SPREAD events to track fire sources
     eventBus.on("FIRE_SPREAD", (event) => {
@@ -275,8 +288,13 @@ export class SteppedSimulation {
     this.tickInterval = setInterval(() => this.tick(), this.config.stepDurationSec * 1000);
   }
 
+  /** Whether stop() already ran (prevents double-finalize). */
+  private stopped = false;
+
   /** Stop the simulation loop and save replay. */
   async stop(): Promise<void> {
+    if (this.stopped) return;
+    this.stopped = true;
     this.running = false;
     if (this.tickInterval) {
       clearInterval(this.tickInterval);
@@ -284,6 +302,22 @@ export class SteppedSimulation {
     }
     this.ws?.close();
     await this.replayRecorder.finalize();
+
+    // Finalize stats and notify callback
+    if (this.stats && this.onSimulationEnd) {
+      const data = this.stats.finalize(this.simTime);
+      this.onSimulationEnd(data);
+    }
+  }
+
+  /** Trigger the stop-sim button so main.ts cleanup runs. */
+  private triggerAutoStop(): void {
+    const btn = document.getElementById("stop-sim-btn") as HTMLButtonElement | null;
+    if (btn) {
+      btn.click();
+    } else {
+      this.stop();
+    }
   }
 
   /** Fires every stepDurationSec. Captures frames and sends fire-and-forget WS message. */
@@ -297,14 +331,26 @@ export class SteppedSimulation {
     try {
       this.simTime += this.config.stepDurationSec;
 
+      // Sample stats each tick
+      if (this.stats) {
+        this.stats.sample(this.simTime);
+      }
+
       // Sync visuals before capture
       this.manager.syncVisuals();
 
       // Capture perception frames for all living agents
       const living = this.manager.getLiving();
       if (living.length === 0) {
-        console.log("[SteppedSim] All agents dead. Stopping.");
-        this.stop();
+        console.log("[SteppedSim] All agents dead. Auto-stopping.");
+        this.triggerAutoStop();
+        return;
+      }
+
+      // Timer auto-end check
+      if (this.simTime >= this.maxDurationSec) {
+        console.log("[SteppedSim] Timer expired. Auto-stopping.");
+        this.triggerAutoStop();
         return;
       }
 
@@ -514,6 +560,7 @@ export class SteppedSimulation {
       return `<div class="agent-row ${alive ? "" : "dead"}">${agent.config.name}: ${status}</div>`;
     });
 
-    hud.innerHTML = `<div class="agent-header">Step ${this.step} | ${this.simTime.toFixed(0)}s</div>${lines.join("")}`;
+    const remaining = Math.max(0, this.maxDurationSec - this.simTime);
+    hud.innerHTML = `<div class="agent-header">Step ${this.step} | ${this.simTime.toFixed(0)}s | ${remaining.toFixed(0)}s remaining</div>${lines.join("")}`;
   }
 }
