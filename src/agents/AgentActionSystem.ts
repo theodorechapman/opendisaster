@@ -67,6 +67,38 @@ function collidesWithObstacle(x: number, z: number, obstacles: Obstacle[]): bool
   return false;
 }
 
+/** If agent is overlapping an obstacle, push them to the nearest edge. */
+function pushOutOfObstacles(x: number, z: number, obstacles: Obstacle[]): { x: number; z: number } {
+  for (const o of obstacles) {
+    const cx = Math.max(o.minX, Math.min(x, o.maxX));
+    const cz = Math.max(o.minZ, Math.min(z, o.maxZ));
+    const dx = x - cx;
+    const dz = z - cz;
+    const distSq = dx * dx + dz * dz;
+    if (distSq < AGENT_RADIUS * AGENT_RADIUS) {
+      if (distSq > 0.0001) {
+        // Push along the vector from closest point to agent center
+        const dist = Math.sqrt(distSq);
+        const pushDist = AGENT_RADIUS - dist + 0.1; // small extra margin
+        x += (dx / dist) * pushDist;
+        z += (dz / dist) * pushDist;
+      } else {
+        // Agent center is exactly inside the AABB — push to nearest edge
+        const toMinX = x - o.minX;
+        const toMaxX = o.maxX - x;
+        const toMinZ = z - o.minZ;
+        const toMaxZ = o.maxZ - z;
+        const minPush = Math.min(toMinX, toMaxX, toMinZ, toMaxZ);
+        if (minPush === toMinX) x = o.minX - AGENT_RADIUS - 0.1;
+        else if (minPush === toMaxX) x = o.maxX + AGENT_RADIUS + 0.1;
+        else if (minPush === toMinZ) z = o.minZ - AGENT_RADIUS - 0.1;
+        else z = o.maxZ + AGENT_RADIUS + 0.1;
+      }
+    }
+  }
+  return { x, z };
+}
+
 /** Try to move from (px,pz) toward (nx,nz)*speed*dt, sliding along obstacles.
  *  When sliding along a wall, move at full speed along the unblocked axis. */
 function moveWithCollision(
@@ -101,7 +133,23 @@ function moveWithCollision(
   return { x: px, z: pz, blocked: true };
 }
 
-/** Pick a wander target that isn't inside an obstacle or danger zone. */
+/** Minimum distance from a point to the nearest active danger zone edge.
+ *  Returns Infinity if no active zones exist. */
+function minDangerDist(x: number, z: number, zones: DangerZone[]): number {
+  let minDist = Infinity;
+  const now = Date.now();
+  for (const zone of zones) {
+    if (zone.expiresAt < now) continue;
+    const dx = x - zone.x;
+    const dz = z - zone.z;
+    minDist = Math.min(minDist, Math.sqrt(dx * dx + dz * dz) - zone.radius);
+  }
+  return minDist;
+}
+
+/** Pick a wander target that isn't inside an obstacle or danger zone.
+ *  When danger zones exist, all candidates are scored to maximize distance
+ *  from the nearest danger — the agent always moves AWAY from known threats. */
 function pickWanderTarget(
   px: number,
   pz: number,
@@ -109,39 +157,89 @@ function pickWanderTarget(
   sceneBound: number,
   dangerZones: DangerZone[] = [],
 ): { x: number; z: number } {
-  for (let attempt = 0; attempt < 16; attempt++) {
-    const angle = Math.random() * Math.PI * 2;
-    const r = WANDER_RADIUS * (0.3 + Math.random() * 0.7);
-    const tx = Math.max(-sceneBound, Math.min(sceneBound, px + Math.cos(angle) * r));
-    const tz = Math.max(-sceneBound, Math.min(sceneBound, pz + Math.sin(angle) * r));
-    if (!collidesWithObstacle(tx, tz, obstacles) && !isInDangerZone(tx, tz, dangerZones)) {
-      return { x: tx, z: tz };
+  const hasActiveDanger = dangerZones.some(z => z.expiresAt > Date.now());
+
+  if (!hasActiveDanger) {
+    // No known danger — plain random wander
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const angle = Math.random() * Math.PI * 2;
+      const r = WANDER_RADIUS * (0.3 + Math.random() * 0.7);
+      const tx = Math.max(-sceneBound, Math.min(sceneBound, px + Math.cos(angle) * r));
+      const tz = Math.max(-sceneBound, Math.min(sceneBound, pz + Math.sin(angle) * r));
+      if (!collidesWithObstacle(tx, tz, obstacles)) {
+        return { x: tx, z: tz };
+      }
     }
+    return { x: px, z: pz };
   }
-  // Fallback: pick direction that maximizes distance from danger zones
+
+  // Danger exists — score candidates to maximize distance from all danger zones.
+  // Sample 16 directions at full WANDER_RADIUS + 8 closer fallback directions.
   let bestX = px;
   let bestZ = pz;
   let bestScore = -Infinity;
-  for (let i = 0; i < 8; i++) {
-    const angle = (i / 8) * Math.PI * 2;
-    const tx = Math.max(-sceneBound, Math.min(sceneBound, px + Math.cos(angle) * 8));
-    const tz = Math.max(-sceneBound, Math.min(sceneBound, pz + Math.sin(angle) * 8));
-    if (collidesWithObstacle(tx, tz, obstacles)) continue;
-    // Score by minimum distance to any danger zone (higher = safer)
-    let minDist = Infinity;
-    const now = Date.now();
-    for (const zone of dangerZones) {
-      if (zone.expiresAt < now) continue;
-      const dx = tx - zone.x;
-      const dz = tz - zone.z;
-      minDist = Math.min(minDist, Math.sqrt(dx * dx + dz * dz) - zone.radius);
-    }
-    if (minDist > bestScore) {
-      bestScore = minDist;
-      bestX = tx;
-      bestZ = tz;
+
+  const radii = [WANDER_RADIUS, WANDER_RADIUS * 0.6, 12];
+  for (const r of radii) {
+    for (let i = 0; i < 16; i++) {
+      const angle = (i / 16) * Math.PI * 2 + (r < WANDER_RADIUS ? Math.PI / 16 : 0);
+      const tx = Math.max(-sceneBound, Math.min(sceneBound, px + Math.cos(angle) * r));
+      const tz = Math.max(-sceneBound, Math.min(sceneBound, pz + Math.sin(angle) * r));
+      if (collidesWithObstacle(tx, tz, obstacles)) continue;
+      if (isInDangerZone(tx, tz, dangerZones)) continue;
+      const score = minDangerDist(tx, tz, dangerZones);
+      if (score > bestScore) {
+        bestScore = score;
+        bestX = tx;
+        bestZ = tz;
+      }
     }
   }
+
+  // Fallback: all candidates were inside danger zones (agent is surrounded).
+  // Compute a weighted escape vector away from all danger zones and flee at max
+  // range, even if the target is still inside a zone — moving away is better
+  // than standing still and burning.
+  if (bestScore === -Infinity) {
+    const now = Date.now();
+    let escX = 0;
+    let escZ = 0;
+    for (const zone of dangerZones) {
+      if (zone.expiresAt < now) continue;
+      const dx = px - zone.x;
+      const dz = pz - zone.z;
+      const dist = Math.sqrt(dx * dx + dz * dz);
+      // Weight by inverse distance — closer zones push harder
+      const weight = 1 / Math.max(dist, 0.1);
+      escX += (dist > 0.01 ? dx / dist : Math.random() - 0.5) * weight;
+      escZ += (dist > 0.01 ? dz / dist : Math.random() - 0.5) * weight;
+    }
+    const escLen = Math.sqrt(escX * escX + escZ * escZ);
+    if (escLen > 0.01) {
+      escX /= escLen;
+      escZ /= escLen;
+    } else {
+      // All zones perfectly centered on agent — pick random direction
+      const rAngle = Math.random() * Math.PI * 2;
+      escX = Math.cos(rAngle);
+      escZ = Math.sin(rAngle);
+    }
+    bestX = Math.max(-sceneBound, Math.min(sceneBound, px + escX * WANDER_RADIUS));
+    bestZ = Math.max(-sceneBound, Math.min(sceneBound, pz + escZ * WANDER_RADIUS));
+    // Nudge away from obstacles if we landed in one
+    if (collidesWithObstacle(bestX, bestZ, obstacles)) {
+      for (const r of [WANDER_RADIUS * 0.5, 12, 6]) {
+        const tx = Math.max(-sceneBound, Math.min(sceneBound, px + escX * r));
+        const tz = Math.max(-sceneBound, Math.min(sceneBound, pz + escZ * r));
+        if (!collidesWithObstacle(tx, tz, obstacles)) {
+          bestX = tx;
+          bestZ = tz;
+          break;
+        }
+      }
+    }
+  }
+
   return { x: bestX, z: bestZ };
 }
 
@@ -163,6 +261,14 @@ export function createAgentActionSystem(manager: AgentManager, obstacles: Obstac
       if (AgentState.alive[eid]! === 0) continue;
 
       const action = AgentAction.actionType[eid]! as ActionType;
+
+      // Push agent out of any obstacle they're overlapping (from pushes, spawns, etc.)
+      {
+        const pushed = pushOutOfObstacles(Position.x[eid]!, Position.z[eid]!, obstacles);
+        Position.x[eid] = pushed.x;
+        Position.z[eid] = pushed.z;
+      }
+
       const px = Position.x[eid]!;
       const pz = Position.z[eid]!;
       const tx = AgentAction.targetX[eid]!;
@@ -176,17 +282,23 @@ export function createAgentActionSystem(manager: AgentManager, obstacles: Obstac
         case ActionType.IDLE:
         case ActionType.WAIT: {
           AgentState.stamina[eid] = Math.min(100, AgentState.stamina[eid]! + STAMINA_REGEN * dt);
-          // Auto-wander: after being idle for a bit, pick a random nearby target
+          const hasActiveDanger = zones.some(z => z.expiresAt > now);
+          // If agent is near known danger, flee immediately instead of idling
+          const nearDanger = hasActiveDanger && minDangerDist(px, pz, zones) < WANDER_RADIUS;
+          const idleThreshold = nearDanger ? 0.3 : WANDER_IDLE_TIME;
+
           AgentAction.progress[eid] = (AgentAction.progress[eid] ?? 0) + dt;
-          if (AgentAction.progress[eid]! >= WANDER_IDLE_TIME) {
+          if (AgentAction.progress[eid]! >= idleThreshold) {
             const target = pickWanderTarget(px, pz, obstacles, sceneBound, zones);
             agentLog.log("auto_wander", agent.config.name, {
               fromX: px, fromZ: pz,
               targetX: target.x, targetZ: target.z,
+              fleeMode: nearDanger,
             });
             AgentAction.targetX[eid] = target.x;
             AgentAction.targetZ[eid] = target.z;
-            AgentAction.actionType[eid] = ActionType.MOVE_TO;
+            // Run away from danger, walk if safe
+            AgentAction.actionType[eid] = nearDanger ? ActionType.RUN_TO : ActionType.MOVE_TO;
             AgentAction.progress[eid] = 0;
           }
           break;
@@ -195,6 +307,20 @@ export function createAgentActionSystem(manager: AgentManager, obstacles: Obstac
         case ActionType.MOVE_TO:
         case ActionType.ENTER_BUILDING:
         case ActionType.EXIT_BUILDING: {
+          // If walk target is now inside a danger zone, abort and flee
+          if (isInDangerZone(tx, tz, zones) || (zones.some(z => z.expiresAt > now) && minDangerDist(px, pz, zones) < 5)) {
+            const safe = pickWanderTarget(px, pz, obstacles, sceneBound, zones);
+            agentLog.log("walk_danger_redirect", agent.config.name, {
+              fromX: px, fromZ: pz,
+              oldTargetX: tx, oldTargetZ: tz,
+              safeTargetX: safe.x, safeTargetZ: safe.z,
+            });
+            AgentAction.targetX[eid] = safe.x;
+            AgentAction.targetZ[eid] = safe.z;
+            AgentAction.actionType[eid] = ActionType.RUN_TO;
+            AgentAction.progress[eid] = 0;
+            break;
+          }
           if (dist > ARRIVAL_DIST) {
             const nx = dx / dist;
             const nz = dz / dist;
@@ -254,11 +380,16 @@ export function createAgentActionSystem(manager: AgentManager, obstacles: Obstac
 
             // Check if the flee target is dangerous or if we'd enter a danger zone.
             // But if we're already IN a zone heading toward a safe target, let us escape.
+            // Also allow moving toward a target inside a zone if it's further from
+            // danger than we are (escape vector — better than standing still).
             const agentInZone = isInDangerZone(px, pz, zones);
             const targetInZone = isInDangerZone(tx, tz, zones);
             const nextX = px + nx * speed * dt;
             const nextZ = pz + nz * speed * dt;
-            const shouldRedirect = targetInZone || (!agentInZone && isInDangerZone(nextX, nextZ, zones));
+            const targetImprovesPosition = agentInZone && targetInZone
+              && minDangerDist(tx, tz, zones) > minDangerDist(px, pz, zones);
+            const shouldRedirect = !targetImprovesPosition
+              && (targetInZone || (!agentInZone && isInDangerZone(nextX, nextZ, zones)));
             if (shouldRedirect) {
               const safe = pickWanderTarget(px, pz, obstacles, sceneBound, zones);
               agentLog.log("flee_redirected", agent.config.name, {

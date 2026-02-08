@@ -7,6 +7,7 @@ import type { PerceiveMessage, DecisionResponse, PerceptionPayload } from "./typ
 import { AgentState, AgentAction, AgentFacing, Position, ActionType } from "../core/Components.ts";
 import type { EventBus, FireSpreadEvent } from "../core/EventBus.ts";
 import { agentLog } from "./AgentLogger.ts";
+import { ReplayRecorder } from "../replay/ReplayRecorder.ts";
 
 const ACTION_NAMES = ["IDLE","MOVE_TO","RUN_TO","HELP_PERSON","EVACUATE","WAIT","ENTER_BUILDING","EXIT_BUILDING"];
 
@@ -53,6 +54,8 @@ export class SteppedSimulation {
   private pendingPayloads = new Map<string, { payload: PerceptionPayload; simTime: number }>();
   /** Tracked fire sources from EventBus FIRE_SPREAD events. */
   private activeFireSources: { x: number; z: number; radius: number }[] = [];
+  /** Replay recorder for persisting session data to IndexedDB. */
+  private replayRecorder: ReplayRecorder;
 
   constructor(
     world: SimWorld,
@@ -61,12 +64,14 @@ export class SteppedSimulation {
     recorder: AgentRecorder,
     eventBus: EventBus,
     config: SteppedSimConfig = { stepDurationSec: 1, enabled: true },
+    location: string = "Unknown",
   ) {
     this.world = world;
     this.manager = manager;
     this.perception = perception;
     this.recorder = recorder;
     this.config = config;
+    this.replayRecorder = new ReplayRecorder(manager, location);
 
     // Subscribe to FIRE_SPREAD events to track fire sources
     eventBus.on("FIRE_SPREAD", (event) => {
@@ -80,6 +85,25 @@ export class SteppedSimulation {
         existing.radius = Math.max(existing.radius, fire.radius);
       } else {
         this.activeFireSources.push({ x: fx, z: fz, radius: fire.radius });
+      }
+
+      // Update all agents' danger zones that match this fire source —
+      // ensures zones grow as the fire grows, preventing agents from
+      // wandering back into an area that was safe when first recorded.
+      for (const agent of this.manager.agents) {
+        for (const zone of agent.dangerZones) {
+          if (zone.expiresAt < Date.now()) continue;
+          const dx = zone.x - fx;
+          const dz = zone.z - fz;
+          if (dx * dx + dz * dz < 25) { // same fire source (within 5m)
+            const newRadius = fire.radius + 10; // generous margin
+            if (newRadius > zone.radius) {
+              zone.radius = newRadius;
+              // Extend expiry since fire is still active
+              zone.expiresAt = Date.now() + 60_000;
+            }
+          }
+        }
       }
     });
 
@@ -246,14 +270,15 @@ export class SteppedSimulation {
     this.tickInterval = setInterval(() => this.tick(), this.config.stepDurationSec * 1000);
   }
 
-  /** Stop the simulation loop. */
-  stop(): void {
+  /** Stop the simulation loop and save replay. */
+  async stop(): Promise<void> {
     this.running = false;
     if (this.tickInterval) {
       clearInterval(this.tickInterval);
       this.tickInterval = null;
     }
     this.ws?.close();
+    await this.replayRecorder.finalize();
   }
 
   /** Fires every stepDurationSec. Captures frames and sends fire-and-forget WS message. */
@@ -288,6 +313,8 @@ export class SteppedSimulation {
           payload: p,
           simTime: captureSimTime,
         });
+        // Record frame for replay
+        this.replayRecorder.recordFrame(p, this.step, captureSimTime);
       }
 
       // Log every agent's state at capture time
@@ -370,6 +397,13 @@ export class SteppedSimulation {
       obsMap.set(dec.agentIndex, dec.observation);
       decMap.set(dec.agentIndex, { reasoning: dec.reasoning, action: dec.action });
 
+      // Attach VLM output to replay frame
+      this.replayRecorder.attachVLM(dec.agentIndex, step, {
+        observation: dec.observation,
+        reasoning: dec.reasoning,
+        action: dec.action,
+      });
+
       // Save snapshot using the frame captured at send time
       const pendingKey = `${dec.agentIndex}:${step}`;
       const pending = this.pendingPayloads.get(pendingKey);
@@ -422,12 +456,12 @@ export class SteppedSimulation {
             agent.dangerZones.push({
               x: bestFire.x,
               z: bestFire.z,
-              radius: bestFire.radius + 5,
+              radius: bestFire.radius + 10,
               expiresAt: Date.now() + 60_000,
             });
             agentLog.log("danger_zone_added", agentName, {
               fireX: bestFire.x, fireZ: bestFire.z,
-              radius: bestFire.radius + 5, source: "fire_match",
+              radius: bestFire.radius + 10, source: "fire_match",
             });
           } else {
             // No tracked fire in facing direction — estimate 15m ahead
@@ -445,7 +479,49 @@ export class SteppedSimulation {
           }
         }
       }
-      // WANDER = no danger, do nothing — auto-wander continues
+      // WANDER with active danger zones → override to flee away from known threats
+      if (agent && agent.dangerZones.length > 0) {
+        const activeZones = agent.dangerZones.filter(z => z.expiresAt > Date.now());
+        if (activeZones.length > 0) {
+          const eid = agent.eid;
+          const px = Position.x[eid]!;
+          const pz = Position.z[eid]!;
+
+          // Compute average flee direction (away from all danger zone centers)
+          let fleeX = 0;
+          let fleeZ = 0;
+          for (const zone of activeZones) {
+            const dx = px - zone.x;
+            const dz = pz - zone.z;
+            const dist = Math.sqrt(dx * dx + dz * dz) || 1;
+            // Weight inversely by distance — closer danger = stronger push
+            const weight = 1 / dist;
+            fleeX += (dx / dist) * weight;
+            fleeZ += (dz / dist) * weight;
+          }
+          const fleeMag = Math.sqrt(fleeX * fleeX + fleeZ * fleeZ) || 1;
+          fleeX /= fleeMag;
+          fleeZ /= fleeMag;
+
+          // Target: 50m in the flee direction, clamped to scene bounds
+          const fleeTargetX = px + fleeX * 50;
+          const fleeTargetZ = pz + fleeZ * 50;
+
+          agentLog.log("wander_override_flee", agentName, {
+            step,
+            dangerZones: activeZones.length,
+            targetX: fleeTargetX,
+            targetZ: fleeTargetZ,
+          });
+          this.manager.addDecision(dec.agentIndex, `FLEE (override): ${dec.reasoning}`);
+          this.manager.applyAction(dec.agentIndex, {
+            actionType: ActionType.RUN_TO,
+            targetX: fleeTargetX,
+            targetZ: fleeTargetZ,
+            targetEid: 0,
+          });
+        }
+      }
     }
 
     // Record step

@@ -20,6 +20,21 @@ if (!buildResult.success) {
   process.exit(1);
 }
 
+// Bundle the replay viewer
+const replayBuild = await Bun.build({
+  entrypoints: ["./src/replay/viewer.ts"],
+  outdir: "./dist",
+  minify: false,
+  sourcemap: "inline",
+  target: "browser",
+});
+
+if (!replayBuild.success) {
+  console.error("Replay build failed:");
+  for (const log of replayBuild.logs) console.error(log);
+  process.exit(1);
+}
+
 const distDir = join(import.meta.dir, "dist");
 const htmlFile = Bun.file(join(import.meta.dir, "index.html"));
 
@@ -349,6 +364,14 @@ Bun.serve({
       }
     }
 
+    // --- Static: Replay viewer ---
+    if (url.pathname === "/replay") {
+      const file = Bun.file(join(import.meta.dir, "public", "replay.html"));
+      if (await file.exists()) {
+        return new Response(file, { headers: { "Content-Type": "text/html" } });
+      }
+    }
+
     // --- Static: HTML ---
     if (url.pathname === "/" || url.pathname === "/index.html") {
       const html = (await htmlFile.text()).replace("./src/main.ts", "/dist/main.js");
@@ -363,7 +386,8 @@ Bun.serve({
 
     // --- Static: models and public assets ---
     if (url.pathname.startsWith("/models/")) {
-      const file = Bun.file(join(import.meta.dir, "public", url.pathname));
+      const decoded = decodeURIComponent(url.pathname);
+      const file = Bun.file(join(import.meta.dir, "public", decoded));
       if (await file.exists()) return new Response(file);
     }
 

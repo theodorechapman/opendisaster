@@ -30,6 +30,7 @@ const geocodeError = document.getElementById("geocode-error")!;
 const loading = document.getElementById("loading")!;
 const hud = document.getElementById("hud")!;
 const info = document.getElementById("info")!;
+const stopSimBtn = document.getElementById("stop-sim-btn") as HTMLButtonElement;
 
 sizeInput.addEventListener("input", () => {
   sizeVal.textContent = sizeInput.value;
@@ -184,11 +185,11 @@ function collectObstacles(group: THREE.Group, sceneHalfSize: number): Obstacle[]
     if (!geom) return;
 
     // Heuristic: buildings are ExtrudeGeometry with height > 2m
-    // Trees have CylinderGeometry (trunks) with small radius
+    // Trees: any mesh under the "trees" group (trunks and canopies)
     const isExtrude = geom.type === "ExtrudeGeometry";
-    const isCylinder = geom.type === "CylinderGeometry";
+    const isTreePart = obj.parent?.name === "trees";
 
-    if (!isExtrude && !isCylinder) return;
+    if (!isExtrude && !isTreePart) return;
 
     // Compute world bounding box
     box.setFromObject(obj);
@@ -202,8 +203,8 @@ function collectObstacles(group: THREE.Group, sceneHalfSize: number): Obstacle[]
         minZ: box.min.z - OBSTACLE_PADDING,
         maxZ: box.max.z + OBSTACLE_PADDING,
       });
-    } else if (isCylinder && height > 1 && height < 15) {
-      // Tree trunk — smaller padding
+    } else if (isTreePart && geom.type === "SphereGeometry") {
+      // Tree canopy — use its full XZ footprint as the collision area
       const pad = 1.5;
       obstacles.push({
         minX: box.min.x - pad,
@@ -321,7 +322,7 @@ async function initExploration(sceneGrp: THREE.Group, sceneSize: number, sampler
   try {
     await agentManager.visuals.loadModel();
   } catch (err) {
-    console.error("[Agents] Failed to load human.glb:", err);
+    console.error("[Agents] Failed to load Man.glb:", err);
     info.textContent = "Agent model failed to load — agents disabled";
     return;
   }
@@ -377,10 +378,16 @@ function launchScenario(scenarioId: string) {
   // 3. Create perception, recorder, stepped simulation
   const perception = new AgentPerceptionSystem(renderer, scene, agentManager);
   const recorder = new AgentRecorder(agentManager);
+  // Build location string for replay recording
+  const locAddr = addressInput.value.trim();
+  const locLat = latInput.value;
+  const locLon = lonInput.value;
+  const locationStr = locAddr || `${locLat}, ${locLon}`;
+
   steppedSim = new SteppedSimulation(world, agentManager, perception, recorder, sharedEventBus, {
     stepDurationSec: 1,
     enabled: true,
-  });
+  }, locationStr);
 
   // 4. Start stepped simulation (connects WebSocket)
   steppedSim.start();
@@ -388,9 +395,10 @@ function launchScenario(scenarioId: string) {
   // 5. Launch the chosen scenario
   scenario.launch(scene, sharedEventBus, sampler);
 
-  // 6. Hide scenario panel
+  // 6. Hide scenario panel, show stop button
   scenarioPanel.classList.remove("visible");
   explorationReady = false;
+  stopSimBtn.style.display = "block";
 
   info.textContent = `${AGENT_CONFIGS.length} agents spawned | ${scenario.name} scenario active | Ctrl+P snapshots | Ctrl+R recording`;
   console.log(`[Agents] Scenario "${scenario.name}" launched`);
@@ -418,6 +426,19 @@ function buildScenarioPanel() {
   }
 }
 
+// --- Stop simulation button ---
+stopSimBtn.addEventListener("click", async () => {
+  if (!steppedSim) return;
+  stopSimBtn.disabled = true;
+  stopSimBtn.textContent = "Saving...";
+  await steppedSim.stop();
+  steppedSim = null;
+  stopSimBtn.style.display = "none";
+  stopSimBtn.disabled = false;
+  stopSimBtn.textContent = "Stop Simulation";
+  info.textContent = "Simulation stopped. Replay saved.";
+});
+
 // --- Load all layers ---
 let sceneGroup: THREE.Group | null = null;
 
@@ -432,9 +453,10 @@ goBtn.addEventListener("click", async () => {
 
   // Clean up previous agent system
   if (steppedSim) {
-    steppedSim.stop();
+    await steppedSim.stop();
     steppedSim = null;
   }
+  stopSimBtn.style.display = "none";
   world = null;
   agentManager = null;
   heightSampler = null;
@@ -513,8 +535,10 @@ function animate() {
       Position.y[eid] = heightSampler.sample(Position.x[eid]!, Position.z[eid]!);
     }
     agentManager.syncVisuals();
+    agentManager.visuals.updateAnimations(dt);
   } else if (agentManager) {
     agentManager.syncVisuals();
+    agentManager.visuals.updateAnimations(dt);
   }
 
   const pos = camera.position;

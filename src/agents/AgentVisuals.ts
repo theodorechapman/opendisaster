@@ -6,15 +6,27 @@ import type { AgentConfig } from "./types.ts";
 const EYE_HEIGHT = 8;
 const TARGET_HEIGHT = 10; // desired agent height in world units
 
+/** Animation clip names embedded in Man.glb */
+const CLIP_NAMES: Record<string, string> = {
+  idle: "HumanArmature|Man_Idle",
+  walk: "HumanArmature|Man_Walk",
+  run: "HumanArmature|Man_Run",
+  death: "HumanArmature|Man_Death",
+};
+
 export interface AgentVisual {
   mesh: THREE.Object3D; // Group containing the cloned human model
   camera: THREE.PerspectiveCamera;
+  mixer: THREE.AnimationMixer;
+  actions: Map<string, THREE.AnimationAction>;
+  currentAnim: string;
 }
 
 export class AgentVisuals {
   private visuals: AgentVisual[] = [];
   private scene: THREE.Scene;
   private template: THREE.Group | null = null;
+  private animations: THREE.AnimationClip[] = [];
   private modelScale = 1;
 
   constructor(scene: THREE.Scene) {
@@ -24,14 +36,18 @@ export class AgentVisuals {
   /** Load the human GLB model once. Must be called before createAgent(). */
   async loadModel(): Promise<void> {
     const loader = new GLTFLoader();
-    const gltf = await loader.loadAsync("/models/human.glb");
+    const modelUrl = encodeURI("/models/Animated Men Pack-glb (1)/Man.glb");
+    const gltf = await loader.loadAsync(modelUrl);
     this.template = gltf.scene as THREE.Group;
+    this.animations = gltf.animations;
 
     // Compute scale so the model is TARGET_HEIGHT tall
     const box = new THREE.Box3().setFromObject(this.template);
     const height = box.max.y - box.min.y;
     this.modelScale = height > 0 ? TARGET_HEIGHT / height : 1;
-    console.log(`[AgentVisuals] Model loaded, native height=${height.toFixed(2)}, scale=${this.modelScale.toFixed(3)}`);
+    console.log(
+      `[AgentVisuals] Model loaded, native height=${height.toFixed(2)}, scale=${this.modelScale.toFixed(3)}. Animations: ${this.animations.length} clips`,
+    );
   }
 
   /** Create a cloned human mesh and first-person camera for an agent. */
@@ -44,13 +60,15 @@ export class AgentVisuals {
     const model = skeletonClone(this.template);
     model.scale.setScalar(this.modelScale);
 
-    // Apply per-agent color
+    // Clone materials so per-agent tint doesn't affect others.
+    // We tint by lerping toward the agent color instead of replacing,
+    // so the model's original textures and detail remain visible.
+    const tintColor = new THREE.Color(config.color);
     model.traverse((child) => {
       if (child instanceof THREE.Mesh && child.material) {
-        // Clone material so per-agent color doesn't affect others
         const mat = (child.material as THREE.Material).clone() as THREE.MeshStandardMaterial;
         if (mat.color) {
-          mat.color.setHex(config.color);
+          mat.color.lerp(tintColor, 0.4);
         }
         child.material = mat;
         child.castShadow = true;
@@ -77,9 +95,55 @@ export class AgentVisuals {
 
     this.scene.add(group);
 
-    const visual: AgentVisual = { mesh: group, camera };
+    // Set up AnimationMixer on the cloned model
+    const mixer = new THREE.AnimationMixer(model);
+    const actions = new Map<string, THREE.AnimationAction>();
+
+    for (const [key, clipName] of Object.entries(CLIP_NAMES)) {
+      const clip = this.animations.find((c) => c.name === clipName);
+      if (clip) {
+        const action = mixer.clipAction(clip);
+        if (key === "death") {
+          action.setLoop(THREE.LoopOnce, 1);
+          action.clampWhenFinished = true;
+        }
+        actions.set(key, action);
+      }
+    }
+
+    // Play idle by default
+    const idleAction = actions.get("idle");
+    if (idleAction) {
+      idleAction.play();
+    }
+
+    const visual: AgentVisual = { mesh: group, camera, mixer, actions, currentAnim: "idle" };
     this.visuals.push(visual);
     return visual;
+  }
+
+  /** Crossfade to a target animation. Skips if already playing. */
+  setAnimation(index: number, name: string): void {
+    const visual = this.visuals[index];
+    if (!visual || visual.currentAnim === name) return;
+
+    const nextAction = visual.actions.get(name);
+    if (!nextAction) return;
+
+    const prevAction = visual.actions.get(visual.currentAnim);
+    if (prevAction) {
+      prevAction.fadeOut(0.3);
+    }
+
+    nextAction.reset().fadeIn(0.3).play();
+    visual.currentAnim = name;
+  }
+
+  /** Tick all animation mixers. Call once per frame. */
+  updateAnimations(dt: number): void {
+    for (const visual of this.visuals) {
+      visual.mixer.update(dt);
+    }
   }
 
   /** Update camera and mesh orientation from yaw (radians around Y). */
@@ -98,7 +162,7 @@ export class AgentVisuals {
     visual.mesh.position.set(x, y, z);
   }
 
-  /** Turn mesh gray when agent dies. */
+  /** Turn mesh gray when agent dies and play death animation. */
   markDead(index: number): void {
     const visual = this.visuals[index];
     if (!visual) return;
@@ -110,6 +174,7 @@ export class AgentVisuals {
         }
       }
     });
+    this.setAnimation(index, "death");
   }
 
   getVisual(index: number): AgentVisual | undefined {

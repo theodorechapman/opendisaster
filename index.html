@@ -136,6 +136,30 @@
     .scenario-card .sc-text { flex: 1; }
     .scenario-card .sc-name { font-size: 13px; font-weight: 600; color: #eee; }
     .scenario-card .sc-desc { font-size: 11px; color: #888; margin-top: 2px; }
+
+    #stop-sim-btn {
+      position: fixed; top: 12px; right: 330px;
+      padding: 6px 14px;
+      background: rgba(46,26,26,0.85); border: 1px solid #622;
+      border-radius: 6px; color: #e55;
+      font-size: 12px; font-family: monospace;
+      cursor: pointer; z-index: 6;
+      transition: background 0.15s, border-color 0.15s;
+      display: none;
+    }
+    #stop-sim-btn:hover { background: rgba(80,30,30,0.9); border-color: #e55; }
+
+    #replay-btn {
+      position: fixed; top: 12px; right: 200px;
+      padding: 6px 14px;
+      background: rgba(26,26,46,0.85); border: 1px solid #444;
+      border-radius: 6px; color: #4fc3f7;
+      font-size: 12px; font-family: monospace;
+      cursor: pointer; z-index: 6;
+      transition: background 0.15s, border-color 0.15s;
+      text-decoration: none; display: inline-block;
+    }
+    #replay-btn:hover { background: rgba(67,97,238,0.15); border-color: #4361ee; }
   </style>
 </head>
 <body>
@@ -167,6 +191,8 @@
   <div id="scenario-panel">
     <h2>Scenarios</h2>
   </div>
+  <button id="stop-sim-btn">Stop Simulation</button>
+  <a id="replay-btn" href="/replay" target="_blank">View Replays</a>
   <div id="info"></div>
   <div id="agent-hud"></div>
   <div id="snapshot-gallery"></div>

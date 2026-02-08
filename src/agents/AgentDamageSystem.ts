@@ -59,11 +59,35 @@ export function createAgentDamageSystem(
           case "FIRE_SPREAD": {
             const [fx, _fy, fz] = event.position;
             const dist = Math.sqrt((ax - fx) ** 2 + (az - fz) ** 2);
-            if (dist < event.radius) {
-              const damage = 20 * event.intensity * dt;
+            const r = event.radius;
+            const intensity = event.intensity;
+
+            if (dist < r) {
+              // Core fire zone: quadratic falloff (center=full, edge=30%)
+              const normDist = dist / r;
+              const falloff = 1.0 - 0.7 * normDist * normDist;
+              const damage = 35 * intensity * falloff * dt;
               AgentState.health[eid] = AgentState.health[eid]! - damage;
               AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.3);
-              manager.addEvent(agent.index, `Fire nearby! Intensity ${event.intensity.toFixed(1)}, distance ${dist.toFixed(0)}m.`);
+              manager.addEvent(agent.index, `In fire! Intensity ${intensity.toFixed(1)}, distance ${dist.toFixed(0)}m.`);
+            } else if (dist < r * 1.5) {
+              // Heat radiation zone: linear falloff
+              const normDist = (dist - r) / (r * 0.5);
+              const falloff = 1.0 - normDist;
+              const damage = 8 * intensity * falloff * dt;
+              AgentState.health[eid] = AgentState.health[eid]! - damage;
+              AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.15);
+              manager.addEvent(agent.index, `Heat radiation! Intensity ${intensity.toFixed(1)}, distance ${dist.toFixed(0)}m.`);
+            } else if (dist < r * 2.5) {
+              // Smoke zone: linear falloff
+              const normDist = (dist - r * 1.5) / (r * 1.0);
+              const falloff = 1.0 - normDist;
+              const damage = 2 * intensity * falloff * dt;
+              AgentState.health[eid] = AgentState.health[eid]! - damage;
+              if (Math.random() < 0.05) {
+                AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.1);
+                manager.addEvent(agent.index, `Smoke inhalation! Distance ${dist.toFixed(0)}m from fire.`);
+              }
             }
             break;
           }

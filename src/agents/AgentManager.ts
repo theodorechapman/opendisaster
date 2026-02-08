@@ -18,6 +18,24 @@ import type * as THREE from "three";
 
 const ACTION_NAMES = ["IDLE","MOVE_TO","RUN_TO","HELP_PERSON","EVACUATE","WAIT","ENTER_BUILDING","EXIT_BUILDING"];
 
+/** Map ActionType → animation name for AgentVisuals */
+function actionToAnim(actionType: number): string {
+  switch (actionType) {
+    case ActionType.MOVE_TO:
+    case ActionType.HELP_PERSON:
+    case ActionType.ENTER_BUILDING:
+    case ActionType.EXIT_BUILDING:
+      return "walk";
+    case ActionType.RUN_TO:
+    case ActionType.EVACUATE:
+      return "run";
+    case ActionType.IDLE:
+    case ActionType.WAIT:
+    default:
+      return "idle";
+  }
+}
+
 export interface AgentRuntime {
   config: AgentConfig;
   eid: number;        // bitecs entity id
@@ -160,6 +178,14 @@ export class AgentManager {
         Position.z[eid]!,
       );
       this.visuals.updateCamera(agent.index, AgentFacing.yaw[eid]!);
+
+      // Drive animation from ECS action state
+      if (AgentState.alive[eid] === 0) {
+        this.visuals.setAnimation(agent.index, "death");
+      } else {
+        const animName = actionToAnim(AgentAction.actionType[eid]!);
+        this.visuals.setAnimation(agent.index, animName);
+      }
     }
   }
 }

@@ -7,6 +7,7 @@
       "dependencies": {
         "bitecs": "^0.4.0",
         "three": "^0.182.0",
+        "three.quarks": "^0.17.0",
       },
       "devDependencies": {
         "@types/bun": "latest",
@@ -42,7 +43,11 @@
 
     "meshoptimizer": ["meshoptimizer@0.22.0", "", {}, "sha512-IebiK79sqIy+E4EgOr+CAw+Ke8hAspXKzBd0JdgEmPHiAwmvEj2S4h1rfvo+o/BnfEYd/jAOg5IeeIjzlzSnDg=="],
 
+    "quarks.core": ["quarks.core@0.17.0", "", {}, "sha512-MhFT+PokVAdNoawiRUYxLIjArTr5d+Lq/00ssZY60y4ivOVnIKBq9ZeMFzjBHm8UdszYzeyr7pu0a3VJi2mMVQ=="],
+
     "three": ["three@0.182.0", "", {}, "sha512-GbHabT+Irv+ihI1/f5kIIsZ+Ef9Sl5A1Y7imvS5RQjWgtTPfPnZ43JmlYI7NtCRDK9zir20lQpfg8/9Yd02OvQ=="],
+
+    "three.quarks": ["three.quarks@0.17.0", "", { "dependencies": { "quarks.core": "*" }, "peerDependencies": { "three": ">=0.182.0" } }, "sha512-d612B1+HUpUUlDOqFjEEv3dtsHCgJ1krWBYyf3yFLdAMTTkYJPwxsDfRHrwLJKclaCACS62GUihoQeRHluAleA=="],
 
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
 
