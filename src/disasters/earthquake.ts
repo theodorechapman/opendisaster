@@ -41,6 +41,10 @@ export class EarthquakeSimulator {
   private sceneBasePos: THREE.Vector3 | null = null;
   private lastPaint = 0;
   private groundShakeY = 0;
+  private pileMap = new Map<string, number>();
+  private readonly pileCellSize = 1.6;
+  private readonly tmpBox = new THREE.Box3();
+  private readonly tmpSize = new THREE.Vector3();
   private debris: {
     mesh: THREE.Mesh;
     velocity: THREE.Vector3;
@@ -87,6 +91,7 @@ export class EarthquakeSimulator {
     this.time = 0;
     this.active = true;
     this.crackedRoads.clear();
+    this.pileMap.clear();
     resetCarsToBase();
   }
 
@@ -94,6 +99,7 @@ export class EarthquakeSimulator {
     this.active = false;
     resetCarsToBase();
     this.groundShakeY = 0;
+    this.pileMap.clear();
     if (sceneGroupRef && this.sceneBasePos) {
       sceneGroupRef.position.copy(this.sceneBasePos);
     } else if (terrainMeshRef && this.terrainBasePos) {
@@ -675,11 +681,32 @@ export class EarthquakeSimulator {
         }
       }
       if (d.mesh.position.y < groundY) {
-        d.mesh.position.y = groundY;
+        const pileY = this.addToPile(d.mesh, groundY);
+        d.mesh.position.y = pileY;
         d.velocity.set(0, 0, 0);
         d.grounded = true;
+        // Keep grounded debris visible longer for agent perception.
+        d.ttl = Math.max(d.ttl, 60 + Math.random() * 40);
       }
     }
+  }
+
+  private addToPile(mesh: THREE.Mesh, groundY: number): number {
+    const key = this.getPileKey(mesh.position.x, mesh.position.z);
+    const current = this.pileMap.get(key) ?? 0;
+    this.tmpBox.setFromObject(mesh);
+    const size = this.tmpBox.getSize(this.tmpSize);
+    const increment = Math.max(0.06, Math.min(0.6, size.y * 0.55));
+    const next = current + increment;
+    this.pileMap.set(key, next);
+    return groundY + current;
+  }
+
+  private getPileKey(x: number, z: number): string {
+    const s = this.pileCellSize;
+    const ix = Math.round(x / s);
+    const iz = Math.round(z / s);
+    return `${ix},${iz}`;
   }
 
   private updateTrees(dt: number) {
