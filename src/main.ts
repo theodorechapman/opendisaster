@@ -397,8 +397,9 @@ const scenarios: ScenarioDefinition[] = [
     description: "Destructive funnel with debris physics",
     icon: "\uD83C\uDF2A\uFE0F",
     available: true,
-    launch: () => {
+    launch: (_sc, eb) => {
       activeDisasterType = "tornado";
+      tornado.setEventBus(eb);
       tornadoPanel.style.display = "block";
       quakePanel.style.display = "none";
       floodPanel.style.display = "none";
@@ -410,8 +411,9 @@ const scenarios: ScenarioDefinition[] = [
     description: "Seismic event with structural damage",
     icon: "\uD83C\uDF0B",
     available: true,
-    launch: () => {
+    launch: (_sc, eb) => {
       activeDisasterType = "earthquake";
+      quake.setEventBus(eb);
       quakePanel.style.display = "block";
       tornadoPanel.style.display = "none";
       floodPanel.style.display = "none";
@@ -787,6 +789,8 @@ stopSimBtn.addEventListener("click", async () => {
   }
   activeDisasterType = null;
   flood.setEventBus(null);
+  tornado.setEventBus(null);
+  quake.setEventBus(null);
   stormTarget = 0;
 
   stopSimBtn.style.display = "none";
@@ -833,6 +837,8 @@ goBtn.addEventListener("click", async () => {
   floodPanel.style.display = "none";
   activeDisasterType = null;
   flood.setEventBus(null);
+  tornado.setEventBus(null);
+  quake.setEventBus(null);
 
   try {
     const size = parseInt(sizeInput.value);

@@ -39,4 +39,6 @@ export interface ReplaySession {
   durationSec: number;
   agents: { name: string; color: number }[];
   vlmEntries: ReplayVLMEntry[];
+  /** Cached audio clips per agent, keyed by agent index. */
+  audioClips?: Record<number, ReplayAudioClip[]>;
 }

@@ -39,6 +39,9 @@ export type WindFieldUpdateEvent = {
   direction: Vec3;
   speed: number;
   center: Vec3;
+  coreRadius: number;
+  outerRadius: number;
+  maxWindSpeed: number;
 };
 
 export type AgentDeathEvent = {

@@ -45,44 +45,72 @@ export function createAgentDamageSystem(
           }
 
           case "FLOOD_LEVEL": {
+            // NOTE: FLOOD_LEVEL emits every 0.5s, so multiply by 0.5 for per-event damage.
+            const FLOOD_DT = 0.5;
             const [fx, _fy, fz] = event.position;
             const dist = Math.sqrt((ax - fx) ** 2 + (az - fz) ** 2);
-            if (dist < 20 && event.waterHeight > 1.5) {
-              const damage = 5 * event.waterHeight * dt;
-              AgentState.health[eid] = AgentState.health[eid]! - damage;
-              AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.2);
-              manager.addEvent(agent.index, `Flooding! Water height ${event.waterHeight.toFixed(1)}m.`);
+            if (dist < 20) {
+              const wh = event.waterHeight;
+              const vx = event.velocity[0];
+              const vz = event.velocity[2];
+              const velocity = Math.sqrt(vx * vx + vz * vz);
+
+              if (wh > 1.5) {
+                // Chest+ deep: dangerous
+                const damage = 3 * wh * FLOOD_DT;
+                AgentState.health[eid] = AgentState.health[eid]! - damage;
+                AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.2);
+                manager.addEvent(agent.index, `Deep flooding! Water height ${wh.toFixed(1)}m.`);
+              } else if (wh > 0.8) {
+                // Waist-deep: slow damage
+                const damage = 1 * wh * FLOOD_DT;
+                AgentState.health[eid] = AgentState.health[eid]! - damage;
+                AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.1);
+                manager.addEvent(agent.index, `Waist-deep flooding! Water height ${wh.toFixed(1)}m.`);
+              } else if (wh > 0.3) {
+                // Ankle-deep: panic only, no damage
+                AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.05);
+              }
+
+              // Velocity-based knockdown: swept away by current
+              if (velocity > 2 && wh > 0.5) {
+                const damage = 2 * velocity * FLOOD_DT;
+                AgentState.health[eid] = AgentState.health[eid]! - damage;
+                manager.addEvent(agent.index, `Swept by flood current! Velocity ${velocity.toFixed(1)} m/s.`);
+              }
             }
             break;
           }
 
           case "FIRE_SPREAD": {
+            // NOTE: FIRE_SPREAD events emit once per second (EMIT_INTERVAL=1.0s),
+            // so damage is per-event, NOT multiplied by dt.
             const [fx, _fy, fz] = event.position;
             const dist = Math.sqrt((ax - fx) ** 2 + (az - fz) ** 2);
             const r = event.radius;
             const intensity = event.intensity;
 
             if (dist < r) {
-              // Core fire zone: quadratic falloff (center=full, edge=30%)
+              // Core fire zone: ~4 HP/event at center with intensity 0.8 → ~25s to kill
               const normDist = dist / r;
               const falloff = 1.0 - 0.7 * normDist * normDist;
-              const damage = 35 * intensity * falloff * dt;
+              const damage = 5 * intensity * falloff;
               AgentState.health[eid] = AgentState.health[eid]! - damage;
               AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.3);
               manager.addEvent(agent.index, `In fire! Intensity ${intensity.toFixed(1)}, distance ${dist.toFixed(0)}m.`);
             } else if (dist < r * 1.5) {
-              // Heat radiation zone: linear falloff
+              // Heat radiation zone: ~1.2 HP/event max
               const normDist = (dist - r) / (r * 0.5);
               const falloff = 1.0 - normDist;
-              const damage = 8 * intensity * falloff * dt;
+              const damage = 1.5 * intensity * falloff;
               AgentState.health[eid] = AgentState.health[eid]! - damage;
               AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.15);
               manager.addEvent(agent.index, `Heat radiation! Intensity ${intensity.toFixed(1)}, distance ${dist.toFixed(0)}m.`);
             } else if (dist < r * 2.5) {
-              // Smoke zone: linear falloff
+              // Smoke zone: ~0.4 HP/event max
               const normDist = (dist - r * 1.5) / (r * 1.0);
               const falloff = 1.0 - normDist;
-              const damage = 2 * intensity * falloff * dt;
+              const damage = 0.5 * intensity * falloff;
               AgentState.health[eid] = AgentState.health[eid]! - damage;
               if (Math.random() < 0.05) {
                 AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.1);
@@ -92,19 +120,82 @@ export function createAgentDamageSystem(
             break;
           }
 
+          case "WIND_FIELD_UPDATE": {
+            // NOTE: WIND_FIELD_UPDATE emits every 0.5s, so multiply by 0.5 for per-event damage.
+            const WIND_DT = 0.5;
+            const [cx, _cy, cz] = event.center;
+            const dist = Math.sqrt((ax - cx) ** 2 + (az - cz) ** 2);
+            const { coreRadius, outerRadius, maxWindSpeed } = event;
+
+            // Rankine vortex wind speed at agent position
+            let windSpeed: number;
+            if (dist < 0.1) {
+              windSpeed = maxWindSpeed * 0.7;
+            } else if (dist <= coreRadius) {
+              windSpeed = maxWindSpeed * (dist / coreRadius);
+            } else {
+              windSpeed = maxWindSpeed * (coreRadius / dist);
+            }
+
+            if (dist < coreRadius) {
+              // Core vortex: ~8 HP/s at core edge → ~12s to kill
+              const speedRatio = windSpeed / maxWindSpeed;
+              const damage = 8 * speedRatio * speedRatio * WIND_DT;
+              AgentState.health[eid] = AgentState.health[eid]! - damage;
+              AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.3);
+
+              // 8% chance of flying debris hit (20 HP)
+              if (Math.random() < 0.08) {
+                AgentState.health[eid] = AgentState.health[eid]! - 20;
+                AgentState.injured[eid] = AgentState.injured[eid]! | 1;
+                manager.addEvent(agent.index, `Hit by flying debris in tornado core! Wind ${windSpeed.toFixed(0)} m/s.`);
+              } else {
+                manager.addEvent(agent.index, `In tornado core! Wind ${windSpeed.toFixed(0)} m/s, distance ${dist.toFixed(0)}m.`);
+              }
+            } else if (dist < outerRadius) {
+              // Outer vortex: ~3 HP/s chip damage
+              const speedRatio = windSpeed / maxWindSpeed;
+              const damage = 3 * speedRatio * WIND_DT;
+              AgentState.health[eid] = AgentState.health[eid]! - damage;
+              AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.15);
+              if (Math.random() < 0.03) {
+                manager.addEvent(agent.index, `Strong winds! Wind ${windSpeed.toFixed(0)} m/s, distance ${dist.toFixed(0)}m from tornado.`);
+              }
+            }
+            break;
+          }
+
           case "GROUND_SHAKE": {
+            // NOTE: GROUND_SHAKE emits every 0.5s, so multiply by 0.5 for per-event damage.
+            const QUAKE_DT = 0.5;
             const [ex, _ey, ez] = event.epicenter;
             const dist = Math.sqrt((ax - ex) ** 2 + (az - ez) ** 2);
-            if (dist < 200) {
-              const panicIncrease = 0.3 * (1 - dist / 200);
-              AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + panicIncrease);
+            const pga = event.pga;
+            const magnitude = event.magnitude;
 
+            if (dist < 50) {
+              // Close range: ground shaking + falling objects
+              const damage = 2 * pga * QUAKE_DT;
+              AgentState.health[eid] = AgentState.health[eid]! - damage;
+              AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.3 * (1 - dist / 50));
+
+              // 10% chance of debris hit scaled by magnitude
               if (Math.random() < 0.1) {
-                AgentState.health[eid] = AgentState.health[eid]! - 10;
+                const debrisDamage = 15 * (magnitude / 9);
+                AgentState.health[eid] = AgentState.health[eid]! - debrisDamage;
                 AgentState.injured[eid] = AgentState.injured[eid]! | 1;
-                manager.addEvent(agent.index, `Hit by debris during earthquake! Magnitude ${event.magnitude.toFixed(1)}.`);
+                manager.addEvent(agent.index, `Hit by debris during earthquake! Magnitude ${magnitude.toFixed(1)}, ${dist.toFixed(0)}m from epicenter.`);
               } else {
-                manager.addEvent(agent.index, `Earthquake felt! Magnitude ${event.magnitude.toFixed(1)}.`);
+                manager.addEvent(agent.index, `Earthquake! Magnitude ${magnitude.toFixed(1)}, ${dist.toFixed(0)}m from epicenter.`);
+              }
+            } else if (dist < 200) {
+              // Medium range: lighter shaking damage
+              const damage = 0.5 * pga * QUAKE_DT;
+              AgentState.health[eid] = AgentState.health[eid]! - damage;
+              AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.15 * (1 - dist / 200));
+
+              if (Math.random() < 0.03) {
+                manager.addEvent(agent.index, `Earthquake felt! Magnitude ${magnitude.toFixed(1)}.`);
               }
             }
             break;

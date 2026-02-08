@@ -1,4 +1,4 @@
-import { listSessions, getSession, getFramesForAgent, deleteSession } from "./storage.ts";
+import { listSessions, getSession, getFramesForAgent, deleteSession, saveSession } from "./storage.ts";
 import type { ReplaySession, ReplayVideoFrame, ReplayVLMEntry, ReplayAudioClip } from "./types.ts";
 
 class ReplayViewer {
@@ -158,6 +158,7 @@ class ReplayViewer {
 
     await this.loadAgentFrames();
     this.renderVLMHistory();
+    this.loadCachedAudio();
   }
 
   private async loadAgentFrames(): Promise<void> {
@@ -481,6 +482,25 @@ class ReplayViewer {
     this.audioGenerationId++;
     this.audioBtn.textContent = "Generate Audio";
     this.audioBtn.classList.remove("generating", "ready");
+    this.loadCachedAudio();
+  }
+
+  /** Load previously cached audio clips from IndexedDB for the current agent. */
+  private async loadCachedAudio(): Promise<void> {
+    if (!this.session) return;
+    const cached = this.session.audioClips?.[this.currentAgent];
+    if (!cached || cached.length === 0) return;
+
+    const genId = this.audioGenerationId;
+    console.log(`[Audio] Loading ${cached.length} cached clips for agent ${this.currentAgent}`);
+
+    await this.decodeAudioClips(cached);
+
+    if (genId !== this.audioGenerationId) return;
+
+    this.audioBtn.textContent = `Audio Ready (${this.decodedClips.length})`;
+    this.audioBtn.classList.add("ready");
+    if (this.playing) this.scheduleAudio();
   }
 
   private async generateAudio(): Promise<void> {
@@ -551,6 +571,13 @@ class ReplayViewer {
       this.audioBtn.textContent = `Audio Ready (${this.decodedClips.length})`;
       this.audioBtn.classList.remove("generating");
       this.audioBtn.classList.add("ready");
+
+      // Cache clips to IndexedDB so we don't need to regenerate
+      if (this.session && data.clips.length > 0) {
+        if (!this.session.audioClips) this.session.audioClips = {};
+        this.session.audioClips[this.currentAgent] = data.clips;
+        saveSession(this.session).catch((e) => console.error("[Audio] Failed to cache clips:", e));
+      }
 
       // If already playing, schedule immediately
       if (this.playing) this.scheduleAudio();

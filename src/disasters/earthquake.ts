@@ -12,6 +12,7 @@ import {
   roadLinesRef,
   sceneGroupRef,
 } from "../layers.ts";
+import type { EventBus } from "../core/EventBus.ts";
 
 // Allen et al. (2012) IPE for active shallow crustal regions (OpenQuake implementation)
 const IPE_COEFF = {
@@ -56,6 +57,8 @@ export class EarthquakeSimulator {
   private concreteMat: THREE.MeshPhongMaterial;
   private glassMat: THREE.MeshPhongMaterial;
   private crackedRoads = new Set<number>();
+  private eventBus: EventBus | null = null;
+  private lastEventEmit = 0;
 
   constructor(scene: THREE.Scene) {
     this.scene = scene;
@@ -73,6 +76,10 @@ export class EarthquakeSimulator {
     this.concreteMat = new THREE.MeshPhongMaterial({ color: 0x6b6b6b, emissive: 0x2a2a2a, emissiveIntensity: 0.15 });
     this.glassMat = new THREE.MeshPhongMaterial({ color: 0x88bbee, emissive: 0x223344, emissiveIntensity: 0.25, transparent: true, opacity: 0.85 });
     this.setMagnitude(this.magnitude);
+  }
+
+  setEventBus(eb: EventBus | null) {
+    this.eventBus = eb;
   }
 
   setMagnitude(mag: number) {
@@ -122,6 +129,19 @@ export class EarthquakeSimulator {
       this.updateBuildings(dt, buildings);
       this.updateTrees(dt);
       this.updateCars(dt);
+
+      // Emit GROUND_SHAKE event for agent damage system
+      if (this.eventBus && this.time - this.lastEventEmit >= 0.5) {
+        this.lastEventEmit = this.time;
+        const shake = this.getShakeVector(this.position.x, this.position.z);
+        const pga = shake.length();
+        this.eventBus.emit({
+          type: "GROUND_SHAKE",
+          epicenter: [this.position.x, this.position.y, this.position.z],
+          magnitude: this.magnitude,
+          pga,
+        });
+      }
     }
 
     // Debris keeps simulating after quake ends until settled/expired
@@ -386,6 +406,12 @@ export class EarthquakeSimulator {
           b.destroyed = true;
           this.spawnRubble(centerLive.x, centerLive.z, 16);
           this.spawnCollapseChunks(centerLive.x, centerLive.z, bboxLive.min.y + 0.2, 6);
+          this.eventBus?.emit({
+            type: "STRUCTURE_COLLAPSE",
+            entityId: 0,
+            position: [b.centerX, b.baseY, b.centerZ],
+            fragmentCount: 16,
+          });
           // Debris from building sides only
           const side = Math.random() < 0.5 ? "x" : "z";
           const sign = Math.random() < 0.5 ? -1 : 1;

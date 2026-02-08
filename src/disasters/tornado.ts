@@ -20,6 +20,7 @@ import {
   treeRegistry,
   carRegistry,
 } from "../layers.ts";
+import type { EventBus } from "../core/EventBus.ts";
 
 // ─── Enhanced Fujita Scale ──────────────────────────────────────────────────
 
@@ -293,6 +294,10 @@ export class TornadoSimulator {
   private rubbleMat!: THREE.MeshPhongMaterial;
   private stumpMat!: THREE.MeshPhongMaterial;
 
+  /* ── EventBus ── */
+  private eventBus: EventBus | null = null;
+  private lastEventEmit = 0;
+
   /* ── timing ── */
   private time = 0;
   private lastDirtSpawn = 0;
@@ -355,6 +360,10 @@ export class TornadoSimulator {
   // ─────────────────────────────────────────────────────────────────────────
   // Public API
   // ─────────────────────────────────────────────────────────────────────────
+
+  setEventBus(eb: EventBus | null) {
+    this.eventBus = eb;
+  }
 
   setEFRating(rating: number) {
     this.efRating = Math.max(0, Math.min(5, Math.round(rating)));
@@ -467,6 +476,20 @@ export class TornadoSimulator {
       this.lastDirtSpawn = this.time;
     }
     if (Math.floor(this.time * 15) % 4 === 0) this.paintGround();
+
+    // Emit wind field event for agent damage system
+    if (this.eventBus && this.time - this.lastEventEmit >= 0.5) {
+      this.lastEventEmit = this.time;
+      this.eventBus.emit({
+        type: "WIND_FIELD_UPDATE",
+        center: [this.position.x, this.position.y, this.position.z],
+        direction: [Math.cos(this.heading), 0, Math.sin(this.heading)],
+        speed: this.maxWindSpeed,
+        coreRadius: this.coreRadius,
+        outerRadius: this.outerRadius,
+        maxWindSpeed: this.maxWindSpeed,
+      });
+    }
   }
 
   getWindSpeedAtGround(x: number, z: number): number {
@@ -1182,6 +1205,12 @@ export class TornadoSimulator {
           b.destroyed = true;
           // Leave a rubble pile at the collapsed building site
           this.spawnGroundRubble(b.centerX, b.centerZ, 5, this.rubbleMat, 10, [0.3, 0.8]);
+          this.eventBus?.emit({
+            type: "STRUCTURE_COLLAPSE",
+            entityId: 0,
+            position: [b.centerX, b.baseY, b.centerZ],
+            fragmentCount: 5,
+          });
         }
       }
     }
@@ -1292,6 +1321,13 @@ export class TornadoSimulator {
 
     // Leave a rubble foundation at the original site
     this.spawnGroundRubble(b.centerX, b.centerZ, 6, this.rubbleMat, 8, [0.3, 0.7]);
+
+    this.eventBus?.emit({
+      type: "STRUCTURE_COLLAPSE",
+      entityId: 0,
+      position: [b.centerX, b.baseY, b.centerZ],
+      fragmentCount: 6,
+    });
 
     const mesh = b.mesh;
     const wp = new THREE.Vector3();
