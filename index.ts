@@ -37,6 +37,7 @@ if (!replayBuild.success) {
 
 const distDir = join(import.meta.dir, "dist");
 const htmlFile = Bun.file(join(import.meta.dir, "index.html"));
+const assetsDir = join(import.meta.dir, "assets");
 
 /** Convert lat/lon + half-size offset to a bounding box. */
 function bbox(lat: number, lon: number, halfSize: number) {
@@ -388,6 +389,12 @@ Bun.serve({
     if (url.pathname.startsWith("/models/")) {
       const decoded = decodeURIComponent(url.pathname);
       const file = Bun.file(join(import.meta.dir, "public", decoded));
+      if (await file.exists()) return new Response(file);
+    }
+
+    // --- Static: assets (models, textures) ---
+    if (url.pathname.startsWith("/assets/")) {
+      const file = Bun.file(join(assetsDir, url.pathname.slice(8)));
       if (await file.exists()) return new Response(file);
     }
 

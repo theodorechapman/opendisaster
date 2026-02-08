@@ -1,7 +1,10 @@
 import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { fetchLayers } from "./tiles.ts";
-import { buildAllLayers, type HeightSampler } from "./layers.ts";
+import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, resetCarsToBase, sceneGroupRef } from "./layers.ts";
 import { FlyControls } from "./controls.ts";
+import { TornadoSimulator, EF_SCALE } from "./disasters/tornado.ts";
+import { EarthquakeSimulator } from "./disasters/earthquake.ts";
 
 // Agent system imports
 import { SimWorld } from "./core/World.ts";
@@ -53,6 +56,53 @@ fireZInput.addEventListener("input", () => { fireZVal.textContent = fireZInput.v
 fireSizeInput.addEventListener("input", () => { fireSizeVal.textContent = fireSizeInput.value; });
 fireSpreadInput.addEventListener("input", () => { fireSpreadVal.textContent = fireSpreadInput.value; });
 
+// --- Car asset (GLB) ---
+const carLoader = new GLTFLoader();
+let carTemplate: THREE.Object3D | null = null;
+const carTemplatePromise = carLoader.loadAsync("/assets/classic_muscle_car.glb")
+  .then((gltf) => {
+    const root = gltf.scene;
+    const box = new THREE.Box3().setFromObject(root);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const length = Math.max(size.x, size.z, 0.001);
+    const targetLen = 4.2 * 1.7;
+    const scale = targetLen / length;
+    root.scale.setScalar(scale);
+    const box2 = new THREE.Box3().setFromObject(root);
+    const center2 = new THREE.Vector3();
+    box2.getCenter(center2);
+    root.position.sub(center2);
+    root.position.y -= box2.min.y;
+    carTemplate = root;
+  })
+  .catch((err) => {
+    console.warn("Failed to load car model:", err);
+    carTemplate = null;
+  });
+
+// Tornado panel elements
+const tornadoPanel   = document.getElementById("tornado-panel")!;
+const efSlider       = document.getElementById("ef-slider") as HTMLInputElement;
+const efBadge        = document.getElementById("ef-badge")!;
+const efDesc         = document.getElementById("ef-desc")!;
+const radiusVal      = document.getElementById("radius-val")!;
+const widthVal       = document.getElementById("width-val")!;
+const spawnBtn       = document.getElementById("spawn-btn") as HTMLButtonElement;
+const despawnBtn     = document.getElementById("despawn-btn") as HTMLButtonElement;
+const tornadoStats   = document.getElementById("tornado-stats")!;
+const tsWind         = document.getElementById("ts-wind")!;
+const tsDamaged      = document.getElementById("ts-damaged")!;
+const tsDestroyed    = document.getElementById("ts-destroyed")!;
+
+// Earthquake panel elements
+const quakePanel   = document.getElementById("quake-panel")!;
+const magSlider    = document.getElementById("mag-slider") as HTMLInputElement;
+const magVal       = document.getElementById("mag-val")!;
+const radiusValEq  = document.getElementById("eq-radius-val")!;
+const spawnQuakeBtn = document.getElementById("spawn-quake-btn") as HTMLButtonElement;
+const stopQuakeBtn  = document.getElementById("stop-quake-btn") as HTMLButtonElement;
+
 sizeInput.addEventListener("input", () => {
   sizeVal.textContent = sizeInput.value;
   sizeLabel.textContent = sizeInput.value;
@@ -98,8 +148,6 @@ scene.add(hemi);
 const ambient = new THREE.AmbientLight(0xffffff, 0.3);
 scene.add(ambient);
 
-
-
 // Controls
 const controls = new FlyControls(camera, renderer.domElement);
 
@@ -108,6 +156,143 @@ window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// --- Tornado & Earthquake simulators ---
+const tornado = new TornadoSimulator(scene);
+const quake = new EarthquakeSimulator(scene);
+const raycaster = new THREE.Raycaster();
+
+const EF_COLORS = ["#22cc22", "#cccc00", "#ff8800", "#ff4400", "#ff0000", "#880000"];
+
+function updateEFDisplay() {
+  const r = parseInt(efSlider.value);
+  const ef = EF_SCALE[r]!;
+  efBadge.textContent = ef.label;
+  efBadge.style.background = EF_COLORS[r]!;
+  efDesc.textContent = `${ef.desc} · ${ef.minMph}–${ef.maxMph} mph`;
+  tornado.setEFRating(r);
+  radiusVal.textContent = tornado.getCoreRadius().toFixed(1);
+  widthVal.textContent = Math.round(tornado.getPathWidthMeters()).toString();
+}
+efSlider.addEventListener("input", updateEFDisplay);
+updateEFDisplay();
+
+const speedSlider = document.getElementById("speed-slider") as HTMLInputElement;
+const speedVal    = document.getElementById("speed-val")!;
+speedSlider.addEventListener("input", () => {
+  speedVal.textContent = speedSlider.value;
+  tornado.setTranslationSpeed(parseInt(speedSlider.value));
+});
+
+function updateMagnitudeDisplay() {
+  const m = parseFloat(magSlider.value);
+  magVal.textContent = m.toFixed(1);
+  quake.setMagnitude(m);
+  radiusValEq.textContent = `${Math.round(quake.affectedRadiusKm)} km`;
+}
+magSlider.addEventListener("input", updateMagnitudeDisplay);
+updateMagnitudeDisplay();
+
+// --- Gradual storm atmosphere transition ---
+const clearSky = {
+  bg: new THREE.Color(skyColor),
+  fogNear: 300, fogFar: 800,
+  sunIntensity: 1.5, sunColor: new THREE.Color(0xfff4e0),
+  hemiIntensity: 0.6, hemiColor: new THREE.Color(0x88bbee),
+  ambIntensity: 0.3,
+  exposure: 1.0,
+};
+const stormSky = {
+  bg: new THREE.Color(0x8a8a96),
+  fogNear: 250, fogFar: 700,
+  sunIntensity: 0.85, sunColor: new THREE.Color(0xdddde8),
+  hemiIntensity: 0.5, hemiColor: new THREE.Color(0x778899),
+  ambIntensity: 0.28,
+  exposure: 0.92,
+};
+
+let stormTarget = 0;
+let stormCurrent = 0;
+const STORM_SPEED = 0.35;
+
+const _lerpColor = new THREE.Color();
+function updateAtmosphere(t: number) {
+  _lerpColor.copy(clearSky.bg).lerp(stormSky.bg, t);
+  (scene.background as THREE.Color).copy(_lerpColor);
+  const fogColor = _lerpColor.clone();
+  scene.fog = new THREE.Fog(fogColor,
+    clearSky.fogNear + (stormSky.fogNear - clearSky.fogNear) * t,
+    clearSky.fogFar  + (stormSky.fogFar  - clearSky.fogFar) * t,
+  );
+  sun.intensity = clearSky.sunIntensity + (stormSky.sunIntensity - clearSky.sunIntensity) * t;
+  sun.color.copy(clearSky.sunColor).lerp(stormSky.sunColor, t);
+  hemi.intensity = clearSky.hemiIntensity + (stormSky.hemiIntensity - clearSky.hemiIntensity) * t;
+  hemi.color.copy(clearSky.hemiColor).lerp(stormSky.hemiColor, t);
+  ambient.intensity = clearSky.ambIntensity + (stormSky.ambIntensity - clearSky.ambIntensity) * t;
+  renderer.toneMappingExposure = clearSky.exposure + (stormSky.exposure - clearSky.exposure) * t;
+}
+
+// Track active disaster for auto-despawn detection
+let activeDisasterType: "tornado" | "earthquake" | null = null;
+let wasTornadoActive = false;
+let wasQuakeActive = false;
+
+/** Raycast from camera centre to terrain, place tornado. */
+function spawnTornadoAtCrosshair() {
+  const terrain = sceneGroup?.getObjectByName("terrain");
+  if (!terrain) return;
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const hits = raycaster.intersectObject(terrain);
+  if (hits.length > 0) {
+    tornado.spawn(hits[0]!.point);
+    stormTarget = 1;
+    spawnBtn.style.display = "none";
+    despawnBtn.style.display = "block";
+    tornadoStats.style.display = "block";
+  }
+}
+
+function spawnQuakeAtCrosshair() {
+  const terrain = sceneGroup?.getObjectByName("terrain");
+  if (!terrain) return;
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const hits = raycaster.intersectObject(terrain);
+  if (hits.length > 0) {
+    quake.spawn(hits[0]!.point);
+    spawnQuakeBtn.style.display = "none";
+    stopQuakeBtn.style.display = "block";
+  }
+}
+
+function stopTornado() {
+  tornado.despawn();
+  stormTarget = 0;
+  spawnBtn.style.display = "block";
+  despawnBtn.style.display = "none";
+  tornadoStats.style.display = "none";
+}
+
+function stopQuake() {
+  quake.despawn();
+  spawnQuakeBtn.style.display = "block";
+  stopQuakeBtn.style.display = "none";
+}
+
+spawnBtn.addEventListener("click", spawnTornadoAtCrosshair);
+despawnBtn.addEventListener("click", stopTornado);
+spawnQuakeBtn.addEventListener("click", spawnQuakeAtCrosshair);
+stopQuakeBtn.addEventListener("click", stopQuake);
+
+window.addEventListener("keydown", (e) => {
+  if (!overlay.classList.contains("hidden")) return;
+  if (activeDisasterType === "tornado") {
+    if (e.code === "KeyT") spawnTornadoAtCrosshair();
+    if (e.code === "KeyX") stopTornado();
+  } else if (activeDisasterType === "earthquake") {
+    if (e.code === "KeyT") spawnQuakeAtCrosshair();
+    if (e.code === "KeyX") stopQuake();
+  }
 });
 
 // --- Geocode lookup ---
@@ -161,12 +346,28 @@ const scenarios: ScenarioDefinition[] = [
     launch: (sc, eb, s, fireConfig?: FireConfig) => startTestFire(sc, eb, s, fireConfig),
   },
   {
+    id: "tornado",
+    name: "Tornado",
+    description: "Destructive funnel with debris physics",
+    icon: "\uD83C\uDF2A\uFE0F",
+    available: true,
+    launch: () => {
+      activeDisasterType = "tornado";
+      tornadoPanel.style.display = "block";
+      quakePanel.style.display = "none";
+    },
+  },
+  {
     id: "earthquake",
     name: "Earthquake",
     description: "Seismic event with structural damage",
     icon: "\uD83C\uDF0B",
-    available: false,
-    launch: () => {},
+    available: true,
+    launch: () => {
+      activeDisasterType = "earthquake";
+      quakePanel.style.display = "block";
+      tornadoPanel.style.display = "none";
+    },
   },
   {
     id: "flood",
@@ -206,19 +407,15 @@ function collectObstacles(group: THREE.Group, sceneHalfSize: number): Obstacle[]
     const geom = obj.geometry;
     if (!geom) return;
 
-    // Heuristic: buildings are ExtrudeGeometry with height > 2m
-    // Trees: any mesh under the "trees" group (trunks and canopies)
     const isExtrude = geom.type === "ExtrudeGeometry";
     const isTreePart = obj.parent?.name === "trees";
 
     if (!isExtrude && !isTreePart) return;
 
-    // Compute world bounding box
     box.setFromObject(obj);
     const height = box.max.y - box.min.y;
 
     if (isExtrude && height > 2) {
-      // Building — add with padding
       obstacles.push({
         minX: box.min.x - OBSTACLE_PADDING,
         maxX: box.max.x + OBSTACLE_PADDING,
@@ -226,7 +423,6 @@ function collectObstacles(group: THREE.Group, sceneHalfSize: number): Obstacle[]
         maxZ: box.max.z + OBSTACLE_PADDING,
       });
     } else if (isTreePart && geom.type === "SphereGeometry") {
-      // Tree canopy — use its full XZ footprint as the collision area
       const pad = 1.5;
       obstacles.push({
         minX: box.min.x - pad,
@@ -248,11 +444,9 @@ function findOpenPosition(
   obstacles: Obstacle[],
   agentRadius: number,
 ): { x: number; z: number } {
-  // Try the preferred position first
   if (!collidesAny(preferredX, preferredZ, obstacles, agentRadius)) {
     return { x: preferredX, z: preferredZ };
   }
-  // Spiral outward
   for (let r = 5; r < 100; r += 5) {
     for (let a = 0; a < 8; a++) {
       const angle = (a / 8) * Math.PI * 2;
@@ -263,7 +457,7 @@ function findOpenPosition(
       }
     }
   }
-  return { x: preferredX, z: preferredZ }; // fallback
+  return { x: preferredX, z: preferredZ };
 }
 
 function collidesAny(x: number, z: number, obstacles: Obstacle[], radius: number): boolean {
@@ -328,16 +522,13 @@ const AGENT_CONFIGS: Omit<AgentConfig, "spawnPosition">[] = [
 async function initExploration(sceneGrp: THREE.Group, sceneSize: number, sampler: HeightSampler) {
   const sceneHalfSize = sceneSize / 2;
 
-  // 1. Create ECS world and event bus
   world = new SimWorld();
   sharedEventBus = new EventBus();
 
-  // 2. Collect obstacles from the generated scene
   sharedObstacles = collectObstacles(sceneGrp, sceneHalfSize);
   sharedSceneGroup = sceneGrp;
   sharedSceneSize = sceneSize;
 
-  // 3. Create agent manager and load model
   agentManager = new AgentManager(world, scene);
   info.textContent = "Loading agent model...";
 
@@ -400,7 +591,6 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
   // 3. Create perception, recorder, stepped simulation
   const perception = new AgentPerceptionSystem(renderer, scene, agentManager);
   const recorder = new AgentRecorder(agentManager);
-  // Build location string for replay recording
   const locAddr = addressInput.value.trim();
   const locLat = latInput.value;
   const locLon = lonInput.value;
@@ -413,7 +603,7 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
     enabled: true,
   });
 
-  // 3b. Create replay capture system (round-robin 512x512 captures in animate loop)
+  // 3b. Create replay capture system
   replayCaptureSystem = new ReplayCaptureSystem(renderer, scene, agentManager, replayRecorder);
 
   // 4. Start stepped simulation (connects WebSocket)
@@ -433,7 +623,6 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
 
 /** Build scenario panel UI from the registry */
 function buildScenarioPanel() {
-  // Clear existing cards
   scenarioPanel.querySelectorAll(".scenario-card").forEach((el) => el.remove());
 
   for (const s of scenarios) {
@@ -449,9 +638,11 @@ function buildScenarioPanel() {
     if (s.available) {
       card.addEventListener("click", () => {
         if (s.id === "fire") {
-          // Show fire config panel instead of launching directly
           scenarioPanel.classList.remove("visible");
           fireConfigPanel.classList.add("visible");
+        } else if (s.id === "tornado" || s.id === "earthquake") {
+          // Launch scenario immediately (agents + disaster panels)
+          launchScenario(s.id);
         } else {
           launchScenario(s.id);
         }
@@ -489,6 +680,20 @@ stopSimBtn.addEventListener("click", async () => {
   }
   await steppedSim.stop();
   steppedSim = null;
+
+  // Clean up any active disaster
+  if (activeDisasterType === "tornado") {
+    tornado.reset();
+    stopTornado();
+    tornadoPanel.style.display = "none";
+  } else if (activeDisasterType === "earthquake") {
+    quake.despawn();
+    stopQuake();
+    quakePanel.style.display = "none";
+  }
+  activeDisasterType = null;
+  stormTarget = 0;
+
   stopSimBtn.style.display = "none";
   stopSimBtn.disabled = false;
   stopSimBtn.textContent = "Stop Simulation";
@@ -527,10 +732,14 @@ goBtn.addEventListener("click", async () => {
   sharedSceneSize = 0;
   scenarioPanel.classList.remove("visible");
   fireConfigPanel.classList.remove("visible");
+  tornadoPanel.style.display = "none";
+  quakePanel.style.display = "none";
+  activeDisasterType = null;
 
   try {
     const size = parseInt(sizeInput.value);
     const layers = await fetchLayers(lat, lon, size);
+    await carTemplatePromise;
 
     if (sceneGroup) {
       scene.remove(sceneGroup);
@@ -546,9 +755,14 @@ goBtn.addEventListener("click", async () => {
       });
     }
 
-    const buildResult = buildAllLayers(layers, lat, lon);
+    // Reset tornado state from previous session
+    tornado.reset();
+    stopTornado();
+
+    const buildResult = buildAllLayers(layers, lat, lon, carTemplate);
     sceneGroup = buildResult.group;
     heightSampler = buildResult.heightSampler;
+    resetCarsToBase();
     scene.add(sceneGroup);
 
     // Reset camera — scale distance with area size
@@ -590,7 +804,6 @@ function animate() {
     world.update(dt);
   }
   if (agentManager && heightSampler) {
-    // Update agent Y positions to follow terrain before syncing visuals
     for (const agent of agentManager.agents) {
       const eid = agent.eid;
       Position.y[eid] = heightSampler.sample(Position.x[eid]!, Position.z[eid]!);
@@ -602,8 +815,71 @@ function animate() {
     agentManager.visuals.updateAnimations(dt);
   }
 
+  // Tornado & earthquake simulation ticks
+  tornado.update(dt, buildingRegistry);
+  quake.update(dt, buildingRegistry);
+
+  // Detect auto-despawn (tornado left the terrain)
+  if (wasTornadoActive && !tornado.active) {
+    stopTornado();
+  }
+  wasTornadoActive = tornado.active;
+
+  // Detect auto-stop (quake finished)
+  if (wasQuakeActive && !quake.active) {
+    stopQuake();
+  }
+  wasQuakeActive = quake.active;
+
+  // Camera shake when near tornado
+  if (tornado.active) {
+    const shake = tornado.getCameraShake(camera.position);
+    camera.position.add(shake);
+
+    // Update HUD stats
+    const windMph = Math.round(tornado.getWindSpeedAtGround(
+      tornado.position.x, tornado.position.z) * 2.237);
+    tsWind.textContent = String(windMph);
+    tsDamaged.textContent = String(tornado.buildingsDamaged);
+    tsDestroyed.textContent = String(tornado.buildingsDestroyed);
+  }
+
+  // Earthquake camera shake
+  if (quake.active) {
+    camera.position.y += quake.getGroundShakeY();
+  }
+
+  // Clamp camera to rendered terrain bounds
+  if (terrainBoundsRef) {
+    const b = terrainBoundsRef;
+    const margin = 2;
+    camera.position.x = Math.min(b.xMax - margin, Math.max(b.xMin + margin, camera.position.x));
+    camera.position.z = Math.min(b.zMax - margin, Math.max(b.zMin + margin, camera.position.z));
+  }
+  const groundY = getTerrainHeight(camera.position.x, camera.position.z);
+  const minY = groundY + 2;
+  const maxY = tornado.getCloudCeilingY() - 6;
+  camera.position.y = Math.min(maxY, Math.max(minY, camera.position.y));
+
+  // Apply quake jitter after clamp
+  if (quake.active) {
+    camera.position.add(quake.getCameraJitter());
+    const groundYAfter = getTerrainHeight(camera.position.x, camera.position.z);
+    if (camera.position.y < groundYAfter + 2) camera.position.y = groundYAfter + 2;
+  }
+
+  // Gradual storm atmosphere transition
+  if (Math.abs(stormCurrent - stormTarget) > 0.001) {
+    if (stormCurrent < stormTarget) {
+      stormCurrent = Math.min(stormTarget, stormCurrent + STORM_SPEED * dt);
+    } else {
+      stormCurrent = Math.max(stormTarget, stormCurrent - STORM_SPEED * dt);
+    }
+    updateAtmosphere(stormCurrent);
+  }
+
   const pos = camera.position;
-  hud.textContent = `pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})  |  WASD move · Mouse look · Space ↑ · Shift ↓  |  Click to capture mouse`;
+  hud.textContent = `pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})  |  WASD move · Mouse look · Space ↑ · Shift ↓`;
 
   renderer.render(scene, camera);
 
