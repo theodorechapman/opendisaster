@@ -18,6 +18,9 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 # sqlite cache
 buildings.db
 
+# agent logs
+agent-log.jsonl
+
 # dotenv environment variable files
 .env
 .env.development.local

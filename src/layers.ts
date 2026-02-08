@@ -4,9 +4,91 @@ import { metersPerDegree } from "./tiles.ts";
 
 type Proj = { lon: number; lat: number };
 
+// ─── Building registry & terrain references (for tornado interaction) ────────
+
+export interface BuildingRecord {
+  mesh: THREE.Mesh;
+  height: number;
+  baseY: number;
+  centerX: number;
+  centerZ: number;
+  width: number;
+  tiltTargetX?: number;
+  tiltTargetZ?: number;
+  damageLevel: number;
+  destroyed: boolean;
+  originalColor: THREE.Color;
+  /** Random multiplier (0.7–1.3) simulating construction quality variance. */
+  structuralStrength: number;
+}
+
+export let buildingRegistry: BuildingRecord[] = [];
+
+export function clearBuildingRegistry() {
+  buildingRegistry = [];
+}
+
+export interface TreeRecord {
+  trunkMesh: THREE.Mesh;
+  canopyMesh: THREE.Mesh;
+  x: number;
+  z: number;
+  height: number;
+  uprooted: boolean;
+  broken: boolean;
+  /** Random 0.7–1.3 multiplier for wind resistance. */
+  strength: number;
+}
+
+export let treeRegistry: TreeRecord[] = [];
+
+export function clearTreeRegistry() {
+  treeRegistry = [];
+}
+
+export interface CarRecord {
+  mesh: THREE.Object3D;
+  x: number;
+  z: number;
+  baseX: number;
+  baseZ: number;
+  baseY: number;
+  uprooted: boolean;
+  /** Random 0.7–1.3 multiplier for wind resistance. */
+  strength: number;
+  heading: number;
+  speed: number;
+  tipped: boolean;
+}
+
+export let carRegistry: CarRecord[] = [];
+
+export function clearCarRegistry() {
+  carRegistry = [];
+}
+
+// Terrain canvas / texture refs (for tornado ground-damage painting)
+export let terrainCanvasRef: HTMLCanvasElement | null = null;
+export let terrainTextureRef: THREE.CanvasTexture | null = null;
+export let terrainBoundsRef: {
+  xMin: number; xMax: number; zMin: number; zMax: number;
+  width: number; depth: number;
+} | null = null;
+export let terrainMeshRef: THREE.Mesh | null = null;
+export let roadLinesRef: RoadLine2D[] = [];
+export let sceneGroupRef: THREE.Group | null = null;
+
+// Height sampler accessor (set inside buildAllLayers)
+let _heightSampler: HeightSampler | null = null;
+
+/** Sample terrain height at local Three.js (x, z) coordinates. */
+export function getTerrainHeight(x: number, z: number): number {
+  return _heightSampler ? _heightSampler.sample(x, z) : 0;
+}
+
 // ─── Height sampler (bilinear interpolation over the elevation grid) ────────
 
-class HeightSampler {
+export class HeightSampler {
   private values: number[][];
   private gridSize: number;
   private minElev: number;
@@ -74,17 +156,26 @@ export function buildAllLayers(
   data: LayerData,
   centerLat: number,
   centerLon: number,
-): THREE.Group {
+  carTemplate?: THREE.Object3D | null,
+): { group: THREE.Group; heightSampler: HeightSampler } {
   const root = new THREE.Group();
+  sceneGroupRef = root;
   const mpd = metersPerDegree(centerLat);
 
+  // Reset registries for tornado interaction
+  clearBuildingRegistry();
+  clearTreeRegistry();
+  clearCarRegistry();
+
   const sampler = new HeightSampler(data.elevation, centerLat, centerLon, mpd);
+  _heightSampler = sampler;
 
   // Extract geometry for canvas painting
   const parkPolys = extractPolygonsXZ(data.parks, centerLat, centerLon, mpd);
   const waterPolys = extractPolygonsXZ(data.water, centerLat, centerLon, mpd);
   const roadLines = extractRoadLinesXZ(data.roads, centerLat, centerLon, mpd);
   const railLines = extractRoadLinesXZ(data.railways, centerLat, centerLon, mpd);
+  roadLinesRef = roadLines;
 
   // All ground features painted directly onto the terrain texture
   root.add(buildTerrain(data.elevation, centerLat, centerLon, mpd, sampler, parkPolys, waterPolys, roadLines, railLines));
@@ -93,8 +184,11 @@ export function buildAllLayers(
   root.add(buildWater(data.water, centerLat, centerLon, mpd, sampler));
   root.add(buildTrees(data.trees, centerLat, centerLon, mpd, sampler));
   root.add(buildBarriers(data.barriers, centerLat, centerLon, mpd, sampler));
+  if (carTemplate && roadLines.length > 0) {
+    root.add(buildCars(roadLines, sampler, carTemplate));
+  }
 
-  return root;
+  return { group: root, heightSampler: sampler };
 }
 
 // ─── Projection helpers ─────────────────────────────────────────────────────
@@ -150,7 +244,7 @@ function extractPolygonsXZ(fc: FeatureCollection, cLat: number, cLon: number, mp
   return result;
 }
 
-type RoadLine2D = { points: [number, number][]; width: number; isFootpath: boolean };
+export type RoadLine2D = { points: [number, number][]; width: number; isFootpath: boolean };
 
 const ROAD_WIDTHS: Record<string, number> = {
   motorway: 14, trunk: 12, primary: 10, secondary: 8, tertiary: 7,
@@ -193,6 +287,153 @@ function pointInAnyPolygon(x: number, z: number, polys: Poly2D[]): boolean {
     if (pointInPolygon(x, z, p)) return true;
   }
   return false;
+}
+
+// ─── Cars (spawned along roads) ────────────────────────────────────────────
+
+function buildCars(roadLines: RoadLine2D[], sampler: HeightSampler, carTemplate: THREE.Object3D): THREE.Group {
+  const group = new THREE.Group();
+  group.name = "cars";
+
+  const segments: { x1: number; z1: number; x2: number; z2: number; len: number }[] = [];
+  let totalLen = 0;
+  for (const line of roadLines) {
+    if (line.isFootpath) continue;
+    const pts = line.points;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [x1, z1] = pts[i]!;
+      const [x2, z2] = pts[i + 1]!;
+      const dx = x2 - x1;
+      const dz = z2 - z1;
+      const len = Math.hypot(dx, dz);
+      if (len < 8) continue;
+      segments.push({ x1, z1, x2, z2, len });
+      totalLen += len;
+    }
+  }
+
+  if (segments.length === 0) return group;
+
+  const density = THREE.MathUtils.clamp(totalLen / 2500, 0.4, 1.4);
+  const areaKm2 = terrainBoundsRef ? (terrainBoundsRef.width * terrainBoundsRef.depth) / 1_000_000 : 1;
+  const areaFactor = THREE.MathUtils.clamp(areaKm2 / 0.9, 0.35, 1.2);
+  const maxByLen = Math.floor(totalLen / 90);
+  const target = Math.min(30, Math.max(1, Math.floor(maxByLen * density * areaFactor)));
+
+  const cumulative: number[] = [];
+  let acc = 0;
+  for (const s of segments) {
+    acc += s.len;
+    cumulative.push(acc);
+  }
+
+  for (let i = 0; i < target; i++) {
+    const r = Math.random() * acc;
+    let idx = cumulative.findIndex((v) => v >= r);
+    if (idx < 0) idx = segments.length - 1;
+    const s = segments[idx]!;
+    const t = Math.random();
+    const x = s.x1 + (s.x2 - s.x1) * t;
+    const z = s.z1 + (s.z2 - s.z1) * t;
+    const y = sampler.sample(x, z) + 0.25;
+
+    const car = carTemplate.clone(true);
+    const nx = x + (Math.random() - 0.5) * 2;
+    const nz = z + (Math.random() - 0.5) * 2;
+    if (terrainBoundsRef) {
+      if (nx < terrainBoundsRef.xMin || nx > terrainBoundsRef.xMax) continue;
+      if (nz < terrainBoundsRef.zMin || nz > terrainBoundsRef.zMax) continue;
+    }
+    car.position.set(nx, y, nz);
+
+    const dirX = s.x2 - s.x1;
+    const dirZ = s.z2 - s.z1;
+    car.rotation.y = Math.atan2(dirX, dirZ) + (Math.random() - 0.5) * 0.15;
+
+    car.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.geometry = obj.geometry.clone();
+        if (Array.isArray(obj.material)) {
+          obj.material = obj.material.map((m) => m.clone());
+        } else {
+          obj.material = (obj.material as THREE.Material).clone();
+        }
+        obj.castShadow = true;
+        obj.receiveShadow = true;
+      }
+    });
+
+    group.add(car);
+    carRegistry.push({
+      mesh: car,
+      x: nx,
+      z: nz,
+      baseX: nx,
+      baseZ: nz,
+      baseY: y,
+      uprooted: false,
+      strength: 0.7 + Math.random() * 0.6,
+      heading: car.rotation.y,
+      speed: 0,
+      tipped: false,
+    });
+  }
+
+  return group;
+}
+
+export function updateCarsMovement(dt: number) {
+  if (!terrainBoundsRef) return;
+  const b = terrainBoundsRef;
+  for (const car of carRegistry) {
+    if (car.uprooted || car.tipped) continue;
+    const turn = (Math.random() - 0.5) * 0.6 * dt;
+    car.heading += turn;
+    const vx = Math.sin(car.heading) * car.speed;
+    const vz = Math.cos(car.heading) * car.speed;
+    car.x += vx * dt;
+    car.z += vz * dt;
+
+    // Keep within bounds by gently steering inward
+    const margin = 6;
+    if (car.x < b.xMin + margin) car.heading = 0.2;
+    if (car.x > b.xMax - margin) car.heading = -0.2 + Math.PI;
+    if (car.z < b.zMin + margin) car.heading = Math.PI;
+    if (car.z > b.zMax - margin) car.heading = 0;
+
+    const y = getTerrainHeight(car.x, car.z);
+    car.mesh.position.set(car.x, y, car.z);
+    car.mesh.rotation.y = car.heading;
+
+    // Building collision: turn away and slow down
+    for (const bld of buildingRegistry) {
+      if (bld.destroyed) continue;
+      const dx = car.x - bld.centerX;
+      const dz = car.z - bld.centerZ;
+      const dist = Math.hypot(dx, dz);
+      const bRadius = bld.width * 0.6;
+      const carRadius = 1.8;
+      if (dist < bRadius + carRadius) {
+        const ang = Math.atan2(dx, dz);
+        car.heading = ang + Math.PI * 0.8;
+        car.speed = Math.max(1.2, car.speed * 0.6);
+        car.x = bld.centerX + Math.sin(car.heading) * (bRadius + carRadius + 1.0);
+        car.z = bld.centerZ + Math.cos(car.heading) * (bRadius + carRadius + 1.0);
+        break;
+      }
+    }
+  }
+}
+
+export function resetCarsToBase() {
+  for (const car of carRegistry) {
+    car.x = car.baseX;
+    car.z = car.baseZ;
+    car.mesh.position.set(car.baseX, car.baseY, car.baseZ);
+    car.mesh.rotation.y = car.heading;
+    car.speed = 0;
+    car.tipped = false;
+  }
 }
 
 // ─── Terrain mesh (with canvas-textured parks & water) ──────────────────────
@@ -287,6 +528,11 @@ function buildTerrain(
   texture.minFilter = THREE.LinearFilter;
   texture.magFilter = THREE.LinearFilter;
 
+  // Expose canvas/texture/bounds for tornado ground-damage painting
+  terrainCanvasRef = canvas;
+  terrainTextureRef = texture;
+  terrainBoundsRef = { xMin, xMax, zMin, zMax, width, depth };
+
   // --- Build terrain geometry (indexed, much faster) ---
   const subdivs = Math.max(gs - 1, 64);
   const geo = new THREE.PlaneGeometry(width, depth, subdivs, subdivs);
@@ -310,7 +556,6 @@ function buildTerrain(
 
   const mat = new THREE.MeshPhongMaterial({
     map: texture,
-    flatShading: true,
     polygonOffset: true,
     polygonOffsetFactor: 1,
     polygonOffsetUnits: 1,
@@ -319,6 +564,7 @@ function buildTerrain(
   const mesh = new THREE.Mesh(geo, mat);
   mesh.receiveShadow = true;
   mesh.name = "terrain";
+  terrainMeshRef = mesh;
   return mesh;
 }
 
@@ -356,7 +602,13 @@ function buildBuildings(fc: FeatureCollection, cLat: number, cLon: number, mpd: 
       const extH = height - minHeight;
       if (extH <= 0) continue;
 
-      const geo = new THREE.ExtrudeGeometry(shape, { depth: extH, bevelEnabled: false });
+      const geo = new THREE.ExtrudeGeometry(shape, {
+        depth: extH,
+        bevelEnabled: true,
+        bevelThickness: 0.2,
+        bevelSize: 0.15,
+        bevelSegments: 2,
+      });
       // ExtrudeGeometry extrudes along Z in shape space. We created shape in XZ plane,
       // so extrusion goes along "local Z". We need to rotate so extrusion goes up (Y).
       // Shape is in (x, z) coords → extrude goes along shape's Z axis.
@@ -364,11 +616,28 @@ function buildBuildings(fc: FeatureCollection, cLat: number, cLon: number, mpd: 
       geo.rotateX(-Math.PI / 2);
       geo.translate(0, terrainY + minHeight, 0);
 
-      const mat = new THREE.MeshPhongMaterial({ color, flatShading: true });
+      const mat = new THREE.MeshPhongMaterial({ color, shininess: 15 });
       const mesh = new THREE.Mesh(geo, mat);
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       group.add(mesh);
+
+      // Register for tornado interaction
+      const bbox = new THREE.Box3().setFromObject(mesh);
+      const size = bbox.getSize(new THREE.Vector3());
+      const center = bbox.getCenter(new THREE.Vector3());
+      buildingRegistry.push({
+        mesh,
+        height: extH,
+        baseY: terrainY + minHeight,
+        centerX: center.x,
+        centerZ: center.z,
+        width: Math.max(size.x, size.z),
+        damageLevel: 0,
+        destroyed: false,
+        originalColor: new THREE.Color(color),
+        structuralStrength: 0.7 + Math.random() * 0.6,
+      });
     }
   }
   return group;
@@ -416,10 +685,10 @@ function buildWater(fc: FeatureCollection, cLat: number, cLon: number, mpd: Proj
 
 // ─── Trees (placed on terrain) ──────────────────────────────────────────────
 
-const treeTrunkGeo = new THREE.CylinderGeometry(0.3, 0.4, 4, 6);
-const treeCanopyGeo = new THREE.SphereGeometry(3, 8, 6);
-const trunkMat = new THREE.MeshPhongMaterial({ color: 0x5c3a1e });
-const canopyMat = new THREE.MeshPhongMaterial({ color: 0x2d7a2d, flatShading: true });
+const treeTrunkGeo = new THREE.CylinderGeometry(0.25, 0.45, 4, 12);
+const treeCanopyGeo = new THREE.IcosahedronGeometry(3, 1);
+const trunkMat = new THREE.MeshPhongMaterial({ color: 0x5c3a1e, shininess: 5 });
+const canopyMat = new THREE.MeshPhongMaterial({ color: 0x2d7a2d, shininess: 8 });
 
 function buildTrees(fc: FeatureCollection, cLat: number, cLon: number, mpd: Proj, sampler: HeightSampler): THREE.Group {
   const group = new THREE.Group();
@@ -473,6 +742,16 @@ function addTree(group: THREE.Group, x: number, z: number, height: number, sampl
   canopy.scale.setScalar(scale);
   canopy.castShadow = true;
   group.add(canopy);
+
+  // Register for tornado interaction
+  treeRegistry.push({
+    trunkMesh: trunk,
+    canopyMesh: canopy,
+    x, z, height,
+    uprooted: false,
+    broken: false,
+    strength: 0.7 + Math.random() * 0.6,
+  });
 }
 
 // ─── Barriers (walls on terrain) ────────────────────────────────────────────

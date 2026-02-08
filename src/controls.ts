@@ -28,6 +28,7 @@ export class FlyControls {
 
     document.addEventListener("pointerlockchange", () => {
       this.locked = document.pointerLockElement === canvas;
+      if (!this.locked) this.keys.clear();
       document.getElementById("crosshair")!.style.display = this.locked ? "block" : "none";
     });
 
@@ -43,6 +44,9 @@ export class FlyControls {
     });
     window.addEventListener("keyup", (e) => {
       this.keys.delete(e.code);
+    });
+    window.addEventListener("blur", () => {
+      this.keys.clear();
     });
   }
 

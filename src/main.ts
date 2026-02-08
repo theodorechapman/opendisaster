@@ -1,9 +1,27 @@
 import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { fetchLayers, type LayerData } from "./tiles.ts";
-import { buildAllLayers } from "./layers.ts";
+import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, resetCarsToBase, sceneGroupRef } from "./layers.ts";
 import { FlyControls } from "./controls.ts";
+import { TornadoSimulator, EF_SCALE } from "./disasters/tornado.ts";
+import { EarthquakeSimulator } from "./disasters/earthquake.ts";
 import { createDisaster, getDefaultDisasterControls } from "../disasters/factory.ts";
 import type { DisasterControl, DisasterController, DisasterKind } from "../disasters/types.ts";
+
+// Agent system imports
+import { SimWorld } from "./core/World.ts";
+import { EventBus } from "./core/EventBus.ts";
+import { AgentManager } from "./agents/AgentManager.ts";
+import { AgentPerceptionSystem } from "./agents/AgentPerceptionSystem.ts";
+import { AgentRecorder } from "./agents/AgentRecorder.ts";
+import { SteppedSimulation } from "./agents/SteppedSimulation.ts";
+import { ReplayRecorder } from "./replay/ReplayRecorder.ts";
+import { createAgentActionSystem, type Obstacle } from "./agents/AgentActionSystem.ts";
+import { createAgentDamageSystem } from "./agents/AgentDamageSystem.ts";
+import { startTestFire, type FireConfig } from "./scenarios/TestFire.ts";
+import type { AgentConfig } from "./agents/types.ts";
+import { Position } from "./core/Components.ts";
+import { ReplayCaptureSystem } from "./replay/ReplayCaptureSystem.ts";
 
 const overlay = document.getElementById("overlay")!;
 const goBtn = document.getElementById("go") as HTMLButtonElement;
@@ -18,13 +36,83 @@ const lookupBtn = document.getElementById("lookup") as HTMLButtonElement;
 const geocodeError = document.getElementById("geocode-error")!;
 const loading = document.getElementById("loading")!;
 const hud = document.getElementById("hud")!;
-const disasterPanel = document.getElementById("disaster-panel") as HTMLDivElement;
-const disasterType = document.getElementById("disaster-type") as HTMLSelectElement;
-const disasterStartBtn = document.getElementById("disaster-start") as HTMLButtonElement;
-const disasterToggleBtn = document.getElementById("disaster-toggle") as HTMLButtonElement;
-const disasterResetBtn = document.getElementById("disaster-reset") as HTMLButtonElement;
-const disasterControlsHost = document.getElementById("disaster-controls") as HTMLDivElement;
-const disasterStats = document.getElementById("disaster-stats") as HTMLPreElement;
+const info = document.getElementById("info")!;
+const stopSimBtn = document.getElementById("stop-sim-btn") as HTMLButtonElement;
+
+// Fire config panel elements
+const fireConfigPanel = document.getElementById("fire-config-panel")!;
+const fireXInput = document.getElementById("fire-x") as HTMLInputElement;
+const fireZInput = document.getElementById("fire-z") as HTMLInputElement;
+const fireSizeInput = document.getElementById("fire-size") as HTMLInputElement;
+const fireSpreadInput = document.getElementById("fire-spread") as HTMLInputElement;
+const fireXVal = document.getElementById("fire-x-val")!;
+const fireZVal = document.getElementById("fire-z-val")!;
+const fireSizeVal = document.getElementById("fire-size-val")!;
+const fireSpreadVal = document.getElementById("fire-spread-val")!;
+const fireStartBtn = document.getElementById("fire-start-btn") as HTMLButtonElement;
+const fireBackBtn = document.getElementById("fire-back-btn") as HTMLButtonElement;
+
+// Live value updates for fire sliders
+fireXInput.addEventListener("input", () => { fireXVal.textContent = fireXInput.value; });
+fireZInput.addEventListener("input", () => { fireZVal.textContent = fireZInput.value; });
+fireSizeInput.addEventListener("input", () => { fireSizeVal.textContent = fireSizeInput.value; });
+fireSpreadInput.addEventListener("input", () => { fireSpreadVal.textContent = fireSpreadInput.value; });
+
+// Flood/Tsunami disaster control panel elements
+const disasterCtrlPanel = document.getElementById("disaster-ctrl-panel")!;
+const disasterCtrlTitle = document.getElementById("disaster-ctrl-title")!;
+const disasterStartBtnEl = document.getElementById("disaster-start-btn") as HTMLButtonElement;
+const disasterPauseBtnEl = document.getElementById("disaster-pause-btn") as HTMLButtonElement;
+const disasterResetBtnEl = document.getElementById("disaster-reset-btn") as HTMLButtonElement;
+const disasterCtrlControls = document.getElementById("disaster-ctrl-controls")!;
+const disasterCtrlStats = document.getElementById("disaster-ctrl-stats")!;
+
+// --- Car asset (GLB) ---
+const carLoader = new GLTFLoader();
+let carTemplate: THREE.Object3D | null = null;
+const carTemplatePromise = carLoader.loadAsync("/assets/classic_muscle_car.glb")
+  .then((gltf) => {
+    const root = gltf.scene;
+    const box = new THREE.Box3().setFromObject(root);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const length = Math.max(size.x, size.z, 0.001);
+    const targetLen = 4.2 * 1.7;
+    const scale = targetLen / length;
+    root.scale.setScalar(scale);
+    const box2 = new THREE.Box3().setFromObject(root);
+    const center2 = new THREE.Vector3();
+    box2.getCenter(center2);
+    root.position.sub(center2);
+    root.position.y -= box2.min.y;
+    carTemplate = root;
+  })
+  .catch((err) => {
+    console.warn("Failed to load car model:", err);
+    carTemplate = null;
+  });
+
+// Tornado panel elements
+const tornadoPanel   = document.getElementById("tornado-panel")!;
+const efSlider       = document.getElementById("ef-slider") as HTMLInputElement;
+const efBadge        = document.getElementById("ef-badge")!;
+const efDesc         = document.getElementById("ef-desc")!;
+const radiusVal      = document.getElementById("radius-val")!;
+const widthVal       = document.getElementById("width-val")!;
+const spawnBtn       = document.getElementById("spawn-btn") as HTMLButtonElement;
+const despawnBtn     = document.getElementById("despawn-btn") as HTMLButtonElement;
+const tornadoStats   = document.getElementById("tornado-stats")!;
+const tsWind         = document.getElementById("ts-wind")!;
+const tsDamaged      = document.getElementById("ts-damaged")!;
+const tsDestroyed    = document.getElementById("ts-destroyed")!;
+
+// Earthquake panel elements
+const quakePanel   = document.getElementById("quake-panel")!;
+const magSlider    = document.getElementById("mag-slider") as HTMLInputElement;
+const magVal       = document.getElementById("mag-val")!;
+const radiusValEq  = document.getElementById("eq-radius-val")!;
+const spawnQuakeBtn = document.getElementById("spawn-quake-btn") as HTMLButtonElement;
+const stopQuakeBtn  = document.getElementById("stop-quake-btn") as HTMLButtonElement;
 
 sizeInput.addEventListener("input", () => {
   sizeVal.textContent = sizeInput.value;
@@ -81,6 +169,143 @@ window.addEventListener("resize", () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
+// --- Tornado & Earthquake simulators ---
+const tornado = new TornadoSimulator(scene);
+const quake = new EarthquakeSimulator(scene);
+const raycaster = new THREE.Raycaster();
+
+const EF_COLORS = ["#22cc22", "#cccc00", "#ff8800", "#ff4400", "#ff0000", "#880000"];
+
+function updateEFDisplay() {
+  const r = parseInt(efSlider.value);
+  const ef = EF_SCALE[r]!;
+  efBadge.textContent = ef.label;
+  efBadge.style.background = EF_COLORS[r]!;
+  efDesc.textContent = `${ef.desc} · ${ef.minMph}–${ef.maxMph} mph`;
+  tornado.setEFRating(r);
+  radiusVal.textContent = tornado.getCoreRadius().toFixed(1);
+  widthVal.textContent = Math.round(tornado.getPathWidthMeters()).toString();
+}
+efSlider.addEventListener("input", updateEFDisplay);
+updateEFDisplay();
+
+const speedSlider = document.getElementById("speed-slider") as HTMLInputElement;
+const speedVal    = document.getElementById("speed-val")!;
+speedSlider.addEventListener("input", () => {
+  speedVal.textContent = speedSlider.value;
+  tornado.setTranslationSpeed(parseInt(speedSlider.value));
+});
+
+function updateMagnitudeDisplay() {
+  const m = parseFloat(magSlider.value);
+  magVal.textContent = m.toFixed(1);
+  quake.setMagnitude(m);
+  radiusValEq.textContent = `${Math.round(quake.affectedRadiusKm)} km`;
+}
+magSlider.addEventListener("input", updateMagnitudeDisplay);
+updateMagnitudeDisplay();
+
+// --- Gradual storm atmosphere transition ---
+const clearSky = {
+  bg: new THREE.Color(skyColor),
+  fogNear: 300, fogFar: 800,
+  sunIntensity: 1.5, sunColor: new THREE.Color(0xfff4e0),
+  hemiIntensity: 0.6, hemiColor: new THREE.Color(0x88bbee),
+  ambIntensity: 0.3,
+  exposure: 1.0,
+};
+const stormSky = {
+  bg: new THREE.Color(0x8a8a96),
+  fogNear: 250, fogFar: 700,
+  sunIntensity: 0.85, sunColor: new THREE.Color(0xdddde8),
+  hemiIntensity: 0.5, hemiColor: new THREE.Color(0x778899),
+  ambIntensity: 0.28,
+  exposure: 0.92,
+};
+
+let stormTarget = 0;
+let stormCurrent = 0;
+const STORM_SPEED = 0.35;
+
+const _lerpColor = new THREE.Color();
+function updateAtmosphere(t: number) {
+  _lerpColor.copy(clearSky.bg).lerp(stormSky.bg, t);
+  (scene.background as THREE.Color).copy(_lerpColor);
+  const fogColor = _lerpColor.clone();
+  scene.fog = new THREE.Fog(fogColor,
+    clearSky.fogNear + (stormSky.fogNear - clearSky.fogNear) * t,
+    clearSky.fogFar  + (stormSky.fogFar  - clearSky.fogFar) * t,
+  );
+  sun.intensity = clearSky.sunIntensity + (stormSky.sunIntensity - clearSky.sunIntensity) * t;
+  sun.color.copy(clearSky.sunColor).lerp(stormSky.sunColor, t);
+  hemi.intensity = clearSky.hemiIntensity + (stormSky.hemiIntensity - clearSky.hemiIntensity) * t;
+  hemi.color.copy(clearSky.hemiColor).lerp(stormSky.hemiColor, t);
+  ambient.intensity = clearSky.ambIntensity + (stormSky.ambIntensity - clearSky.ambIntensity) * t;
+  renderer.toneMappingExposure = clearSky.exposure + (stormSky.exposure - clearSky.exposure) * t;
+}
+
+// Track active disaster for auto-despawn detection
+let activeDisasterType: "tornado" | "earthquake" | null = null;
+let wasTornadoActive = false;
+let wasQuakeActive = false;
+
+/** Raycast from camera centre to terrain, place tornado. */
+function spawnTornadoAtCrosshair() {
+  const terrain = sceneGroup?.getObjectByName("terrain");
+  if (!terrain) return;
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const hits = raycaster.intersectObject(terrain);
+  if (hits.length > 0) {
+    tornado.spawn(hits[0]!.point);
+    stormTarget = 1;
+    spawnBtn.style.display = "none";
+    despawnBtn.style.display = "block";
+    tornadoStats.style.display = "block";
+  }
+}
+
+function spawnQuakeAtCrosshair() {
+  const terrain = sceneGroup?.getObjectByName("terrain");
+  if (!terrain) return;
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const hits = raycaster.intersectObject(terrain);
+  if (hits.length > 0) {
+    quake.spawn(hits[0]!.point);
+    spawnQuakeBtn.style.display = "none";
+    stopQuakeBtn.style.display = "block";
+  }
+}
+
+function stopTornado() {
+  tornado.despawn();
+  stormTarget = 0;
+  spawnBtn.style.display = "block";
+  despawnBtn.style.display = "none";
+  tornadoStats.style.display = "none";
+}
+
+function stopQuake() {
+  quake.despawn();
+  spawnQuakeBtn.style.display = "block";
+  stopQuakeBtn.style.display = "none";
+}
+
+spawnBtn.addEventListener("click", spawnTornadoAtCrosshair);
+despawnBtn.addEventListener("click", stopTornado);
+spawnQuakeBtn.addEventListener("click", spawnQuakeAtCrosshair);
+stopQuakeBtn.addEventListener("click", stopQuake);
+
+window.addEventListener("keydown", (e) => {
+  if (!overlay.classList.contains("hidden")) return;
+  if (activeDisasterType === "tornado") {
+    if (e.code === "KeyT") spawnTornadoAtCrosshair();
+    if (e.code === "KeyX") stopTornado();
+  } else if (activeDisasterType === "earthquake") {
+    if (e.code === "KeyT") spawnQuakeAtCrosshair();
+    if (e.code === "KeyX") stopQuake();
+  }
+});
+
 // --- Geocode lookup ---
 async function doLookup() {
   const q = addressInput.value.trim();
@@ -115,53 +340,406 @@ addressInput.addEventListener("keydown", (e) => {
   }
 });
 
+// --- Scenario registry ---
+interface ScenarioDefinition {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  available: boolean;
+  launch: (scene: THREE.Scene, eventBus: EventBus, sampler: HeightSampler, fireConfig?: FireConfig) => void;
+}
+
+const scenarios: ScenarioDefinition[] = [
+  {
+    id: "fire",
+    name: "Fire",
+    description: "Building fire with smoke and flames",
+    icon: "\uD83D\uDD25",
+    available: true,
+    launch: (sc, eb, s, fireConfig?: FireConfig) => startTestFire(sc, eb, s, fireConfig),
+  },
+  {
+    id: "tornado",
+    name: "Tornado",
+    description: "Destructive funnel with debris physics",
+    icon: "\uD83C\uDF2A\uFE0F",
+    available: true,
+    launch: () => {
+      activeDisasterType = "tornado";
+      tornadoPanel.style.display = "block";
+      quakePanel.style.display = "none";
+    },
+  },
+  {
+    id: "earthquake",
+    name: "Earthquake",
+    description: "Seismic event with structural damage",
+    icon: "\uD83C\uDF0B",
+    available: true,
+    launch: () => {
+      activeDisasterType = "earthquake";
+      quakePanel.style.display = "block";
+      tornadoPanel.style.display = "none";
+    },
+  },
+  {
+    id: "flood",
+    name: "Flood",
+    description: "Rising water levels with shallow-water simulation",
+    icon: "\uD83C\uDF0A",
+    available: true,
+    launch: () => {
+      launchDisasterScenario("flood");
+    },
+  },
+  {
+    id: "tsunami",
+    name: "Tsunami",
+    description: "Coastal wave with destruction and debris physics",
+    icon: "\uD83C\uDF0A",
+    available: true,
+    launch: () => {
+      launchDisasterScenario("tsunami");
+    },
+  },
+];
+
+const scenarioPanel = document.getElementById("scenario-panel")!;
+
+// --- Agent system state ---
+let world: SimWorld | null = null;
+let agentManager: AgentManager | null = null;
+let steppedSim: SteppedSimulation | null = null;
+let heightSampler: HeightSampler | null = null;
+let replayCaptureSystem: ReplayCaptureSystem | null = null;
+
+// Exploration phase shared state
+let explorationReady = false;
+let sharedEventBus: EventBus | null = null;
+let sharedObstacles: Obstacle[] = [];
+let sharedSceneGroup: THREE.Group | null = null;
+let sharedSceneSize = 0;
+
+// --- Obstacle collection from generated scene ---
+const OBSTACLE_PADDING = 3; // meters padding around buildings
+
+function collectObstacles(group: THREE.Group, sceneHalfSize: number): Obstacle[] {
+  const obstacles: Obstacle[] = [];
+  const box = new THREE.Box3();
+
+  group.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return;
+    const geom = obj.geometry;
+    if (!geom) return;
+
+    const isExtrude = geom.type === "ExtrudeGeometry";
+    const isTreePart = obj.parent?.name === "trees";
+
+    if (!isExtrude && !isTreePart) return;
+
+    box.setFromObject(obj);
+    const height = box.max.y - box.min.y;
+
+    if (isExtrude && height > 2) {
+      obstacles.push({
+        minX: box.min.x - OBSTACLE_PADDING,
+        maxX: box.max.x + OBSTACLE_PADDING,
+        minZ: box.min.z - OBSTACLE_PADDING,
+        maxZ: box.max.z + OBSTACLE_PADDING,
+      });
+    } else if (isTreePart && geom.type === "SphereGeometry") {
+      const pad = 1.5;
+      obstacles.push({
+        minX: box.min.x - pad,
+        maxX: box.max.x + pad,
+        minZ: box.min.z - pad,
+        maxZ: box.max.z + pad,
+      });
+    }
+  });
+
+  console.log(`[Agents] Collected ${obstacles.length} obstacles from scene`);
+  return obstacles;
+}
+
+/** Find an open position that doesn't collide with any obstacle. */
+function findOpenPosition(
+  preferredX: number,
+  preferredZ: number,
+  obstacles: Obstacle[],
+  agentRadius: number,
+): { x: number; z: number } {
+  if (!collidesAny(preferredX, preferredZ, obstacles, agentRadius)) {
+    return { x: preferredX, z: preferredZ };
+  }
+  for (let r = 5; r < 100; r += 5) {
+    for (let a = 0; a < 8; a++) {
+      const angle = (a / 8) * Math.PI * 2;
+      const x = preferredX + Math.cos(angle) * r;
+      const z = preferredZ + Math.sin(angle) * r;
+      if (!collidesAny(x, z, obstacles, agentRadius)) {
+        return { x, z };
+      }
+    }
+  }
+  return { x: preferredX, z: preferredZ };
+}
+
+function collidesAny(x: number, z: number, obstacles: Obstacle[], radius: number): boolean {
+  for (const o of obstacles) {
+    const cx = Math.max(o.minX, Math.min(x, o.maxX));
+    const cz = Math.max(o.minZ, Math.min(z, o.maxZ));
+    const dx = x - cx;
+    const dz = z - cz;
+    if (dx * dx + dz * dz < radius * radius) return true;
+  }
+  return false;
+}
+
+// Agent configs — 8 unique personalities with distinct colors
+const AGENT_CONFIGS: Omit<AgentConfig, "spawnPosition">[] = [
+  {
+    name: "Alice",
+    color: 0xff4444,
+    personality: { bravery: 0.8, altruism: 0.6, awareness: 0.7, description: "a brave security guard" },
+  },
+  {
+    name: "Bob",
+    color: 0x4444ff,
+    personality: { bravery: 0.3, altruism: 0.5, awareness: 0.8, description: "a nervous bystander" },
+  },
+  {
+    name: "Carol",
+    color: 0x44ff44,
+    personality: { bravery: 0.5, altruism: 0.9, awareness: 0.6, description: "an analytical professor" },
+  },
+  {
+    name: "Dave",
+    color: 0xffaa00,
+    personality: { bravery: 0.6, altruism: 0.4, awareness: 0.5, description: "a practical delivery worker" },
+  },
+  {
+    name: "Eve",
+    color: 0xff44ff,
+    personality: { bravery: 0.9, altruism: 0.8, awareness: 0.9, description: "an experienced firefighter" },
+  },
+  {
+    name: "Frank",
+    color: 0x44ffff,
+    personality: { bravery: 0.2, altruism: 0.3, awareness: 0.6, description: "a panicky tourist" },
+  },
+  {
+    name: "Grace",
+    color: 0xffff44,
+    personality: { bravery: 0.7, altruism: 0.7, awareness: 0.5, description: "a resourceful paramedic" },
+  },
+  {
+    name: "Hank",
+    color: 0x88ff88,
+    personality: { bravery: 0.4, altruism: 0.6, awareness: 0.4, description: "a distracted jogger" },
+  },
+];
+
+/**
+ * Phase A: Set up ECS world, event bus, obstacles, load agent model.
+ * Does NOT spawn agents or start simulation.
+ */
+async function initExploration(sceneGrp: THREE.Group, sceneSize: number, sampler: HeightSampler) {
+  const sceneHalfSize = sceneSize / 2;
+
+  world = new SimWorld();
+  sharedEventBus = new EventBus();
+
+  sharedObstacles = collectObstacles(sceneGrp, sceneHalfSize);
+  sharedSceneGroup = sceneGrp;
+  sharedSceneSize = sceneSize;
+
+  agentManager = new AgentManager(world, scene);
+  info.textContent = "Loading agent model...";
+
+  try {
+    await agentManager.visuals.loadModel();
+  } catch (err) {
+    console.error("[Agents] Failed to load Man.glb:", err);
+    info.textContent = "Agent model failed to load — agents disabled";
+    return;
+  }
+
+  explorationReady = true;
+  info.textContent = "Explore the area. Select a scenario to begin simulation.";
+  console.log("[Agents] Exploration phase ready — awaiting scenario selection");
+}
+
+/**
+ * Phase B: Spawn agents, register systems, start simulation,
+ * then trigger the chosen scenario.
+ */
+function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
+  if (!explorationReady || !world || !agentManager || !heightSampler || !sharedEventBus) {
+    console.error("[Agents] Cannot launch scenario — exploration not ready");
+    return;
+  }
+
+  const scenario = scenarios.find((s) => s.id === scenarioId);
+  if (!scenario || !scenario.available) return;
+
+  const sampler = heightSampler;
+  const sceneHalfSize = sharedSceneSize / 2;
+
+  // 1. Spawn 8 agents in a ring around the center
+  const spawnDist = 30;
+  const offsets = AGENT_CONFIGS.map((_, i) => {
+    const angle = (i / AGENT_CONFIGS.length) * Math.PI * 2;
+    return {
+      x: Math.cos(angle) * spawnDist,
+      z: Math.sin(angle) * spawnDist,
+    };
+  });
+
+  for (let i = 0; i < AGENT_CONFIGS.length; i++) {
+    const cfg = AGENT_CONFIGS[i]!;
+    const offset = offsets[i]!;
+    const pos = findOpenPosition(offset.x, offset.z, sharedObstacles, 3);
+    const y = sampler.sample(pos.x, pos.z);
+    agentManager.spawn({
+      ...cfg,
+      spawnPosition: { x: pos.x, y, z: pos.z },
+    });
+  }
+
+  // 2. Register ECS systems
+  const agentActionSystem = createAgentActionSystem(agentManager, sharedObstacles, sceneHalfSize);
+  const agentDamageSystem = createAgentDamageSystem(agentManager, sharedEventBus);
+  world.addSystem("agentAction", agentActionSystem);
+  world.addSystem("agentDamage", agentDamageSystem);
+
+  // 3. Create perception, recorder, stepped simulation
+  const perception = new AgentPerceptionSystem(renderer, scene, agentManager);
+  const recorder = new AgentRecorder(agentManager);
+  const locAddr = addressInput.value.trim();
+  const locLat = latInput.value;
+  const locLon = lonInput.value;
+  const locationStr = locAddr || `${locLat}, ${locLon}`;
+
+  const replayRecorder = new ReplayRecorder(agentManager, locationStr);
+
+  steppedSim = new SteppedSimulation(world, agentManager, perception, recorder, sharedEventBus, replayRecorder, {
+    stepDurationSec: 1,
+    enabled: true,
+  });
+
+  // 3b. Create replay capture system
+  replayCaptureSystem = new ReplayCaptureSystem(renderer, scene, agentManager, replayRecorder);
+
+  // 4. Start stepped simulation (connects WebSocket)
+  steppedSim.start();
+
+  // 5. Launch the chosen scenario
+  scenario.launch(scene, sharedEventBus, sampler, fireConfig);
+
+  // 6. Hide scenario panel, show stop button
+  scenarioPanel.classList.remove("visible");
+  explorationReady = false;
+  stopSimBtn.style.display = "block";
+
+  info.textContent = `${AGENT_CONFIGS.length} agents spawned | ${scenario.name} scenario active | Ctrl+P snapshots | Ctrl+R recording`;
+  console.log(`[Agents] Scenario "${scenario.name}" launched`);
+}
+
+/** Build scenario panel UI from the registry */
+function buildScenarioPanel() {
+  scenarioPanel.querySelectorAll(".scenario-card").forEach((el) => el.remove());
+
+  for (const s of scenarios) {
+    const card = document.createElement("div");
+    card.className = "scenario-card" + (s.available ? "" : " disabled");
+    card.innerHTML = `
+      <div class="sc-icon">${s.icon}</div>
+      <div class="sc-text">
+        <div class="sc-name">${s.name}</div>
+        <div class="sc-desc">${s.description}${s.available ? "" : " (coming soon)"}</div>
+      </div>
+    `;
+    if (s.available) {
+      card.addEventListener("click", () => {
+        if (s.id === "fire") {
+          scenarioPanel.classList.remove("visible");
+          fireConfigPanel.classList.add("visible");
+        } else if (s.id === "tornado" || s.id === "earthquake") {
+          // Launch scenario immediately (agents + disaster panels)
+          launchScenario(s.id);
+        } else {
+          launchScenario(s.id);
+        }
+      });
+    }
+    scenarioPanel.appendChild(card);
+  }
+}
+
+// --- Fire config panel buttons ---
+fireStartBtn.addEventListener("click", () => {
+  const config: FireConfig = {
+    offsetX: parseInt(fireXInput.value),
+    offsetZ: parseInt(fireZInput.value),
+    maxRadius: parseInt(fireSizeInput.value),
+    maxFires: parseInt(fireSpreadInput.value),
+  };
+  fireConfigPanel.classList.remove("visible");
+  launchScenario("fire", config);
+});
+
+fireBackBtn.addEventListener("click", () => {
+  fireConfigPanel.classList.remove("visible");
+  scenarioPanel.classList.add("visible");
+});
+
+// --- Stop simulation button ---
+stopSimBtn.addEventListener("click", async () => {
+  if (!steppedSim) return;
+  stopSimBtn.disabled = true;
+  stopSimBtn.textContent = "Saving...";
+  if (replayCaptureSystem) {
+    replayCaptureSystem.dispose();
+    replayCaptureSystem = null;
+  }
+  await steppedSim.stop();
+  steppedSim = null;
+
+  // Clean up any active disaster
+  if (activeDisasterType === "tornado") {
+    tornado.reset();
+    stopTornado();
+    tornadoPanel.style.display = "none";
+  } else if (activeDisasterType === "earthquake") {
+    quake.despawn();
+    stopQuake();
+    quakePanel.style.display = "none";
+  }
+  activeDisasterType = null;
+  stormTarget = 0;
+
+  // Clean up flood/tsunami disaster controller
+  if (activeDisasterCtrl) {
+    activeDisasterCtrl.dispose();
+    activeDisasterCtrl = null;
+  }
+  disasterCtrlPanel.style.display = "none";
+
+  stopSimBtn.style.display = "none";
+  stopSimBtn.disabled = false;
+  stopSimBtn.textContent = "Stop Simulation";
+  info.textContent = "Simulation stopped. Replay saved.";
+});
+
 // --- Load all layers ---
 let sceneGroup: THREE.Group | null = null;
 let loadedLayers: LayerData | null = null;
 let loadedCenter: { lat: number; lon: number } | null = null;
-let activeDisaster: DisasterController | null = null;
-let selectedDisaster: DisasterKind = parseDisasterKind(disasterType.value);
-let stagedControls: DisasterControl[] = getDefaultDisasterControls(selectedDisaster);
 
-disasterPanel.style.display = "none";
-renderDisasterControls();
-updateDisasterButtons();
-disasterStats.textContent = "Load terrain, choose a disaster, then press Start Disaster.";
-
-disasterType.addEventListener("change", () => {
-  selectedDisaster = parseDisasterKind(disasterType.value);
-  stagedControls = getDefaultDisasterControls(selectedDisaster);
-  if (activeDisaster) {
-    activeDisaster.dispose();
-    activeDisaster = null;
-  }
-  renderDisasterControls();
-  updateDisasterButtons();
-  disasterStats.textContent = `Selected ${capitalize(selectedDisaster)}. Press Start Disaster.`;
-});
-
-disasterStartBtn.addEventListener("click", () => {
-  const disaster = ensureActiveDisaster();
-  if (!disaster) return;
-  disaster.start();
-  updateDisasterButtons();
-});
-
-disasterToggleBtn.addEventListener("click", () => {
-  if (!activeDisaster) return;
-  if (activeDisaster.isRunning()) {
-    activeDisaster.pause();
-  } else {
-    activeDisaster.start();
-  }
-  updateDisasterButtons();
-});
-
-disasterResetBtn.addEventListener("click", () => {
-  if (!activeDisaster) return;
-  activeDisaster.reset();
-  updateDisasterButtons();
-});
+// Active flood/tsunami disaster controller (managed via scenario system)
+let activeDisasterCtrl: DisasterController | null = null;
 
 goBtn.addEventListener("click", async () => {
   const lat = parseFloat(latInput.value);
@@ -172,11 +750,41 @@ goBtn.addEventListener("click", async () => {
   goBtn.textContent = "Loading…";
   loading.style.display = "block";
 
+  // Clean up previous agent system
+  if (replayCaptureSystem) {
+    replayCaptureSystem.dispose();
+    replayCaptureSystem = null;
+  }
+  if (steppedSim) {
+    await steppedSim.stop();
+    steppedSim = null;
+  }
+  stopSimBtn.style.display = "none";
+  world = null;
+  agentManager = null;
+  heightSampler = null;
+  explorationReady = false;
+  sharedEventBus = null;
+  sharedObstacles = [];
+  sharedSceneGroup = null;
+  sharedSceneSize = 0;
+  scenarioPanel.classList.remove("visible");
+  fireConfigPanel.classList.remove("visible");
+  tornadoPanel.style.display = "none";
+  quakePanel.style.display = "none";
+  disasterCtrlPanel.style.display = "none";
+  activeDisasterType = null;
+
   try {
     const size = parseInt(sizeInput.value);
     const layers = await fetchLayers(lat, lon, size);
+    await carTemplatePromise;
 
-    destroyActiveDisaster();
+    // Clean up previous flood/tsunami disaster
+    if (activeDisasterCtrl) {
+      activeDisasterCtrl.dispose();
+      activeDisasterCtrl = null;
+    }
     loadedLayers = null;
     loadedCenter = null;
 
@@ -194,7 +802,14 @@ goBtn.addEventListener("click", async () => {
       });
     }
 
-    sceneGroup = buildAllLayers(layers, lat, lon);
+    // Reset tornado state from previous session
+    tornado.reset();
+    stopTornado();
+
+    const buildResult = buildAllLayers(layers, lat, lon, carTemplate);
+    sceneGroup = buildResult.group;
+    heightSampler = buildResult.heightSampler;
+    resetCarsToBase();
     scene.add(sceneGroup);
     loadedLayers = layers;
     loadedCenter = { lat, lon };
@@ -205,11 +820,13 @@ goBtn.addEventListener("click", async () => {
     controls.speed = 40 * camScale;
 
     overlay.classList.add("hidden");
-    disasterPanel.style.display = "block";
-    stagedControls = getDefaultDisasterControls(selectedDisaster);
-    renderDisasterControls();
-    updateDisasterButtons();
-    disasterStats.textContent = `Loaded area. Selected ${capitalize(selectedDisaster)}. Press Start Disaster.`;
+
+    // Initialize exploration phase (no agents yet)
+    await initExploration(sceneGroup, size, heightSampler);
+
+    // Show scenario selection panel
+    buildScenarioPanel();
+    scenarioPanel.classList.add("visible");
   } catch (err) {
     console.error("Failed to load:", err);
     alert("Failed to load data. Check console for details.");
@@ -230,40 +847,118 @@ function animate() {
   lastTime = now;
 
   controls.update(dt);
-  activeDisaster?.update(dt);
 
-  const pos = camera.position;
-  const disasterMode = activeDisaster
-    ? `${capitalize(activeDisaster.kind)} ${activeDisaster.isRunning() ? "running" : "paused"}`
-    : "No active disaster";
-  hud.textContent =
-    `pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})  |  ` +
-    `WASD move · Mouse look · Space ↑ · Shift ↓  |  Click to capture mouse  |  ${disasterMode}`;
-
-  if (activeDisaster) {
-    disasterStats.textContent = activeDisaster.getStatsText();
+  // Update ECS world and sync agent visuals
+  if (world) {
+    world.update(dt);
+  }
+  if (agentManager && heightSampler) {
+    for (const agent of agentManager.agents) {
+      const eid = agent.eid;
+      Position.y[eid] = heightSampler.sample(Position.x[eid]!, Position.z[eid]!);
+    }
+    agentManager.syncVisuals();
+    agentManager.visuals.updateAnimations(dt);
+  } else if (agentManager) {
+    agentManager.syncVisuals();
+    agentManager.visuals.updateAnimations(dt);
   }
 
+  // Tornado & earthquake simulation ticks
+  tornado.update(dt, buildingRegistry);
+  quake.update(dt, buildingRegistry);
+
+  // Detect auto-despawn (tornado left the terrain)
+  if (wasTornadoActive && !tornado.active) {
+    stopTornado();
+  }
+  wasTornadoActive = tornado.active;
+
+  // Detect auto-stop (quake finished)
+  if (wasQuakeActive && !quake.active) {
+    stopQuake();
+  }
+  wasQuakeActive = quake.active;
+
+  // Camera shake when near tornado
+  if (tornado.active) {
+    const shake = tornado.getCameraShake(camera.position);
+    camera.position.add(shake);
+
+    // Update HUD stats
+    const windMph = Math.round(tornado.getWindSpeedAtGround(
+      tornado.position.x, tornado.position.z) * 2.237);
+    tsWind.textContent = String(windMph);
+    tsDamaged.textContent = String(tornado.buildingsDamaged);
+    tsDestroyed.textContent = String(tornado.buildingsDestroyed);
+  }
+
+  // Earthquake camera shake
+  if (quake.active) {
+    camera.position.y += quake.getGroundShakeY();
+  }
+
+  // Clamp camera to rendered terrain bounds
+  if (terrainBoundsRef) {
+    const b = terrainBoundsRef;
+    const margin = 2;
+    camera.position.x = Math.min(b.xMax - margin, Math.max(b.xMin + margin, camera.position.x));
+    camera.position.z = Math.min(b.zMax - margin, Math.max(b.zMin + margin, camera.position.z));
+  }
+  const groundY = getTerrainHeight(camera.position.x, camera.position.z);
+  const minY = groundY + 2;
+  const maxY = tornado.getCloudCeilingY() - 6;
+  camera.position.y = Math.min(maxY, Math.max(minY, camera.position.y));
+
+  // Apply quake jitter after clamp
+  if (quake.active) {
+    camera.position.add(quake.getCameraJitter());
+    const groundYAfter = getTerrainHeight(camera.position.x, camera.position.z);
+    if (camera.position.y < groundYAfter + 2) camera.position.y = groundYAfter + 2;
+  }
+
+  // Gradual storm atmosphere transition
+  if (Math.abs(stormCurrent - stormTarget) > 0.001) {
+    if (stormCurrent < stormTarget) {
+      stormCurrent = Math.min(stormTarget, stormCurrent + STORM_SPEED * dt);
+    } else {
+      stormCurrent = Math.max(stormTarget, stormCurrent - STORM_SPEED * dt);
+    }
+    updateAtmosphere(stormCurrent);
+  }
+
+  // Update flood/tsunami disaster controller
+  if (activeDisasterCtrl) {
+    activeDisasterCtrl.update(dt);
+    disasterCtrlStats.textContent = activeDisasterCtrl.getStatsText();
+  }
+
+  const pos = camera.position;
+  hud.textContent = `pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})  |  WASD move · Mouse look · Space ↑ · Shift ↓`;
+
   renderer.render(scene, camera);
+
+  // Round-robin replay capture (1 agent per frame)
+  if (replayCaptureSystem) {
+    replayCaptureSystem.captureNext();
+  }
 }
 
 animate();
 
-function ensureActiveDisaster(): DisasterController | null {
-  if (!sceneGroup || !loadedLayers || !loadedCenter) {
-    disasterStats.textContent = "Load an area before starting a disaster.";
-    return null;
-  }
+// --- Flood/Tsunami disaster controller helpers ---
 
-  if (activeDisaster && activeDisaster.kind === selectedDisaster) {
-    applyStagedControls(activeDisaster);
-    return activeDisaster;
-  }
+function launchDisasterScenario(kind: DisasterKind): void {
+  if (!sceneGroup || !loadedLayers || !loadedCenter) return;
 
-  destroyActiveDisaster();
+  // Clean up any previous disaster controller
+  if (activeDisasterCtrl) {
+    activeDisasterCtrl.dispose();
+    activeDisasterCtrl = null;
+  }
 
   try {
-    activeDisaster = createDisaster(selectedDisaster, {
+    activeDisasterCtrl = createDisaster(kind, {
       scene,
       parent: sceneGroup,
       camera,
@@ -272,56 +967,39 @@ function ensureActiveDisaster(): DisasterController | null {
       centerLon: loadedCenter.lon,
       sunLight: sun,
     });
-    applyStagedControls(activeDisaster);
-    stagedControls = activeDisaster.getControls();
-    renderDisasterControls();
-    updateDisasterButtons();
-    return activeDisaster;
+
+    const label = kind.charAt(0).toUpperCase() + kind.slice(1);
+    disasterCtrlTitle.textContent = `${label} Simulator`;
+    disasterCtrlPanel.style.display = "block";
+    renderDisasterCtrlUI();
+    updateDisasterCtrlButtons();
   } catch (error) {
-    console.error(error);
-    disasterStats.textContent = `Could not create ${selectedDisaster} disaster.`;
-    return null;
+    console.error(`[Disaster] Failed to create ${kind}:`, error);
   }
 }
 
-function destroyActiveDisaster(): void {
-  if (!activeDisaster) return;
-  activeDisaster.dispose();
-  activeDisaster = null;
-}
+function renderDisasterCtrlUI(): void {
+  disasterCtrlControls.innerHTML = "";
+  if (!activeDisasterCtrl) return;
 
-function applyStagedControls(disaster: DisasterController): void {
-  for (const control of stagedControls) {
-    disaster.setControl(control.id, control.value);
-  }
-}
-
-function renderDisasterControls(): void {
-  disasterControlsHost.innerHTML = "";
-  const controls =
-    activeDisaster && activeDisaster.kind === selectedDisaster
-      ? activeDisaster.getControls()
-      : stagedControls;
-
-  for (const control of controls) {
+  const ctrls = activeDisasterCtrl.getControls();
+  for (const control of ctrls) {
     const row = document.createElement("div");
     row.style.marginBottom = "10px";
 
     if (control.type === "range") {
       const label = document.createElement("label");
-      label.style.display = "flex";
-      label.style.justifyContent = "space-between";
-      label.style.fontSize = "12px";
-      label.style.color = "#c6d7e9";
-      label.style.marginBottom = "3px";
+      label.style.cssText = "display:flex;justify-content:space-between;font-size:12px;color:#c6d7e9;margin-bottom:3px;";
 
       const name = document.createElement("span");
       name.textContent = control.label;
 
-      const value = document.createElement("span");
-      value.textContent = formatRangeValue(control.value, control);
+      const valSpan = document.createElement("span");
+      const precision = control.precision ?? inferPrecision(control.step);
+      const suffix = control.unit ? ` ${control.unit}` : "";
+      valSpan.textContent = `${control.value.toFixed(precision)}${suffix}`;
 
-      label.append(name, value);
+      label.append(name, valSpan);
 
       const input = document.createElement("input");
       input.type = "range";
@@ -332,93 +1010,63 @@ function renderDisasterControls(): void {
       input.style.width = "100%";
 
       input.addEventListener("input", () => {
-        const next = input.valueAsNumber;
-        setStagedControlValue(control.id, next);
-        if (activeDisaster && activeDisaster.kind === selectedDisaster) {
-          activeDisaster.setControl(control.id, next);
-          stagedControls = activeDisaster.getControls();
-          const refreshed = stagedControls.find((entry) => entry.id === control.id);
-          if (refreshed && refreshed.type === "range") {
-            value.textContent = formatRangeValue(refreshed.value, refreshed);
-            if (Math.abs(refreshed.value - next) > 1e-6) {
-              input.value = String(refreshed.value);
-            }
-          }
-        } else {
-          value.textContent = formatRangeValue(next, control);
+        if (!activeDisasterCtrl) return;
+        activeDisasterCtrl.setControl(control.id, input.valueAsNumber);
+        const refreshed = activeDisasterCtrl.getControls().find((c) => c.id === control.id);
+        if (refreshed && refreshed.type === "range") {
+          const p = refreshed.precision ?? inferPrecision(refreshed.step);
+          const s = refreshed.unit ? ` ${refreshed.unit}` : "";
+          valSpan.textContent = `${refreshed.value.toFixed(p)}${s}`;
         }
       });
 
       row.append(label, input);
-      disasterControlsHost.appendChild(row);
-      continue;
+    } else {
+      const checkLabel = document.createElement("label");
+      checkLabel.style.cssText = "display:flex;align-items:center;gap:8px;font-size:12px;color:#c6d7e9;";
+
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = control.value;
+      input.addEventListener("change", () => {
+        if (!activeDisasterCtrl) return;
+        activeDisasterCtrl.setControl(control.id, input.checked);
+      });
+
+      const text = document.createElement("span");
+      text.textContent = control.label;
+      checkLabel.append(input, text);
+      row.appendChild(checkLabel);
     }
 
-    const checkLabel = document.createElement("label");
-    checkLabel.style.display = "flex";
-    checkLabel.style.alignItems = "center";
-    checkLabel.style.gap = "8px";
-    checkLabel.style.fontSize = "12px";
-    checkLabel.style.color = "#c6d7e9";
-
-    const input = document.createElement("input");
-    input.type = "checkbox";
-    input.checked = control.value;
-    input.addEventListener("change", () => {
-      setStagedControlValue(control.id, input.checked);
-      if (activeDisaster && activeDisaster.kind === selectedDisaster) {
-        activeDisaster.setControl(control.id, input.checked);
-        stagedControls = activeDisaster.getControls();
-      }
-    });
-
-    const text = document.createElement("span");
-    text.textContent = control.label;
-    checkLabel.append(input, text);
-    row.appendChild(checkLabel);
-    disasterControlsHost.appendChild(row);
+    disasterCtrlControls.appendChild(row);
   }
 }
 
-function setStagedControlValue(id: string, value: number | boolean): void {
-  const control = stagedControls.find((entry) => entry.id === id);
-  if (!control) return;
-  if (control.type === "range" && typeof value === "number") {
-    control.value = clamp(value, control.min, control.max);
-  } else if (control.type === "checkbox" && typeof value === "boolean") {
-    control.value = value;
-  }
+function updateDisasterCtrlButtons(): void {
+  const running = activeDisasterCtrl?.isRunning() ?? false;
+  disasterStartBtnEl.style.display = running ? "none" : "block";
+  disasterPauseBtnEl.style.display = running ? "block" : "none";
+  disasterResetBtnEl.style.display = activeDisasterCtrl ? "block" : "none";
 }
 
-function updateDisasterButtons(): void {
-  const hasTerrain = sceneGroup !== null && loadedLayers !== null;
-  disasterStartBtn.disabled = !hasTerrain;
-  disasterToggleBtn.disabled = !hasTerrain || activeDisaster === null;
-  disasterResetBtn.disabled = !hasTerrain || activeDisaster === null;
-  disasterToggleBtn.textContent =
-    activeDisaster && activeDisaster.isRunning() ? "Pause" : "Resume";
-}
+disasterStartBtnEl.addEventListener("click", () => {
+  if (!activeDisasterCtrl) return;
+  activeDisasterCtrl.start();
+  updateDisasterCtrlButtons();
+});
 
-function parseDisasterKind(value: string): DisasterKind {
-  return value === "tsunami" ? "tsunami" : "flood";
-}
+disasterPauseBtnEl.addEventListener("click", () => {
+  if (!activeDisasterCtrl) return;
+  activeDisasterCtrl.pause();
+  updateDisasterCtrlButtons();
+});
 
-function capitalize(value: string): string {
-  return value.slice(0, 1).toUpperCase() + value.slice(1);
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function formatRangeValue(
-  value: number,
-  control: Extract<DisasterControl, { type: "range" }>
-): string {
-  const precision = control.precision ?? inferPrecision(control.step);
-  const suffix = control.unit ? ` ${control.unit}` : "";
-  return `${value.toFixed(precision)}${suffix}`;
-}
+disasterResetBtnEl.addEventListener("click", () => {
+  if (!activeDisasterCtrl) return;
+  activeDisasterCtrl.reset();
+  updateDisasterCtrlButtons();
+});
 
 function inferPrecision(step: number): number {
   const text = step.toString();

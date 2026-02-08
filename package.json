@@ -15,6 +15,8 @@
     "typescript": "^5"
   },
   "dependencies": {
-    "three": "^0.182.0"
+    "bitecs": "^0.4.0",
+    "three": "^0.182.0",
+    "three.quarks": "^0.17.0"
   }
 }
