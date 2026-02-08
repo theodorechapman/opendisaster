@@ -1,4 +1,5 @@
 import { join } from "path";
+import { appendFileSync, writeFileSync } from "fs";
 import { getCached, setCache } from "./src/cache.ts";
 import { fetchFromOverpass } from "./src/overpass.ts";
 import { fetchElevationGrid } from "./src/elevation.ts";
@@ -19,8 +20,24 @@ if (!buildResult.success) {
   process.exit(1);
 }
 
+// Bundle the replay viewer
+const replayBuild = await Bun.build({
+  entrypoints: ["./src/replay/viewer.ts"],
+  outdir: "./dist",
+  minify: false,
+  sourcemap: "inline",
+  target: "browser",
+});
+
+if (!replayBuild.success) {
+  console.error("Replay build failed:");
+  for (const log of replayBuild.logs) console.error(log);
+  process.exit(1);
+}
+
 const distDir = join(import.meta.dir, "dist");
 const htmlFile = Bun.file(join(import.meta.dir, "index.html"));
+const assetsDir = join(import.meta.dir, "assets");
 
 /** Convert lat/lon + half-size offset to a bounding box. */
 function bbox(lat: number, lon: number, halfSize: number) {
@@ -37,27 +54,224 @@ function bbox(lat: number, lon: number, halfSize: number) {
   };
 }
 
-const preferredPort = Number(process.env.PORT ?? 3000);
-const candidatePorts = [
-  preferredPort,
-  preferredPort + 1,
-  preferredPort + 2,
-  3000,
-  3001,
-  3002,
-].filter((port, idx, arr) => Number.isFinite(port) && port > 0 && arr.indexOf(port) === idx);
+/* ── JSONL file logger ───────────────────────────────────────────── */
+const LOG_FILE = "./agent-log.jsonl";
+writeFileSync(LOG_FILE, "");
 
-let server: ReturnType<typeof Bun.serve> | null = null;
-let selectedPort = preferredPort;
-let lastError: unknown = null;
+function logEntry(event: string, agent: string, data: Record<string, any>): void {
+  const entry = { ts: Date.now(), src: "server", event, agent, data };
+  appendFileSync(LOG_FILE, JSON.stringify(entry) + "\n");
+}
 
-for (const port of candidatePorts) {
-  try {
-    server = Bun.serve({
-      port,
-      idleTimeout: 120, // seconds — elevation queries can take a while
-      async fetch(req) {
+function logClientEntry(entry: { ts: number; event: string; agent: string; data: Record<string, any> }): void {
+  appendFileSync(LOG_FILE, JSON.stringify({ ...entry, src: "client" }) + "\n");
+}
+
+/* ── VLM API helpers ─────────────────────────────────────────────── */
+
+const FEATHERLESS_API_KEYS = [
+  process.env.FEATHERLESS_API_KEY ?? "",
+  process.env.FEATHERLESS_API_KEY_2 ?? "",
+  process.env.FEATHERLESS_API_KEY_3 ?? "",
+  process.env.FEATHERLESS_API_KEY_4 ?? "",
+].filter(Boolean);
+
+if (FEATHERLESS_API_KEYS.length === 0) console.warn("[Server] No FEATHERLESS_API_KEY set in .env — agents will auto-wander only");
+
+async function callVLM(frameBase64: string, apiKey: string): Promise<string> {
+  const res = await fetch("https://api.featherless.ai/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: "google/gemma-3-27b-it",
+      max_tokens: 120,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image_url",
+              image_url: { url: `data:image/jpeg;base64,${frameBase64}` },
+            },
+            {
+              type: "text",
+              text: "You are watching the world through someone's POV in a 3D simulation. It is normal for it to look simplistic and blocky, so don't be scared by that. Describe what you see in 1-2 sentences. If anything looks dangerous or out of the ordinary, add DANGER at the end of your response. Danger could be any sign of fire, smoke, flooding, earthquake, flood, etc. Err on the side of caution.",
+            },
+          ],
+        },
+      ],
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`VLM error ${res.status}: ${text}`);
+  }
+
+  const json = (await res.json()) as any;
+  return json.choices?.[0]?.message?.content ?? "I cannot see clearly.";
+}
+
+function hasDanger(observation: string): boolean {
+  return /\bDANGER\s*$/i.test(observation.trim());
+}
+
+async function pooled<T>(tasks: (() => Promise<T>)[], concurrency: number): Promise<T[]> {
+  const results = new Array<T>(tasks.length);
+  let next = 0;
+
+  async function worker() {
+    while (next < tasks.length) {
+      const idx = next++;
+      results[idx] = await tasks[idx]!();
+    }
+  }
+
+  await Promise.all(Array.from({ length: Math.min(concurrency, tasks.length) }, () => worker()));
+  return results;
+}
+
+async function processPayloads(payloads: any[], step: number): Promise<any[]> {
+  if (FEATHERLESS_API_KEYS.length === 0) {
+    // No API keys — return WANDER for all agents
+    return payloads.map((payload: any) => ({
+      agentIndex: payload.agentIndex,
+      observation: "No VLM configured.",
+      reasoning: "",
+      action: "WANDER",
+      targetX: 0,
+      targetZ: 0,
+      targetEntity: 0,
+    }));
+  }
+
+  const numKeys = FEATHERLESS_API_KEYS.length;
+  const perKeyTasks: (() => Promise<{ idx: number; obs: string }>)[][] = Array.from(
+    { length: numKeys },
+    () => [],
+  );
+  payloads.forEach((p: any, i: number) => {
+    const keyIdx = i % numKeys;
+    const apiKey = FEATHERLESS_API_KEYS[keyIdx]!;
+    perKeyTasks[keyIdx]!.push(async () => {
+      try {
+        const obs = await callVLM(p.frameBase64, apiKey);
+        logEntry("vlm_observation", p.name, {
+          step,
+          observation: obs,
+          positionX: p.state.positionX,
+          positionZ: p.state.positionZ,
+          facingYaw: p.state.facingYaw,
+        });
+        return { idx: i, obs };
+      } catch (err) {
+        logEntry("vlm_error", p.name, { step, error: String(err) });
+        console.error(`[VLM] ${p.name} error:`, err);
+        return { idx: i, obs: "Vision system error." };
+      }
+    });
+  });
+
+  const allResults = await Promise.all(
+    perKeyTasks.map((tasks) => pooled(tasks, 2)),
+  );
+  const observations = new Array<string>(payloads.length);
+  for (const batch of allResults) {
+    for (const r of batch) {
+      observations[r.idx] = r.obs;
+    }
+  }
+
+  return payloads.map((payload: any, idx: number) => {
+    const observation = observations[idx]!;
+    const danger = hasDanger(observation);
+    const cleanObs = observation.replace(/\s*DANGER\s*$/i, "").trim();
+
+    if (danger) {
+      const s = payload.state;
+      const yaw = s.facingYaw ?? 0;
+      const fleeDistance = 60;
+      const targetX = s.positionX + Math.sin(yaw + Math.PI) * fleeDistance;
+      const targetZ = s.positionZ + Math.cos(yaw + Math.PI) * fleeDistance;
+
+      logEntry("danger_flee", payload.name, {
+        step,
+        observation: cleanObs,
+        positionX: s.positionX,
+        positionZ: s.positionZ,
+        facingYaw: yaw,
+        targetX,
+        targetZ,
+        fleeDistance,
+      });
+
+      return {
+        agentIndex: payload.agentIndex,
+        observation: cleanObs,
+        reasoning: "DANGER detected — turning 180° and fleeing.",
+        action: "RUN_TO",
+        targetX,
+        targetZ,
+        targetEntity: 0,
+      };
+    }
+
+    return {
+      agentIndex: payload.agentIndex,
+      observation: cleanObs,
+      reasoning: "",
+      action: "WANDER",
+      targetX: 0,
+      targetZ: 0,
+      targetEntity: 0,
+    };
+  });
+}
+
+/* ── Server ──────────────────────────────────────────────────────── */
+
+Bun.serve({
+  port: 3000,
+  idleTimeout: 120,
+  websocket: {
+    async message(ws, message) {
+      try {
+        const msg = JSON.parse(String(message));
+
+        if (msg.type === "perceive") {
+          console.log(`[Server] Step ${msg.step} — ${msg.payloads.length} agents`);
+          const decisions = await processPayloads(msg.payloads, msg.step);
+          ws.send(JSON.stringify({
+            type: "decisions",
+            step: msg.step,
+            decisions,
+          }));
+        } else if (msg.type === "agent_log") {
+          logClientEntry(msg.entry);
+        }
+      } catch (err) {
+        console.error("[Server] WebSocket message error:", err);
+        ws.send(JSON.stringify({ type: "error", message: String(err) }));
+      }
+    },
+    open(ws) {
+      console.log("[Server] WebSocket client connected");
+    },
+    close(ws) {
+      console.log("[Server] WebSocket client disconnected");
+    },
+  },
+  async fetch(req, server) {
     const url = new URL(req.url);
+
+    // --- WebSocket upgrade ---
+    if (url.pathname === "/ws") {
+      if (server.upgrade(req)) return;
+      return new Response("WebSocket upgrade failed", { status: 500 });
+    }
 
     // --- API: all layers endpoint ---
     if (url.pathname === "/api/data") {
@@ -68,14 +282,12 @@ for (const port of candidatePorts) {
         return new Response("Missing or invalid lat/lon", { status: 400 });
       }
 
-      // Check cache (include size in key)
       const cached = getCached(lat, lon, size);
       if (cached) {
         console.log(`Cache hit for (${lat.toFixed(4)}, ${lon.toFixed(4)})`);
         return Response.json(cached);
       }
 
-      // Fetch Overpass + Elevation in parallel
       console.log(`Cache miss — fetching Overpass + USGS elevation for (${lat.toFixed(4)}, ${lon.toFixed(4)})`);
       try {
         const { south, west, north, east } = bbox(lat, lon, size / 2);
@@ -108,10 +320,8 @@ for (const port of candidatePorts) {
       const q = url.searchParams.get("q")?.trim();
       if (!q) return new Response("Missing ?q=", { status: 400 });
 
-      // If it looks like a URL, try to extract coords from it
       let resolvedQ = q;
       if (/^https?:\/\//i.test(q)) {
-        // Follow redirects for short URLs (maps.app.goo.gl, goo.gl/maps, etc.)
         if (/goo\.gl/i.test(q)) {
           try {
             const res = await fetch(q, { redirect: "follow" });
@@ -135,7 +345,6 @@ for (const port of candidatePorts) {
         }
       }
 
-      // Fall back to Nominatim geocoding
       try {
         const nominatimUrl = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`;
         const res = await fetch(nominatimUrl, {
@@ -156,6 +365,14 @@ for (const port of candidatePorts) {
       }
     }
 
+    // --- Static: Replay viewer ---
+    if (url.pathname === "/replay") {
+      const file = Bun.file(join(import.meta.dir, "public", "replay.html"));
+      if (await file.exists()) {
+        return new Response(file, { headers: { "Content-Type": "text/html" } });
+      }
+    }
+
     // --- Static: HTML ---
     if (url.pathname === "/" || url.pathname === "/index.html") {
       const html = (await htmlFile.text()).replace("./src/main.ts", "/dist/main.js");
@@ -168,31 +385,25 @@ for (const port of candidatePorts) {
       if (await file.exists()) return new Response(file);
     }
 
-    return new Response("Not found", { status: 404 });
-      },
-    });
-    selectedPort = port;
-    break;
-  } catch (error) {
-    lastError = error;
-    const err = error as { code?: string; message?: string; syscall?: string };
-    const message = err?.message ?? (error instanceof Error ? error.message : String(error));
-    const text = String(message).toLowerCase();
-    const isAddrInUse =
-      err?.code === "EADDRINUSE" ||
-      String(error).includes("EADDRINUSE") ||
-      (err?.syscall === "listen" && text.includes("in use")) ||
-      text.includes("port") && text.includes("in use");
-    if (!isAddrInUse) {
-      throw error;
+    // --- Static: models and public assets ---
+    if (url.pathname.startsWith("/models/")) {
+      const decoded = decodeURIComponent(url.pathname);
+      const file = Bun.file(join(import.meta.dir, "public", decoded));
+      if (await file.exists()) return new Response(file);
     }
-  }
-}
 
-if (!server) {
-  throw new Error(
-    `Could not bind to ports: ${candidatePorts.join(", ")}${lastError ? ` (${String(lastError)})` : ""}`
-  );
-}
+    // --- Static: assets (models, textures) ---
+    if (url.pathname.startsWith("/assets/")) {
+      const file = Bun.file(join(assetsDir, url.pathname.slice(8)));
+      if (await file.exists()) return new Response(file);
+    }
 
-console.log(`OpenDisaster running at http://localhost:${selectedPort}`);
+    return new Response("Not found", { status: 404 });
+  },
+});
+
+console.log("[OpenDisaster] Server running at http://localhost:3000");
+console.log(`[OpenDisaster] Agent logs → ${LOG_FILE}`);
+if (FEATHERLESS_API_KEYS.length > 0) {
+  console.log(`[OpenDisaster] VLM enabled with ${FEATHERLESS_API_KEYS.length} API key(s)`);
+}
