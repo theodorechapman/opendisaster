@@ -51,14 +51,13 @@ export class ReplayRecorder {
     agentIndex: number,
     step: number,
     simTime: number,
-    vlmOutput: { observation: string; reasoning: string; action: string },
+    vlmOutput: { observation: string; action: string },
   ): void {
     this.vlmEntries.push({
       agentIndex,
       step,
       simTime,
       observation: vlmOutput.observation,
-      reasoning: vlmOutput.reasoning,
       action: vlmOutput.action,
     });
   }

@@ -1,7 +1,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { fetchLayers } from "./tiles.ts";
-import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, resetCarsToBase } from "./layers.ts";
+import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, resetCarsToBase, sceneGroupRef, roadLinesRef } from "./layers.ts";
 import { FlyControls } from "./controls.ts";
 import { TornadoSimulator, EF_SCALE } from "./disasters/tornado.ts";
 import { EarthquakeSimulator } from "./disasters/earthquake.ts";
@@ -19,6 +19,7 @@ import { createAgentActionSystem, type Obstacle } from "./agents/AgentActionSyst
 import { createAgentDamageSystem } from "./agents/AgentDamageSystem.ts";
 import { startTestFire, type FireConfig } from "./scenarios/TestFire.ts";
 import type { AgentConfig } from "./agents/types.ts";
+import { RoadGraph } from "./agents/RoadGraph.ts";
 import { Position } from "./core/Components.ts";
 import { ReplayCaptureSystem } from "./replay/ReplayCaptureSystem.ts";
 
@@ -455,6 +456,7 @@ let sharedEventBus: EventBus | null = null;
 let sharedObstacles: Obstacle[] = [];
 let sharedSceneGroup: THREE.Group | null = null;
 let sharedSceneSize = 0;
+let sharedRoadGraph: RoadGraph | null = null;
 
 // --- Obstacle collection from generated scene ---
 const OBSTACLE_PADDING = 3; // meters padding around buildings
@@ -590,6 +592,9 @@ async function initExploration(sceneGrp: THREE.Group, sceneSize: number, sampler
   sharedSceneGroup = sceneGrp;
   sharedSceneSize = sceneSize;
 
+  // Build road navigation graph from road polylines
+  sharedRoadGraph = roadLinesRef.length > 0 ? new RoadGraph(roadLinesRef) : null;
+
   agentManager = new AgentManager(world, scene);
   info.textContent = "Loading agent model...";
 
@@ -622,20 +627,36 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
   const sampler = heightSampler;
   const sceneHalfSize = sharedSceneSize / 2;
 
-  // 1. Spawn 8 agents in a ring around the center
-  const spawnDist = 30;
-  const offsets = AGENT_CONFIGS.map((_, i) => {
-    const angle = (i / AGENT_CONFIGS.length) * Math.PI * 2;
-    return {
-      x: Math.cos(angle) * spawnDist,
-      z: Math.sin(angle) * spawnDist,
-    };
-  });
+  // 1. Spawn agents on roads near center (fallback to ring if not enough road nodes)
+  let spawnPositions: { x: number; z: number }[] = [];
+
+  if (sharedRoadGraph) {
+    const nearCenter = sharedRoadGraph.nodesNearCenter(35);
+    if (nearCenter.length >= AGENT_CONFIGS.length) {
+      const picked = sharedRoadGraph.spreadPick(nearCenter, AGENT_CONFIGS.length);
+      spawnPositions = picked.map(id => {
+        const pos = sharedRoadGraph!.getNodePos(id)!;
+        return findOpenPosition(pos.x, pos.z, sharedObstacles, 3);
+      });
+      console.log(`[Agents] Spawning on roads: ${spawnPositions.length} positions from ${nearCenter.length} candidates`);
+    }
+  }
+
+  // Fallback: ring around center
+  if (spawnPositions.length < AGENT_CONFIGS.length) {
+    const spawnDist = 30;
+    spawnPositions = AGENT_CONFIGS.map((_, i) => {
+      const angle = (i / AGENT_CONFIGS.length) * Math.PI * 2;
+      const ox = Math.cos(angle) * spawnDist;
+      const oz = Math.sin(angle) * spawnDist;
+      return findOpenPosition(ox, oz, sharedObstacles, 3);
+    });
+    console.log("[Agents] Fallback: spawning in ring (not enough road nodes near center)");
+  }
 
   for (let i = 0; i < AGENT_CONFIGS.length; i++) {
     const cfg = AGENT_CONFIGS[i]!;
-    const offset = offsets[i]!;
-    const pos = findOpenPosition(offset.x, offset.z, sharedObstacles, 3);
+    const pos = spawnPositions[i]!;
     const y = sampler.sample(pos.x, pos.z);
     agentManager.spawn({
       ...cfg,
@@ -644,7 +665,7 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
   }
 
   // 2. Register ECS systems
-  const agentActionSystem = createAgentActionSystem(agentManager, sharedObstacles, sceneHalfSize);
+  const agentActionSystem = createAgentActionSystem(agentManager, sharedObstacles, sceneHalfSize, sharedRoadGraph);
   const agentDamageSystem = createAgentDamageSystem(agentManager, sharedEventBus);
   world.addSystem("agentAction", agentActionSystem);
   world.addSystem("agentDamage", agentDamageSystem);
@@ -796,6 +817,7 @@ goBtn.addEventListener("click", async () => {
   sharedObstacles = [];
   sharedSceneGroup = null;
   sharedSceneSize = 0;
+  sharedRoadGraph = null;
   scenarioPanel.classList.remove("visible");
   fireConfigPanel.classList.remove("visible");
   tornadoPanel.style.display = "none";

@@ -16,21 +16,19 @@ import { AgentVisuals } from "./AgentVisuals.ts";
 import { agentLog } from "./AgentLogger.ts";
 import type * as THREE from "three";
 
-const ACTION_NAMES = ["IDLE","MOVE_TO","RUN_TO","HELP_PERSON","EVACUATE","WAIT","ENTER_BUILDING","EXIT_BUILDING"];
+const ACTION_NAMES: Record<number, string> = {
+  [ActionType.IDLE]: "IDLE",
+  [ActionType.WALK_TO]: "WALK_TO",
+  [ActionType.RUN_TO]: "RUN_TO",
+};
 
 /** Map ActionType → animation name for AgentVisuals */
 function actionToAnim(actionType: number): string {
   switch (actionType) {
-    case ActionType.MOVE_TO:
-    case ActionType.HELP_PERSON:
-    case ActionType.ENTER_BUILDING:
-    case ActionType.EXIT_BUILDING:
+    case ActionType.WALK_TO:
       return "walk";
     case ActionType.RUN_TO:
-    case ActionType.EVACUATE:
       return "run";
-    case ActionType.IDLE:
-    case ActionType.WAIT:
     default:
       return "idle";
   }

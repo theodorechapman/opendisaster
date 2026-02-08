@@ -9,7 +9,11 @@ import type { EventBus, FireSpreadEvent } from "../core/EventBus.ts";
 import { agentLog } from "./AgentLogger.ts";
 import type { ReplayRecorder } from "../replay/ReplayRecorder.ts";
 
-const ACTION_NAMES = ["IDLE","MOVE_TO","RUN_TO","HELP_PERSON","EVACUATE","WAIT","ENTER_BUILDING","EXIT_BUILDING"];
+const ACTION_NAMES: Record<number, string> = {
+  [ActionType.IDLE]: "IDLE",
+  [ActionType.WALK_TO]: "WALK_TO",
+  [ActionType.RUN_TO]: "RUN_TO",
+};
 
 export interface SteppedSimConfig {
   stepDurationSec: number;  // seconds of sim time per step
@@ -363,7 +367,7 @@ export class SteppedSimulation {
     this.inflight = false;
 
     const obsMap = new Map<number, string>();
-    const decMap = new Map<number, { reasoning: string; action: string }>();
+    const decMap = new Map<number, { action: string }>();
 
     for (const dec of decisions) {
       const lastStep = this.latestAppliedStep.get(dec.agentIndex) ?? 0;
@@ -393,12 +397,11 @@ export class SteppedSimulation {
       // Always store observation in memory + record data
       this.manager.addObservation(dec.agentIndex, dec.observation);
       obsMap.set(dec.agentIndex, dec.observation);
-      decMap.set(dec.agentIndex, { reasoning: dec.reasoning, action: dec.action });
+      decMap.set(dec.agentIndex, { action: dec.action });
 
       // Attach VLM output to replay session
       this.replayRecorder.attachVLM(dec.agentIndex, step, this.simTime, {
         observation: dec.observation,
-        reasoning: dec.reasoning,
         action: dec.action,
       });
 
@@ -409,116 +412,70 @@ export class SteppedSimulation {
         this.saveSnapshot(pending.payload, dec.observation, step, pending.simTime);
       }
 
-      // Apply action: RUN_TO for danger (180° flee), WANDER = keep auto-wandering
-      if (dec.action === "RUN_TO") {
+      // Apply action: RUN_TO = DANGER detected, create danger zone and let action system flee via road graph
+      if (dec.action === "RUN_TO" && agent) {
+        const eid = agent.eid;
+        const px = Position.x[eid]!;
+        const pz = Position.z[eid]!;
+        const yaw = AgentFacing.yaw[eid]!;
+        const facingX = Math.sin(yaw);
+        const facingZ = Math.cos(yaw);
+
+        // Create per-agent danger zone based on VLM perception
+        let bestFire: { x: number; z: number; radius: number } | null = null;
+        let bestDist = Infinity;
+        for (const fire of this.activeFireSources) {
+          const dx = fire.x - px;
+          const dz = fire.z - pz;
+          const dist = Math.sqrt(dx * dx + dz * dz);
+          if (dist < 0.01) continue;
+          const dot = (dx / dist) * facingX + (dz / dist) * facingZ;
+          if (dot > -0.1 && dist < bestDist) {
+            bestDist = dist;
+            bestFire = fire;
+          }
+        }
+
+        if (bestFire) {
+          agent.dangerZones.push({
+            x: bestFire.x,
+            z: bestFire.z,
+            radius: bestFire.radius + 10,
+            expiresAt: Date.now() + 60_000,
+          });
+          agentLog.log("danger_zone_added", agentName, {
+            fireX: bestFire.x, fireZ: bestFire.z,
+            radius: bestFire.radius + 10, source: "fire_match",
+          });
+        } else {
+          const estX = px + facingX * 15;
+          const estZ = pz + facingZ * 15;
+          agent.dangerZones.push({
+            x: estX, z: estZ, radius: 10,
+            expiresAt: Date.now() + 60_000,
+          });
+          agentLog.log("danger_zone_added", agentName, {
+            estX, estZ, radius: 10, source: "estimated",
+          });
+        }
+
+        // Set agent to IDLE with immediate re-evaluation — the action system
+        // will detect nearby danger zones and compute a flee route along roads
+        this.manager.addDecision(dec.agentIndex, `DANGER: ${dec.observation}`);
+        this.manager.applyAction(dec.agentIndex, {
+          actionType: ActionType.IDLE,
+          targetX: 0,
+          targetZ: 0,
+          targetEid: 0,
+        });
+        // Set progress high so action system immediately triggers flee
+        AgentAction.progress[eid] = 10;
+
         agentLog.log("danger_flee", agentName, {
           step,
           observation: dec.observation,
-          targetX: dec.targetX,
-          targetZ: dec.targetZ,
+          dangerZones: agent.dangerZones.length,
         });
-        this.manager.addDecision(dec.agentIndex, `FLEE: ${dec.reasoning}`);
-        this.manager.applyAction(dec.agentIndex, {
-          actionType: parseActionType(dec.action),
-          targetX: dec.targetX,
-          targetZ: dec.targetZ,
-          targetEid: dec.targetEntity,
-        });
-
-        // Create per-agent danger zone based on VLM perception
-        if (agent) {
-          const eid = agent.eid;
-          const px = Position.x[eid]!;
-          const pz = Position.z[eid]!;
-          const yaw = AgentFacing.yaw[eid]!;
-          const facingX = Math.sin(yaw);
-          const facingZ = Math.cos(yaw);
-
-          // Find nearest fire source within ~120° forward cone
-          let bestFire: { x: number; z: number; radius: number } | null = null;
-          let bestDist = Infinity;
-          for (const fire of this.activeFireSources) {
-            const dx = fire.x - px;
-            const dz = fire.z - pz;
-            const dist = Math.sqrt(dx * dx + dz * dz);
-            if (dist < 0.01) continue;
-            // Dot product with facing direction (normalized)
-            const dot = (dx / dist) * facingX + (dz / dist) * facingZ;
-            if (dot > -0.1 && dist < bestDist) {
-              bestDist = dist;
-              bestFire = fire;
-            }
-          }
-
-          if (bestFire) {
-            agent.dangerZones.push({
-              x: bestFire.x,
-              z: bestFire.z,
-              radius: bestFire.radius + 10,
-              expiresAt: Date.now() + 60_000,
-            });
-            agentLog.log("danger_zone_added", agentName, {
-              fireX: bestFire.x, fireZ: bestFire.z,
-              radius: bestFire.radius + 10, source: "fire_match",
-            });
-          } else {
-            // No tracked fire in facing direction — estimate 15m ahead
-            const estX = px + facingX * 15;
-            const estZ = pz + facingZ * 15;
-            agent.dangerZones.push({
-              x: estX,
-              z: estZ,
-              radius: 10,
-              expiresAt: Date.now() + 60_000,
-            });
-            agentLog.log("danger_zone_added", agentName, {
-              estX, estZ, radius: 10, source: "estimated",
-            });
-          }
-        }
-      }
-      // WANDER with active danger zones → override to flee away from known threats
-      if (agent && agent.dangerZones.length > 0) {
-        const activeZones = agent.dangerZones.filter(z => z.expiresAt > Date.now());
-        if (activeZones.length > 0) {
-          const eid = agent.eid;
-          const px = Position.x[eid]!;
-          const pz = Position.z[eid]!;
-
-          // Compute average flee direction (away from all danger zone centers)
-          let fleeX = 0;
-          let fleeZ = 0;
-          for (const zone of activeZones) {
-            const dx = px - zone.x;
-            const dz = pz - zone.z;
-            const dist = Math.sqrt(dx * dx + dz * dz) || 1;
-            // Weight inversely by distance — closer danger = stronger push
-            const weight = 1 / dist;
-            fleeX += (dx / dist) * weight;
-            fleeZ += (dz / dist) * weight;
-          }
-          const fleeMag = Math.sqrt(fleeX * fleeX + fleeZ * fleeZ) || 1;
-          fleeX /= fleeMag;
-          fleeZ /= fleeMag;
-
-          // Target: 50m in the flee direction, clamped to scene bounds
-          const fleeTargetX = px + fleeX * 50;
-          const fleeTargetZ = pz + fleeZ * 50;
-
-          agentLog.log("wander_override_flee", agentName, {
-            step,
-            dangerZones: activeZones.length,
-            targetX: fleeTargetX,
-            targetZ: fleeTargetZ,
-          });
-          this.manager.addDecision(dec.agentIndex, `FLEE (override): ${dec.reasoning}`);
-          this.manager.applyAction(dec.agentIndex, {
-            actionType: ActionType.RUN_TO,
-            targetX: fleeTargetX,
-            targetZ: fleeTargetZ,
-            targetEid: 0,
-          });
-        }
       }
     }
 
