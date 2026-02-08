@@ -1,10 +1,11 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { fetchLayers } from "./tiles.ts";
-import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, resetCarsToBase, sceneGroupRef } from "./layers.ts";
+import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, resetCarsToBase } from "./layers.ts";
 import { FlyControls } from "./controls.ts";
 import { TornadoSimulator, EF_SCALE } from "./disasters/tornado.ts";
 import { EarthquakeSimulator } from "./disasters/earthquake.ts";
+import { FloodSimulator } from "./disasters/flood.ts";
 
 // Agent system imports
 import { SimWorld } from "./core/World.ts";
@@ -103,6 +104,14 @@ const radiusValEq  = document.getElementById("eq-radius-val")!;
 const spawnQuakeBtn = document.getElementById("spawn-quake-btn") as HTMLButtonElement;
 const stopQuakeBtn  = document.getElementById("stop-quake-btn") as HTMLButtonElement;
 
+// Flood panel elements
+const floodPanel = document.getElementById("flood-panel")!;
+const floodHeightSlider = document.getElementById("flood-height") as HTMLInputElement;
+const floodHeightVal = document.getElementById("flood-height-val")!;
+const floodRadiusVal = document.getElementById("flood-radius-val")!;
+const spawnFloodBtn = document.getElementById("spawn-flood-btn") as HTMLButtonElement;
+const stopFloodBtn = document.getElementById("stop-flood-btn") as HTMLButtonElement;
+
 sizeInput.addEventListener("input", () => {
   sizeVal.textContent = sizeInput.value;
   sizeLabel.textContent = sizeInput.value;
@@ -158,9 +167,10 @@ window.addEventListener("resize", () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
-// --- Tornado & Earthquake simulators ---
+// --- Tornado, Earthquake, Flood simulators ---
 const tornado = new TornadoSimulator(scene);
 const quake = new EarthquakeSimulator(scene);
+const flood = new FloodSimulator(scene);
 const raycaster = new THREE.Raycaster();
 
 const EF_COLORS = ["#22cc22", "#cccc00", "#ff8800", "#ff4400", "#ff0000", "#880000"];
@@ -193,6 +203,15 @@ function updateMagnitudeDisplay() {
 }
 magSlider.addEventListener("input", updateMagnitudeDisplay);
 updateMagnitudeDisplay();
+
+function updateFloodDisplay() {
+  const h = parseFloat(floodHeightSlider.value);
+  floodHeightVal.textContent = h.toFixed(1);
+  flood.setMaxHeight(h);
+  floodRadiusVal.textContent = `${Math.round(flood.affectedRadiusMeters)} m`;
+}
+floodHeightSlider.addEventListener("input", updateFloodDisplay);
+updateFloodDisplay();
 
 // --- Gradual storm atmosphere transition ---
 const clearSky = {
@@ -234,7 +253,7 @@ function updateAtmosphere(t: number) {
 }
 
 // Track active disaster for auto-despawn detection
-let activeDisasterType: "tornado" | "earthquake" | null = null;
+let activeDisasterType: "tornado" | "earthquake" | "flood" | null = null;
 let wasTornadoActive = false;
 let wasQuakeActive = false;
 
@@ -265,6 +284,18 @@ function spawnQuakeAtCrosshair() {
   }
 }
 
+function spawnFloodAtCrosshair() {
+  const terrain = sceneGroup?.getObjectByName("terrain");
+  if (!terrain) return;
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const hits = raycaster.intersectObject(terrain);
+  if (hits.length > 0) {
+    flood.spawn(hits[0]!.point);
+    spawnFloodBtn.style.display = "none";
+    stopFloodBtn.style.display = "block";
+  }
+}
+
 function stopTornado() {
   tornado.despawn();
   stormTarget = 0;
@@ -279,10 +310,18 @@ function stopQuake() {
   stopQuakeBtn.style.display = "none";
 }
 
+function stopFlood() {
+  flood.despawn();
+  spawnFloodBtn.style.display = "block";
+  stopFloodBtn.style.display = "none";
+}
+
 spawnBtn.addEventListener("click", spawnTornadoAtCrosshair);
 despawnBtn.addEventListener("click", stopTornado);
 spawnQuakeBtn.addEventListener("click", spawnQuakeAtCrosshair);
 stopQuakeBtn.addEventListener("click", stopQuake);
+spawnFloodBtn.addEventListener("click", spawnFloodAtCrosshair);
+stopFloodBtn.addEventListener("click", stopFlood);
 
 window.addEventListener("keydown", (e) => {
   if (!overlay.classList.contains("hidden")) return;
@@ -292,6 +331,9 @@ window.addEventListener("keydown", (e) => {
   } else if (activeDisasterType === "earthquake") {
     if (e.code === "KeyT") spawnQuakeAtCrosshair();
     if (e.code === "KeyX") stopQuake();
+  } else if (activeDisasterType === "flood") {
+    if (e.code === "KeyT") spawnFloodAtCrosshair();
+    if (e.code === "KeyX") stopFlood();
   }
 });
 
@@ -323,7 +365,10 @@ async function doLookup() {
 
 lookupBtn.addEventListener("click", doLookup);
 addressInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); doLookup(); }
+  if (e.key === "Enter") {
+    e.preventDefault();
+    void doLookup();
+  }
 });
 
 // --- Scenario registry ---
@@ -355,6 +400,7 @@ const scenarios: ScenarioDefinition[] = [
       activeDisasterType = "tornado";
       tornadoPanel.style.display = "block";
       quakePanel.style.display = "none";
+      floodPanel.style.display = "none";
     },
   },
   {
@@ -367,12 +413,27 @@ const scenarios: ScenarioDefinition[] = [
       activeDisasterType = "earthquake";
       quakePanel.style.display = "block";
       tornadoPanel.style.display = "none";
+      floodPanel.style.display = "none";
     },
   },
   {
     id: "flood",
     name: "Flood",
     description: "Rising water levels and evacuation",
+    icon: "\uD83C\uDF0A",
+    available: true,
+    launch: (_sc, eb) => {
+      activeDisasterType = "flood";
+      flood.setEventBus(eb);
+      floodPanel.style.display = "block";
+      tornadoPanel.style.display = "none";
+      quakePanel.style.display = "none";
+    },
+  },
+  {
+    id: "tsunami",
+    name: "Tsunami",
+    description: "Offshore surge and coastal impact",
     icon: "\uD83C\uDF0A",
     available: false,
     launch: () => {},
@@ -690,8 +751,13 @@ stopSimBtn.addEventListener("click", async () => {
     quake.despawn();
     stopQuake();
     quakePanel.style.display = "none";
+  } else if (activeDisasterType === "flood") {
+    flood.despawn();
+    stopFlood();
+    floodPanel.style.display = "none";
   }
   activeDisasterType = null;
+  flood.setEventBus(null);
   stormTarget = 0;
 
   stopSimBtn.style.display = "none";
@@ -734,7 +800,9 @@ goBtn.addEventListener("click", async () => {
   fireConfigPanel.classList.remove("visible");
   tornadoPanel.style.display = "none";
   quakePanel.style.display = "none";
+  floodPanel.style.display = "none";
   activeDisasterType = null;
+  flood.setEventBus(null);
 
   try {
     const size = parseInt(sizeInput.value);
@@ -758,13 +826,17 @@ goBtn.addEventListener("click", async () => {
     // Reset tornado state from previous session
     tornado.reset();
     stopTornado();
+    quake.despawn();
+    stopQuake();
+    flood.despawn();
+    stopFlood();
 
-    const buildResult = buildAllLayers(layers, lat, lon, carTemplate);
-    sceneGroup = buildResult.group;
-    heightSampler = buildResult.heightSampler;
-    resetCarsToBase();
-    scene.add(sceneGroup);
-
+  const buildResult = buildAllLayers(layers, lat, lon, carTemplate);
+  sceneGroup = buildResult.group;
+  heightSampler = buildResult.heightSampler;
+  resetCarsToBase();
+  scene.add(sceneGroup);
+  flood.setTerrainContext(layers, lat, lon, sun, sceneGroup);
     // Reset camera — scale distance with area size
     const camScale = size / 500;
     camera.position.set(0, 80 * camScale, 200 * camScale);
@@ -818,6 +890,10 @@ function animate() {
   // Tornado & earthquake simulation ticks
   tornado.update(dt, buildingRegistry);
   quake.update(dt, buildingRegistry);
+  flood.update(dt);
+  if (flood.active) {
+    floodRadiusVal.textContent = `${Math.round(flood.affectedRadiusMeters)} m`;
+  }
 
   // Detect auto-despawn (tornado left the terrain)
   if (wasTornadoActive && !tornado.active) {
