@@ -3,8 +3,8 @@
 import type { FeatureCollection } from "./tiles.ts";
 
 const OPENTOPODATA_URL = "https://api.opentopodata.org/v1/ned10m";
-const GRID_SIZE = 10; // 10x10 grid (~50m resolution over 500m)
 const MAX_PER_REQUEST = 100; // OpenTopoData limit
+const REQUEST_INTERVAL_MS = 1100; // Public API limit is 1 request/second
 
 export interface ElevationGrid {
   geojson: FeatureCollection;
@@ -37,13 +37,14 @@ export async function fetchElevationGrid(
   north: number,
   east: number,
 ): Promise<ElevationGrid> {
-  const latStep = (north - south) / (GRID_SIZE - 1);
-  const lonStep = (east - west) / (GRID_SIZE - 1);
+  const gridSize = chooseGridSize(south, west, north, east);
+  const latStep = (north - south) / (gridSize - 1);
+  const lonStep = (east - west) / (gridSize - 1);
 
   // Build all query points
   const queries: { row: number; col: number; lat: number; lon: number }[] = [];
-  for (let row = 0; row < GRID_SIZE; row++) {
-    for (let col = 0; col < GRID_SIZE; col++) {
+  for (let row = 0; row < gridSize; row++) {
+    for (let col = 0; col < gridSize; col++) {
       queries.push({
         row,
         col,
@@ -54,17 +55,25 @@ export async function fetchElevationGrid(
   }
 
   // Build pipe-separated locations string and fetch in batches of 100
-  const values: number[][] = Array.from({ length: GRID_SIZE }, () =>
-    new Array(GRID_SIZE).fill(0),
+  const values: number[][] = Array.from({ length: gridSize }, () =>
+    new Array(gridSize).fill(0),
   );
   const features: FeatureCollection["features"] = [];
+  let lastRequestAt = 0;
 
   for (let i = 0; i < queries.length; i += MAX_PER_REQUEST) {
+    const now = Date.now();
+    const waitMs = lastRequestAt + REQUEST_INTERVAL_MS - now;
+    if (waitMs > 0) {
+      await Bun.sleep(waitMs);
+    }
+
     const batch = queries.slice(i, i + MAX_PER_REQUEST);
     const locations = batch.map((q) => `${q.lat},${q.lon}`).join("|");
     const url = `${OPENTOPODATA_URL}?locations=${locations}`;
 
     const res = await fetch(url);
+    lastRequestAt = Date.now();
     if (!res.ok) {
       console.error(`OpenTopoData error: ${res.status} ${await res.text()}`);
       continue;
@@ -100,11 +109,26 @@ export async function fetchElevationGrid(
 
   return {
     geojson: { type: "FeatureCollection", features },
-    gridSize: GRID_SIZE,
+    gridSize,
     south,
     north,
     west,
     east,
     values,
   };
+}
+
+function chooseGridSize(south: number, west: number, north: number, east: number): number {
+  const latMid = (south + north) * 0.5;
+  const latRad = (latMid * Math.PI) / 180;
+  const mPerDegLon = (Math.PI / 180) * 6378137 * Math.cos(latRad);
+  const mPerDegLat = (Math.PI / 180) * 6378137;
+  const widthMeters = Math.abs(east - west) * mPerDegLon;
+  const heightMeters = Math.abs(north - south) * mPerDegLat;
+  const longestSide = Math.max(widthMeters, heightMeters);
+
+  // Aim for ~25m sampling while keeping OpenTopoData request volume reasonable.
+  const targetSpacingMeters = 25;
+  const gridSize = Math.round(longestSide / targetSpacingMeters) + 1;
+  return Math.max(12, Math.min(24, gridSize));
 }

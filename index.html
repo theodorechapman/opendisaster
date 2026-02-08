@@ -42,6 +42,67 @@
     #panel button:hover { background: #3a56d4; }
     #panel button:disabled { opacity: 0.5; cursor: not-allowed; }
 
+    #disaster-panel {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      width: 340px;
+      max-height: calc(100vh - 32px);
+      overflow: auto;
+      background: rgba(11, 19, 35, 0.88);
+      border: 1px solid rgba(129, 169, 227, 0.35);
+      border-radius: 10px;
+      padding: 12px;
+      z-index: 9;
+      backdrop-filter: blur(4px);
+    }
+    #disaster-panel h2 {
+      font-size: 14px;
+      margin-bottom: 8px;
+      color: #dceeff;
+      letter-spacing: 0.04em;
+    }
+    #disaster-panel .control-label {
+      display: block;
+      font-size: 12px;
+      color: #9dbbe0;
+      margin-bottom: 4px;
+    }
+    #disaster-panel select,
+    #disaster-panel button {
+      width: 100%;
+      background: #1a2a45;
+      color: #e8f4ff;
+      border: 1px solid #3e5f8f;
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-size: 13px;
+    }
+    #disaster-panel button {
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    #disaster-panel button:hover {
+      background: #244374;
+    }
+    #disaster-panel button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+    #disaster-controls {
+      margin-top: 10px;
+      border-top: 1px solid rgba(138, 165, 207, 0.35);
+      padding-top: 10px;
+    }
+    #disaster-stats {
+      margin-top: 10px;
+      color: #a9d9ff;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      line-height: 1.35;
+      white-space: pre-wrap;
+    }
+
     #hud {
       position: fixed; bottom: 16px; left: 16px;
       font-size: 12px; color: #888;
@@ -345,6 +406,20 @@
     <button id="fire-start-btn">Start Fire</button>
     <button id="fire-back-btn">Back</button>
   </div>
+
+  <!-- Flood / Tsunami disaster control panel -->
+  <div id="disaster-ctrl-panel" style="position:fixed;top:16px;left:16px;background:rgba(26,26,46,0.92);border:1px solid #444;border-radius:10px;padding:16px 20px;width:300px;z-index:20;font-size:13px;color:#ccc;display:none;backdrop-filter:blur(6px);max-height:calc(100vh - 32px);overflow-y:auto;">
+    <h3 id="disaster-ctrl-title" style="margin:0 0 2px;font-size:15px;color:#eee;">Disaster</h3>
+    <p style="font-size:11px;color:#888;margin-bottom:12px;">Adjust parameters while running</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px;">
+      <button id="disaster-start-btn" style="padding:7px 0;border:none;border-radius:6px;font-size:13px;cursor:pointer;background:#2980b9;color:#fff;">Start</button>
+      <button id="disaster-pause-btn" style="padding:7px 0;border:none;border-radius:6px;font-size:13px;cursor:pointer;background:#555;color:#ddd;display:none;">Pause</button>
+      <button id="disaster-reset-btn" style="padding:7px 0;border:none;border-radius:6px;font-size:13px;cursor:pointer;background:#555;color:#ddd;display:none;">Reset</button>
+    </div>
+    <div id="disaster-ctrl-controls" style="margin-top:8px;border-top:1px solid #333;padding-top:8px;"></div>
+    <pre id="disaster-ctrl-stats" style="margin-top:8px;color:#a9d9ff;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;line-height:1.35;white-space:pre-wrap;"></pre>
+  </div>
+
   <button id="stop-sim-btn">Stop Simulation</button>
   <a id="replay-btn" href="/replay" target="_blank">View Replays</a>
   <div id="info"></div>

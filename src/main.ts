@@ -1,10 +1,12 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { fetchLayers } from "./tiles.ts";
+import { fetchLayers, type LayerData } from "./tiles.ts";
 import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, resetCarsToBase, sceneGroupRef } from "./layers.ts";
 import { FlyControls } from "./controls.ts";
 import { TornadoSimulator, EF_SCALE } from "./disasters/tornado.ts";
 import { EarthquakeSimulator } from "./disasters/earthquake.ts";
+import { createDisaster, getDefaultDisasterControls } from "../disasters/factory.ts";
+import type { DisasterControl, DisasterController, DisasterKind } from "../disasters/types.ts";
 
 // Agent system imports
 import { SimWorld } from "./core/World.ts";
@@ -55,6 +57,15 @@ fireXInput.addEventListener("input", () => { fireXVal.textContent = fireXInput.v
 fireZInput.addEventListener("input", () => { fireZVal.textContent = fireZInput.value; });
 fireSizeInput.addEventListener("input", () => { fireSizeVal.textContent = fireSizeInput.value; });
 fireSpreadInput.addEventListener("input", () => { fireSpreadVal.textContent = fireSpreadInput.value; });
+
+// Flood/Tsunami disaster control panel elements
+const disasterCtrlPanel = document.getElementById("disaster-ctrl-panel")!;
+const disasterCtrlTitle = document.getElementById("disaster-ctrl-title")!;
+const disasterStartBtnEl = document.getElementById("disaster-start-btn") as HTMLButtonElement;
+const disasterPauseBtnEl = document.getElementById("disaster-pause-btn") as HTMLButtonElement;
+const disasterResetBtnEl = document.getElementById("disaster-reset-btn") as HTMLButtonElement;
+const disasterCtrlControls = document.getElementById("disaster-ctrl-controls")!;
+const disasterCtrlStats = document.getElementById("disaster-ctrl-stats")!;
 
 // --- Car asset (GLB) ---
 const carLoader = new GLTFLoader();
@@ -323,7 +334,10 @@ async function doLookup() {
 
 lookupBtn.addEventListener("click", doLookup);
 addressInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") { e.preventDefault(); doLookup(); }
+  if (e.key === "Enter") {
+    e.preventDefault();
+    void doLookup();
+  }
 });
 
 // --- Scenario registry ---
@@ -372,10 +386,22 @@ const scenarios: ScenarioDefinition[] = [
   {
     id: "flood",
     name: "Flood",
-    description: "Rising water levels and evacuation",
+    description: "Rising water levels with shallow-water simulation",
     icon: "\uD83C\uDF0A",
-    available: false,
-    launch: () => {},
+    available: true,
+    launch: () => {
+      launchDisasterScenario("flood");
+    },
+  },
+  {
+    id: "tsunami",
+    name: "Tsunami",
+    description: "Coastal wave with destruction and debris physics",
+    icon: "\uD83C\uDF0A",
+    available: true,
+    launch: () => {
+      launchDisasterScenario("tsunami");
+    },
   },
 ];
 
@@ -694,6 +720,13 @@ stopSimBtn.addEventListener("click", async () => {
   activeDisasterType = null;
   stormTarget = 0;
 
+  // Clean up flood/tsunami disaster controller
+  if (activeDisasterCtrl) {
+    activeDisasterCtrl.dispose();
+    activeDisasterCtrl = null;
+  }
+  disasterCtrlPanel.style.display = "none";
+
   stopSimBtn.style.display = "none";
   stopSimBtn.disabled = false;
   stopSimBtn.textContent = "Stop Simulation";
@@ -702,6 +735,11 @@ stopSimBtn.addEventListener("click", async () => {
 
 // --- Load all layers ---
 let sceneGroup: THREE.Group | null = null;
+let loadedLayers: LayerData | null = null;
+let loadedCenter: { lat: number; lon: number } | null = null;
+
+// Active flood/tsunami disaster controller (managed via scenario system)
+let activeDisasterCtrl: DisasterController | null = null;
 
 goBtn.addEventListener("click", async () => {
   const lat = parseFloat(latInput.value);
@@ -734,12 +772,21 @@ goBtn.addEventListener("click", async () => {
   fireConfigPanel.classList.remove("visible");
   tornadoPanel.style.display = "none";
   quakePanel.style.display = "none";
+  disasterCtrlPanel.style.display = "none";
   activeDisasterType = null;
 
   try {
     const size = parseInt(sizeInput.value);
     const layers = await fetchLayers(lat, lon, size);
     await carTemplatePromise;
+
+    // Clean up previous flood/tsunami disaster
+    if (activeDisasterCtrl) {
+      activeDisasterCtrl.dispose();
+      activeDisasterCtrl = null;
+    }
+    loadedLayers = null;
+    loadedCenter = null;
 
     if (sceneGroup) {
       scene.remove(sceneGroup);
@@ -764,6 +811,8 @@ goBtn.addEventListener("click", async () => {
     heightSampler = buildResult.heightSampler;
     resetCarsToBase();
     scene.add(sceneGroup);
+    loadedLayers = layers;
+    loadedCenter = { lat, lon };
 
     // Reset camera — scale distance with area size
     const camScale = size / 500;
@@ -878,6 +927,12 @@ function animate() {
     updateAtmosphere(stormCurrent);
   }
 
+  // Update flood/tsunami disaster controller
+  if (activeDisasterCtrl) {
+    activeDisasterCtrl.update(dt);
+    disasterCtrlStats.textContent = activeDisasterCtrl.getStatsText();
+  }
+
   const pos = camera.position;
   hud.textContent = `pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})  |  WASD move · Mouse look · Space ↑ · Shift ↓`;
 
@@ -890,3 +945,131 @@ function animate() {
 }
 
 animate();
+
+// --- Flood/Tsunami disaster controller helpers ---
+
+function launchDisasterScenario(kind: DisasterKind): void {
+  if (!sceneGroup || !loadedLayers || !loadedCenter) return;
+
+  // Clean up any previous disaster controller
+  if (activeDisasterCtrl) {
+    activeDisasterCtrl.dispose();
+    activeDisasterCtrl = null;
+  }
+
+  try {
+    activeDisasterCtrl = createDisaster(kind, {
+      scene,
+      parent: sceneGroup,
+      camera,
+      layers: loadedLayers,
+      centerLat: loadedCenter.lat,
+      centerLon: loadedCenter.lon,
+      sunLight: sun,
+    });
+
+    const label = kind.charAt(0).toUpperCase() + kind.slice(1);
+    disasterCtrlTitle.textContent = `${label} Simulator`;
+    disasterCtrlPanel.style.display = "block";
+    renderDisasterCtrlUI();
+    updateDisasterCtrlButtons();
+  } catch (error) {
+    console.error(`[Disaster] Failed to create ${kind}:`, error);
+  }
+}
+
+function renderDisasterCtrlUI(): void {
+  disasterCtrlControls.innerHTML = "";
+  if (!activeDisasterCtrl) return;
+
+  const ctrls = activeDisasterCtrl.getControls();
+  for (const control of ctrls) {
+    const row = document.createElement("div");
+    row.style.marginBottom = "10px";
+
+    if (control.type === "range") {
+      const label = document.createElement("label");
+      label.style.cssText = "display:flex;justify-content:space-between;font-size:12px;color:#c6d7e9;margin-bottom:3px;";
+
+      const name = document.createElement("span");
+      name.textContent = control.label;
+
+      const valSpan = document.createElement("span");
+      const precision = control.precision ?? inferPrecision(control.step);
+      const suffix = control.unit ? ` ${control.unit}` : "";
+      valSpan.textContent = `${control.value.toFixed(precision)}${suffix}`;
+
+      label.append(name, valSpan);
+
+      const input = document.createElement("input");
+      input.type = "range";
+      input.min = String(control.min);
+      input.max = String(control.max);
+      input.step = String(control.step);
+      input.value = String(control.value);
+      input.style.width = "100%";
+
+      input.addEventListener("input", () => {
+        if (!activeDisasterCtrl) return;
+        activeDisasterCtrl.setControl(control.id, input.valueAsNumber);
+        const refreshed = activeDisasterCtrl.getControls().find((c) => c.id === control.id);
+        if (refreshed && refreshed.type === "range") {
+          const p = refreshed.precision ?? inferPrecision(refreshed.step);
+          const s = refreshed.unit ? ` ${refreshed.unit}` : "";
+          valSpan.textContent = `${refreshed.value.toFixed(p)}${s}`;
+        }
+      });
+
+      row.append(label, input);
+    } else {
+      const checkLabel = document.createElement("label");
+      checkLabel.style.cssText = "display:flex;align-items:center;gap:8px;font-size:12px;color:#c6d7e9;";
+
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = control.value;
+      input.addEventListener("change", () => {
+        if (!activeDisasterCtrl) return;
+        activeDisasterCtrl.setControl(control.id, input.checked);
+      });
+
+      const text = document.createElement("span");
+      text.textContent = control.label;
+      checkLabel.append(input, text);
+      row.appendChild(checkLabel);
+    }
+
+    disasterCtrlControls.appendChild(row);
+  }
+}
+
+function updateDisasterCtrlButtons(): void {
+  const running = activeDisasterCtrl?.isRunning() ?? false;
+  disasterStartBtnEl.style.display = running ? "none" : "block";
+  disasterPauseBtnEl.style.display = running ? "block" : "none";
+  disasterResetBtnEl.style.display = activeDisasterCtrl ? "block" : "none";
+}
+
+disasterStartBtnEl.addEventListener("click", () => {
+  if (!activeDisasterCtrl) return;
+  activeDisasterCtrl.start();
+  updateDisasterCtrlButtons();
+});
+
+disasterPauseBtnEl.addEventListener("click", () => {
+  if (!activeDisasterCtrl) return;
+  activeDisasterCtrl.pause();
+  updateDisasterCtrlButtons();
+});
+
+disasterResetBtnEl.addEventListener("click", () => {
+  if (!activeDisasterCtrl) return;
+  activeDisasterCtrl.reset();
+  updateDisasterCtrlButtons();
+});
+
+function inferPrecision(step: number): number {
+  const text = step.toString();
+  const dot = text.indexOf(".");
+  return dot >= 0 ? text.length - dot - 1 : 0;
+}

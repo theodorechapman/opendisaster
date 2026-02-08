@@ -231,178 +231,217 @@ async function processPayloads(payloads: any[], step: number): Promise<any[]> {
   });
 }
 
-/* ── Server ──────────────────────────────────────────────────────── */
+/* ── Server (with port fallback) ─────────────────────────────────── */
 
-Bun.serve({
-  port: 3000,
-  idleTimeout: 120,
-  websocket: {
-    async message(ws, message) {
-      try {
-        const msg = JSON.parse(String(message));
+const preferredPort = Number(process.env.PORT ?? 3000);
+const candidatePorts = [
+  preferredPort,
+  preferredPort + 1,
+  preferredPort + 2,
+  3000,
+  3001,
+  3002,
+].filter((port, idx, arr) => Number.isFinite(port) && port > 0 && arr.indexOf(port) === idx);
 
-        if (msg.type === "perceive") {
-          console.log(`[Server] Step ${msg.step} — ${msg.payloads.length} agents`);
-          const decisions = await processPayloads(msg.payloads, msg.step);
-          ws.send(JSON.stringify({
-            type: "decisions",
-            step: msg.step,
-            decisions,
-          }));
-        } else if (msg.type === "agent_log") {
-          logClientEntry(msg.entry);
-        }
-      } catch (err) {
-        console.error("[Server] WebSocket message error:", err);
-        ws.send(JSON.stringify({ type: "error", message: String(err) }));
-      }
-    },
-    open(ws) {
-      console.log("[Server] WebSocket client connected");
-    },
-    close(ws) {
-      console.log("[Server] WebSocket client disconnected");
-    },
-  },
-  async fetch(req, server) {
-    const url = new URL(req.url);
+let server: ReturnType<typeof Bun.serve> | null = null;
+let selectedPort = preferredPort;
+let lastError: unknown = null;
 
-    // --- WebSocket upgrade ---
-    if (url.pathname === "/ws") {
-      if (server.upgrade(req)) return;
-      return new Response("WebSocket upgrade failed", { status: 500 });
-    }
-
-    // --- API: all layers endpoint ---
-    if (url.pathname === "/api/data") {
-      const lat = parseFloat(url.searchParams.get("lat") ?? "");
-      const lon = parseFloat(url.searchParams.get("lon") ?? "");
-      const size = Math.max(100, Math.min(2000, parseInt(url.searchParams.get("size") ?? "500") || 500));
-      if (isNaN(lat) || isNaN(lon)) {
-        return new Response("Missing or invalid lat/lon", { status: 400 });
-      }
-
-      const cached = getCached(lat, lon, size);
-      if (cached) {
-        console.log(`Cache hit for (${lat.toFixed(4)}, ${lon.toFixed(4)})`);
-        return Response.json(cached);
-      }
-
-      console.log(`Cache miss — fetching Overpass + USGS elevation for (${lat.toFixed(4)}, ${lon.toFixed(4)})`);
-      try {
-        const { south, west, north, east } = bbox(lat, lon, size / 2);
-
-        const [overpassLayers, elevation] = await Promise.all([
-          fetchFromOverpass(south, west, north, east),
-          fetchElevationGrid(south, west, north, east),
-        ]);
-
-        const layers: LayerData = {
-          ...overpassLayers,
-          elevation,
-        };
-
-        setCache(lat, lon, layers, size);
-
-        const counts = Object.entries(overpassLayers)
-          .map(([k, v]) => `${k}: ${v.features.length}`)
-          .join(", ");
-        console.log(`  → ${counts}, elevation: ${elevation.gridSize}x${elevation.gridSize} grid`);
-        return Response.json(layers);
-      } catch (err) {
-        console.error("Fetch failed:", err);
-        return new Response(`Fetch error: ${err}`, { status: 502 });
-      }
-    }
-
-    // --- API: geocode address or Google Maps URL ---
-    if (url.pathname === "/api/geocode") {
-      const q = url.searchParams.get("q")?.trim();
-      if (!q) return new Response("Missing ?q=", { status: 400 });
-
-      let resolvedQ = q;
-      if (/^https?:\/\//i.test(q)) {
-        if (/goo\.gl/i.test(q)) {
+for (const port of candidatePorts) {
+  try {
+    server = Bun.serve({
+      port,
+      idleTimeout: 120,
+      websocket: {
+        async message(ws, message) {
           try {
-            const res = await fetch(q, { redirect: "follow" });
-            resolvedQ = res.url;
-          } catch {
-            // fall through to Nominatim
+            const msg = JSON.parse(String(message));
+
+            if (msg.type === "perceive") {
+              console.log(`[Server] Step ${msg.step} — ${msg.payloads.length} agents`);
+              const decisions = await processPayloads(msg.payloads, msg.step);
+              ws.send(JSON.stringify({
+                type: "decisions",
+                step: msg.step,
+                decisions,
+              }));
+            } else if (msg.type === "agent_log") {
+              logClientEntry(msg.entry);
+            }
+          } catch (err) {
+            console.error("[Server] WebSocket message error:", err);
+            ws.send(JSON.stringify({ type: "error", message: String(err) }));
+          }
+        },
+        open(ws) {
+          console.log("[Server] WebSocket client connected");
+        },
+        close(ws) {
+          console.log("[Server] WebSocket client disconnected");
+        },
+      },
+      async fetch(req, server) {
+        const url = new URL(req.url);
+
+        // --- WebSocket upgrade ---
+        if (url.pathname === "/ws") {
+          if (server.upgrade(req)) return;
+          return new Response("WebSocket upgrade failed", { status: 500 });
+        }
+
+        // --- API: all layers endpoint ---
+        if (url.pathname === "/api/data") {
+          const lat = parseFloat(url.searchParams.get("lat") ?? "");
+          const lon = parseFloat(url.searchParams.get("lon") ?? "");
+          const size = Math.max(100, Math.min(2000, parseInt(url.searchParams.get("size") ?? "500") || 500));
+          if (isNaN(lat) || isNaN(lon)) {
+            return new Response("Missing or invalid lat/lon", { status: 400 });
+          }
+
+          const cached = getCached(lat, lon, size);
+          if (cached) {
+            console.log(`Cache hit for (${lat.toFixed(4)}, ${lon.toFixed(4)})`);
+            return Response.json(cached);
+          }
+
+          console.log(`Cache miss — fetching Overpass + USGS elevation for (${lat.toFixed(4)}, ${lon.toFixed(4)})`);
+          try {
+            const { south, west, north, east } = bbox(lat, lon, size / 2);
+
+            const [overpassLayers, elevation] = await Promise.all([
+              fetchFromOverpass(south, west, north, east),
+              fetchElevationGrid(south, west, north, east),
+            ]);
+
+            const layers: LayerData = {
+              ...overpassLayers,
+              elevation,
+            };
+
+            setCache(lat, lon, layers, size);
+
+            const counts = Object.entries(overpassLayers)
+              .map(([k, v]) => `${k}: ${v.features.length}`)
+              .join(", ");
+            console.log(`  → ${counts}, elevation: ${elevation.gridSize}x${elevation.gridSize} grid`);
+            return Response.json(layers);
+          } catch (err) {
+            console.error("Fetch failed:", err);
+            return new Response(`Fetch error: ${err}`, { status: 502 });
           }
         }
 
-        const mapsCoords =
-          resolvedQ.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*)/) ??
-          resolvedQ.match(/[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)/) ??
-          resolvedQ.match(/[?&]ll=(-?\d+\.?\d*),(-?\d+\.?\d*)/);
+        // --- API: geocode address or Google Maps URL ---
+        if (url.pathname === "/api/geocode") {
+          const q = url.searchParams.get("q")?.trim();
+          if (!q) return new Response("Missing ?q=", { status: 400 });
 
-        if (mapsCoords) {
-          const lat = parseFloat(mapsCoords[1]);
-          const lon = parseFloat(mapsCoords[2]);
-          if (!isNaN(lat) && !isNaN(lon)) {
-            return Response.json({ lat, lon });
+          let resolvedQ = q;
+          if (/^https?:\/\//i.test(q)) {
+            if (/goo\.gl/i.test(q)) {
+              try {
+                const res = await fetch(q, { redirect: "follow" });
+                resolvedQ = res.url;
+              } catch {
+                // fall through to Nominatim
+              }
+            }
+
+            const mapsCoords =
+              resolvedQ.match(/@(-?\d+\.?\d*),(-?\d+\.?\d*)/) ??
+              resolvedQ.match(/[?&]q=(-?\d+\.?\d*),(-?\d+\.?\d*)/) ??
+              resolvedQ.match(/[?&]ll=(-?\d+\.?\d*),(-?\d+\.?\d*)/);
+
+            if (mapsCoords) {
+              const lat = parseFloat(mapsCoords[1]);
+              const lon = parseFloat(mapsCoords[2]);
+              if (!isNaN(lat) && !isNaN(lon)) {
+                return Response.json({ lat, lon });
+              }
+            }
+          }
+
+          try {
+            const nominatimUrl = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`;
+            const res = await fetch(nominatimUrl, {
+              headers: { "User-Agent": "OpenDisaster/1.0" },
+            });
+            const results = (await res.json()) as Array<{ lat: string; lon: string; display_name: string }>;
+            if (!results.length) {
+              return Response.json({ error: "Address not found" }, { status: 404 });
+            }
+            return Response.json({
+              lat: parseFloat(results[0].lat),
+              lon: parseFloat(results[0].lon),
+              name: results[0].display_name,
+            });
+          } catch (err) {
+            console.error("Geocode failed:", err);
+            return new Response("Geocode error", { status: 502 });
           }
         }
-      }
 
-      try {
-        const nominatimUrl = `https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`;
-        const res = await fetch(nominatimUrl, {
-          headers: { "User-Agent": "OpenDisaster/1.0" },
-        });
-        const results = (await res.json()) as Array<{ lat: string; lon: string; display_name: string }>;
-        if (!results.length) {
-          return Response.json({ error: "Address not found" }, { status: 404 });
+        // --- Static: Replay viewer ---
+        if (url.pathname === "/replay") {
+          const file = Bun.file(join(import.meta.dir, "public", "replay.html"));
+          if (await file.exists()) {
+            return new Response(file, { headers: { "Content-Type": "text/html" } });
+          }
         }
-        return Response.json({
-          lat: parseFloat(results[0].lat),
-          lon: parseFloat(results[0].lon),
-          name: results[0].display_name,
-        });
-      } catch (err) {
-        console.error("Geocode failed:", err);
-        return new Response("Geocode error", { status: 502 });
-      }
+
+        // --- Static: HTML ---
+        if (url.pathname === "/" || url.pathname === "/index.html") {
+          const html = (await htmlFile.text()).replace("./src/main.ts", "/dist/main.js");
+          return new Response(html, { headers: { "Content-Type": "text/html" } });
+        }
+
+        // --- Static: bundled JS ---
+        if (url.pathname.startsWith("/dist/")) {
+          const file = Bun.file(join(distDir, url.pathname.slice(6)));
+          if (await file.exists()) return new Response(file);
+        }
+
+        // --- Static: models and public assets ---
+        if (url.pathname.startsWith("/models/")) {
+          const decoded = decodeURIComponent(url.pathname);
+          const file = Bun.file(join(import.meta.dir, "public", decoded));
+          if (await file.exists()) return new Response(file);
+        }
+
+        // --- Static: assets (models, textures) ---
+        if (url.pathname.startsWith("/assets/")) {
+          const file = Bun.file(join(assetsDir, url.pathname.slice(8)));
+          if (await file.exists()) return new Response(file);
+        }
+
+        return new Response("Not found", { status: 404 });
+      },
+    });
+    selectedPort = port;
+    break;
+  } catch (error) {
+    lastError = error;
+    const err = error as { code?: string; message?: string; syscall?: string };
+    const message = err?.message ?? (error instanceof Error ? error.message : String(error));
+    const text = String(message).toLowerCase();
+    const isAddrInUse =
+      err?.code === "EADDRINUSE" ||
+      String(error).includes("EADDRINUSE") ||
+      (err?.syscall === "listen" && text.includes("in use")) ||
+      text.includes("port") && text.includes("in use");
+    if (!isAddrInUse) {
+      throw error;
     }
+  }
+}
 
-    // --- Static: Replay viewer ---
-    if (url.pathname === "/replay") {
-      const file = Bun.file(join(import.meta.dir, "public", "replay.html"));
-      if (await file.exists()) {
-        return new Response(file, { headers: { "Content-Type": "text/html" } });
-      }
-    }
+if (!server) {
+  throw new Error(
+    `Could not bind to ports: ${candidatePorts.join(", ")}${lastError ? ` (${String(lastError)})` : ""}`
+  );
+}
 
-    // --- Static: HTML ---
-    if (url.pathname === "/" || url.pathname === "/index.html") {
-      const html = (await htmlFile.text()).replace("./src/main.ts", "/dist/main.js");
-      return new Response(html, { headers: { "Content-Type": "text/html" } });
-    }
-
-    // --- Static: bundled JS ---
-    if (url.pathname.startsWith("/dist/")) {
-      const file = Bun.file(join(distDir, url.pathname.slice(6)));
-      if (await file.exists()) return new Response(file);
-    }
-
-    // --- Static: models and public assets ---
-    if (url.pathname.startsWith("/models/")) {
-      const decoded = decodeURIComponent(url.pathname);
-      const file = Bun.file(join(import.meta.dir, "public", decoded));
-      if (await file.exists()) return new Response(file);
-    }
-
-    // --- Static: assets (models, textures) ---
-    if (url.pathname.startsWith("/assets/")) {
-      const file = Bun.file(join(assetsDir, url.pathname.slice(8)));
-      if (await file.exists()) return new Response(file);
-    }
-
-    return new Response("Not found", { status: 404 });
-  },
-});
-
-console.log("[OpenDisaster] Server running at http://localhost:3000");
+console.log(`[OpenDisaster] Server running at http://localhost:${selectedPort}`);
 console.log(`[OpenDisaster] Agent logs → ${LOG_FILE}`);
 if (FEATHERLESS_API_KEYS.length > 0) {
   console.log(`[OpenDisaster] VLM enabled with ${FEATHERLESS_API_KEYS.length} API key(s)`);
