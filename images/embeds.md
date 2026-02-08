@@ -1,0 +1,5 @@
+![Screenshot 1](https://raw.githubusercontent.com/theodorechapman/opendisaster/main/images/Screenshot%202026-02-08%20at%2010.34.42%20AM.webp)
+![Screenshot 2](https://raw.githubusercontent.com/theodorechapman/opendisaster/main/images/Screenshot%202026-02-08%20at%2010.36.04%20AM.webp)
+![Screenshot 3](https://raw.githubusercontent.com/theodorechapman/opendisaster/main/images/Screenshot%202026-02-08%20at%2010.36.51%20AM.webp)
+![Graph](https://raw.githubusercontent.com/theodorechapman/opendisaster/main/images/graph.webp)
+![Simulation Result](https://raw.githubusercontent.com/theodorechapman/opendisaster/main/images/simulation%20result.webp)
