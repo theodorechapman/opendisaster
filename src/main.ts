@@ -2,6 +2,7 @@ import * as THREE from "three";
 import { fetchLayers } from "./tiles.ts";
 import { buildAllLayers } from "./layers.ts";
 import { FlyControls } from "./controls.ts";
+import { FloodSystem } from "../disasters/flood/FloodSystem.ts";
 
 const overlay = document.getElementById("overlay")!;
 const goBtn = document.getElementById("go") as HTMLButtonElement;
@@ -107,6 +108,7 @@ addressInput.addEventListener("keydown", (e) => {
 
 // --- Load all layers ---
 let sceneGroup: THREE.Group | null = null;
+let floodSystem: FloodSystem | null = null;
 
 goBtn.addEventListener("click", async () => {
   const lat = parseFloat(latInput.value);
@@ -120,6 +122,11 @@ goBtn.addEventListener("click", async () => {
   try {
     const size = parseInt(sizeInput.value);
     const layers = await fetchLayers(lat, lon, size);
+
+    if (floodSystem) {
+      floodSystem.dispose();
+      floodSystem = null;
+    }
 
     if (sceneGroup) {
       scene.remove(sceneGroup);
@@ -137,6 +144,9 @@ goBtn.addEventListener("click", async () => {
 
     sceneGroup = buildAllLayers(layers, lat, lon);
     scene.add(sceneGroup);
+    floodSystem = new FloodSystem(sceneGroup, layers, lat, lon, sun, {
+      autoStart: true,
+    });
 
     // Reset camera — scale distance with area size
     const camScale = size / 500;
@@ -164,6 +174,7 @@ function animate() {
   lastTime = now;
 
   controls.update(dt);
+  floodSystem?.update(dt);
 
   const pos = camera.position;
   hud.textContent = `pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})  |  WASD move · Mouse look · Space ↑ · Shift ↓  |  Click to capture mouse`;
