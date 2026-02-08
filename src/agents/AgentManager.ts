@@ -85,8 +85,9 @@ export class AgentManager {
     // Classification
     Classification.type[eid] = ClassificationType.AGENT;
 
-    // Create visual
-    this.visuals.createAgent(config);
+    // Create visual on its own layer to avoid flicker in perception renders
+    const layer = Math.min(31, 1 + index);
+    this.visuals.createAgent(config, layer);
 
     const runtime: AgentRuntime = {
       config,

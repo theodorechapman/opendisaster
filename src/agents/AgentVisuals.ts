@@ -4,7 +4,7 @@ import { clone as skeletonClone } from "three/examples/jsm/utils/SkeletonUtils.j
 import type { AgentConfig } from "./types.ts";
 
 const EYE_HEIGHT = 8;
-const TARGET_HEIGHT = 10; // desired agent height in world units
+const TARGET_HEIGHT = 7.5; // desired agent height in world units
 
 /** Animation clip names embedded in Man.glb */
 const CLIP_NAMES: Record<string, string> = {
@@ -51,7 +51,7 @@ export class AgentVisuals {
   }
 
   /** Create a cloned human mesh and first-person camera for an agent. */
-  createAgent(config: AgentConfig): AgentVisual {
+  createAgent(config: AgentConfig, layer: number): AgentVisual {
     if (!this.template) {
       throw new Error("AgentVisuals.loadModel() must be called before createAgent()");
     }
@@ -92,6 +92,13 @@ export class AgentVisuals {
     group.add(camera);
     camera.position.set(0, EYE_HEIGHT, 0);
     camera.rotation.set(0, Math.PI, 0);
+
+    // Put this agent on a dedicated layer so we can hide it from its own camera
+    group.traverse((obj) => obj.layers.set(layer));
+
+    // Camera sees everything except its own layer
+    camera.layers.enableAll();
+    camera.layers.disable(layer);
 
     this.scene.add(group);
 

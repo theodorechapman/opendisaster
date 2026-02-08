@@ -581,6 +581,11 @@ Bun.serve({
       const file = Bun.file(join(import.meta.dir, "public", decoded));
       if (await file.exists()) return new Response(file);
     }
+    if (url.pathname.startsWith("/skybox/")) {
+      const decoded = decodeURIComponent(url.pathname);
+      const file = Bun.file(join(import.meta.dir, "public", decoded));
+      if (await file.exists()) return new Response(file);
+    }
 
     // --- Static: assets (models, textures) ---
     if (url.pathname.startsWith("/assets/")) {

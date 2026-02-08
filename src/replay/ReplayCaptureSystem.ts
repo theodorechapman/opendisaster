@@ -75,9 +75,6 @@ export class ReplayCaptureSystem {
     visual.mesh.position.set(Position.x[eid]!, Position.y[eid]!, Position.z[eid]!);
     visual.mesh.rotation.y = AgentFacing.yaw[eid]!;
 
-    // Hide agent mesh for self-view
-    visual.mesh.visible = false;
-
     // Render to offscreen target
     this.renderer.setRenderTarget(this.renderTarget);
     this.renderer.render(this.scene, visual.camera);
@@ -88,9 +85,6 @@ export class ReplayCaptureSystem {
       this.renderTarget, 0, 0,
       CAPTURE_SIZE, CAPTURE_SIZE,
     );
-
-    // Restore visibility
-    visual.mesh.visible = true;
 
     // Flip Y and encode to JPEG
     const imageData = this.ctx.createImageData(CAPTURE_SIZE, CAPTURE_SIZE);

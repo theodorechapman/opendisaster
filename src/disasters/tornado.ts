@@ -62,7 +62,7 @@ const TREE_UPROOT_SPEED = 35; // m/s — EF1 uproots most trees
 // ─── Visual / simulation constants ──────────────────────────────────────────
 
 const FUNNEL_PARTICLES = 12000;
-const MAX_DEBRIS       = 350;
+const MAX_DEBRIS       = 180;
 const FUNNEL_HEIGHT    = 280;
 
 // ─── TSL noise helpers ──────────────────────────────────────────────────────
@@ -391,7 +391,7 @@ export class TornadoSimulator {
     this.active = false;
     this.tornadoGroup.visible = false;
     // Remove airborne debris, keep grounded (they'll TTL out)
-    for (let i = this.debris.length - 1; i >= 0; i--) {
+    for (let i = this.debris.length - 1; i >= 0; i -= 3) {
       if (!this.debris[i]!.grounded) this.removeDebris(i);
     }
   }
@@ -443,11 +443,11 @@ export class TornadoSimulator {
     this.updateCars();
 
     // Spawn dirt chunks from the earth being ripped up
-    if (this.time - this.lastDirtSpawn > 0.25) {
+    if (this.time - this.lastDirtSpawn > 0.6) {
       this.spawnDirtDebris();
       this.lastDirtSpawn = this.time;
     }
-    if (Math.floor(this.time * 15) % 4 === 0) this.paintGround();
+    if (Math.floor(this.time * 6) % 4 === 0) this.paintGround();
 
     // Emit wind field event for agent damage system
     if (this.eventBus && this.time - this.lastEventEmit >= 0.5) {
@@ -1144,7 +1144,7 @@ export class TornadoSimulator {
   }
 
   private getDebrisScale(): number {
-    return 0.35 + this.efRating * 0.13;
+    return 0.2 + this.efRating * 0.09;
   }
 
   private applyEfRadius() {
@@ -1688,7 +1688,7 @@ export class TornadoSimulator {
     for (const t of thresholds) {
       if (prevDmg < t && b.damageLevel >= t) {
         this.chipBuilding(b, 0.8);
-        const count = Math.max(1, Math.floor((2 + Math.random() * 4) * debrisScale));
+        const count = Math.max(1, Math.floor((1 + Math.random() * 2) * debrisScale));
         for (let i = 0; i < count; i++) {
           const geoIdx = Math.floor(Math.random() * this.debrisGeos.length);
           const fragY = b.baseY + b.height * Math.max(0.1, 1 - b.damageLevel) * (0.3 + Math.random() * 0.7);
@@ -1819,7 +1819,8 @@ export class TornadoSimulator {
     const AIRBORNE_TTL = 20;
     const GROUNDED_TTL = 8;
 
-    for (let i = this.debris.length - 1; i >= 0; i--) {
+    const DEBRIS_STEP = 2; // update half the debris per frame
+    for (let i = this.debris.length - 1; i >= 0; i -= DEBRIS_STEP) {
       const d = this.debris[i]!;
       d.life += dt;
       if (d.radius === undefined) {

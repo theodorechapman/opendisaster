@@ -33,7 +33,7 @@ export class HeatmapOverlay {
     const mat = new THREE.MeshBasicMaterial({
       map: this.texture,
       transparent: true,
-      opacity: 0.55,
+      opacity: 0.8,
       depthWrite: false,
       side: THREE.DoubleSide,
     });
@@ -67,7 +67,9 @@ export class HeatmapOverlay {
       for (let col = 0; col < gridWidth; col++) {
         const val = grid[row * gridWidth + col]!;
         if (val <= 0) continue;
-        const t = val / maxVal;
+        let t = val / maxVal;
+        // boost contrast so low values are still visible
+        t = Math.sqrt(t);
         const color = this.heatColor(t);
         ctx.fillStyle = color;
         ctx.fillRect(col * cellW, row * cellH, cellW + 0.5, cellH + 0.5);
@@ -98,7 +100,7 @@ export class HeatmapOverlay {
 
   private heatColor(t: number): string {
     // transparent(0) → blue → yellow → red(1)
-    const alpha = 0.3 + t * 0.6;
+    const alpha = 0.5 + t * 0.5;
     let r: number, g: number, b: number;
     if (t < 0.5) {
       const s = t / 0.5;

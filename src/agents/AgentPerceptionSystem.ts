@@ -54,9 +54,6 @@ export class AgentPerceptionSystem {
       visual.mesh.position.set(Position.x[eid]!, Position.y[eid]!, Position.z[eid]!);
       visual.mesh.rotation.y = AgentFacing.yaw[eid]!;
 
-      // Hide agent's own mesh so it doesn't appear in its own view
-      visual.mesh.visible = false;
-
       // Render to offscreen target
       this.renderer.setRenderTarget(this.renderTarget);
       this.renderer.render(this.scene, visual.camera);
@@ -68,9 +65,6 @@ export class AgentPerceptionSystem {
         0, 0,
         RENDER_SIZE, RENDER_SIZE,
       );
-
-      // Restore visibility
-      visual.mesh.visible = true;
 
       // Flip Y and put into canvas (GPU reads bottom-to-top)
       const imageData = this.ctx.createImageData(RENDER_SIZE, RENDER_SIZE);

@@ -72,7 +72,7 @@
       background: rgba(0,0,0,0.8); border: 1px solid #333;
       border-radius: 6px; overflow: hidden;
     }
-    .snapshot-card img { width: 200px; height: 200px; object-fit: cover; display: block; }
+    .snapshot-card img { width: 200px; height: 200px; object-fit: cover; display: block; transform: scaleY(-1); }
     .snapshot-card .caption { padding: 6px 8px; font-size: 10px; color: #aaa; font-family: monospace; }
     .snapshot-card .caption .name { color: #4fc3f7; font-weight: bold; margin-bottom: 2px; }
     .snapshot-card .caption .step-info { color: #888; margin-bottom: 4px; }
@@ -174,6 +174,18 @@
       display: none;
     }
     #exit-sim-btn:hover { background: rgba(120,120,120,0.95); border-color: #999; }
+
+    #toggle-agent-cams-btn {
+      position: fixed; bottom: 48px; right: 12px;
+      padding: 6px 14px;
+      background: rgba(60,60,60,0.9); border: 1px solid #666;
+      border-radius: 6px; color: #cfd9e6;
+      font-size: 12px; font-family: monospace;
+      cursor: pointer; z-index: 6;
+      transition: background 0.15s, border-color 0.15s;
+      display: none;
+    }
+    #toggle-agent-cams-btn:hover { background: rgba(90,90,90,0.95); border-color: #888; }
 
     #replay-btn {
       position: fixed; top: 12px; right: 200px;
@@ -324,6 +336,7 @@
     </div>
   </div>
   <button id="exit-sim-btn">Exit Simulation</button>
+  <button id="toggle-agent-cams-btn">Show Agent Cams</button>
   <button id="stop-sim-btn">Stop Simulation</button>
   <a id="replay-btn" href="/replay" target="_blank">View Replays</a>
   <div id="info"></div>

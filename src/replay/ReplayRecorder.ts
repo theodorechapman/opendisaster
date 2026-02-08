@@ -6,6 +6,7 @@ const BATCH_SIZE = 30;
 
 export class ReplayRecorder {
   private frameBuffer: ReplayVideoFrame[] = [];
+  private latestFrames = new Map<number, ReplayVideoFrame>();
   private vlmEntries: ReplayVLMEntry[] = [];
   private sessionId: string;
   private startTime: number;
@@ -33,17 +34,24 @@ export class ReplayRecorder {
     simTime: number,
     state: ReplayVideoFrame["state"],
   ): void {
-    this.frameBuffer.push({
+    const frame: ReplayVideoFrame = {
       sessionId: this.sessionId,
       agentIndex,
       time: simTime,
       frameBase64,
       state,
-    });
+    };
+    this.frameBuffer.push(frame);
+    this.latestFrames.set(agentIndex, frame);
 
     if (this.frameBuffer.length >= BATCH_SIZE) {
       this.flushFrames();
     }
+  }
+
+  /** Latest captured frame per agent (for live preview). */
+  getLatestFramesByAgent(): Map<number, ReplayVideoFrame> {
+    return this.latestFrames;
   }
 
   /** Store a VLM decision entry (separate from video frames). */

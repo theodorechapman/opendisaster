@@ -55,6 +55,7 @@ export class SteppedSimulation {
   private capturing = false;
   /** True while a perceive request is in-flight — prevents stacking VLM calls. */
   private inflight = false;
+  private liveCamEnabled = true;
   /** Per-agent last processed step — used to discard stale responses. */
   private latestAppliedStep = new Map<number, number>();
   /** Frame data stored at send time for snapshot pairing. Key: "agentIndex:step". */
@@ -132,6 +133,10 @@ export class SteppedSimulation {
         this.downloadSnapshots();
       }
     });
+  }
+
+  setLiveCamEnabled(enabled: boolean): void {
+    this.liveCamEnabled = enabled;
   }
 
   /** Save a POV snapshot paired with its VLM caption. Uses capture-time step/simTime. */
@@ -364,6 +369,28 @@ export class SteppedSimulation {
           payload: p,
           simTime: captureSimTime,
         });
+      }
+
+      // If live cams are enabled, show latest POVs immediately (even without VLM)
+      // Replay captures are already Y-flipped; perception payloads are also flipped.
+      // Avoid double-flipping by using replay frames for live display.
+      if (this.liveCamEnabled) {
+        const framesByAgent = this.replayRecorder.getLatestFramesByAgent?.();
+        for (const p of payloads) {
+          const latest = framesByAgent ? framesByAgent.get(p.agentIndex) : null;
+          if (latest) {
+            this.snapshots.push({
+              agentName: p.name,
+              step: this.step,
+              simTime: captureSimTime,
+              frameBase64: latest.frameBase64,
+              caption: "Live POV",
+            });
+          } else {
+            this.saveSnapshot(p, "Live POV", this.step, captureSimTime);
+          }
+        }
+        this.updateGallery();
       }
 
       // Log every agent's state at capture time

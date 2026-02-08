@@ -45,6 +45,8 @@ const hud = document.getElementById("hud")!;
 const info = document.getElementById("info")!;
 const stopSimBtn = document.getElementById("stop-sim-btn") as HTMLButtonElement;
 const exitSimBtn = document.getElementById("exit-sim-btn") as HTMLButtonElement;
+const toggleAgentCamsBtn = document.getElementById("toggle-agent-cams-btn") as HTMLButtonElement;
+const snapshotGallery = document.getElementById("snapshot-gallery") as HTMLDivElement;
 
 // Fire panel elements
 const fireConfigPanel = document.getElementById("fire-config-panel")!;
@@ -135,6 +137,7 @@ scene.background = new THREE.Color(skyColor);
 
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.5, 1000);
 camera.position.set(0, 80, 200);
+for (let i = 0; i < 32; i++) camera.layers.enable(i);
 
 // Lighting — sun directional light with cascaded shadow maps (WebGPU)
 const sun = new THREE.DirectionalLight(0xfff4e0, 1.5);
@@ -831,6 +834,8 @@ stopSimBtn.addEventListener("click", async () => {
   stopSimBtn.style.display = "none";
   stopSimBtn.disabled = false;
   stopSimBtn.textContent = "Stop Simulation";
+  toggleAgentCamsBtn.style.display = "none";
+  snapshotGallery.style.display = "none";
   info.textContent = "Simulation stopped. Replay saved.";
 });
 
@@ -883,6 +888,8 @@ exitSimBtn.addEventListener("click", async () => {
 
   stopSimBtn.style.display = "none";
   exitSimBtn.style.display = "none";
+  toggleAgentCamsBtn.style.display = "none";
+  snapshotGallery.style.display = "none";
   info.textContent = "Exited simulation.";
   mountLandingOverlay();
 });
@@ -893,6 +900,14 @@ const landingRoot = document.getElementById("landing-root")!;
 let reactRoot: ReturnType<typeof createRoot> | null = null;
 
 let landingEnableAgents = true;
+let agentCamsVisible = true;
+
+toggleAgentCamsBtn.addEventListener("click", () => {
+  agentCamsVisible = !agentCamsVisible;
+  snapshotGallery.style.display = agentCamsVisible ? "flex" : "none";
+  toggleAgentCamsBtn.textContent = agentCamsVisible ? "Hide Agent Cams" : "Show Agent Cams";
+  if (steppedSim) steppedSim.setLiveCamEnabled(agentCamsVisible);
+});
 
 function mountLandingOverlay() {
   if (!reactRoot) {
@@ -1069,6 +1084,16 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
       markStep(4, "done");
     }
     exitSimBtn.style.display = "block";
+    if (landingEnableAgents) {
+      agentCamsVisible = true;
+      toggleAgentCamsBtn.textContent = "Hide Agent Cams";
+      toggleAgentCamsBtn.style.display = "block";
+      snapshotGallery.style.display = "flex";
+      if (steppedSim) steppedSim.setLiveCamEnabled(true);
+    } else {
+      toggleAgentCamsBtn.style.display = "none";
+      snapshotGallery.style.display = "none";
+    }
   } catch (err) {
     console.error("Failed to load:", err);
     // Mark current active step as error

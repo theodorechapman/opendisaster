@@ -6,7 +6,7 @@ import type { EventBus, DisasterEvent } from "../core/EventBus.ts";
 import type { AgentManager } from "./AgentManager.ts";
 
 /** Global damage multiplier — increase to make sims deadlier for testing. */
-const DMG_SCALE = 2.0;
+const DMG_SCALE = 3.0;
 
 /**
  * Creates the agent damage ECS system.
@@ -61,26 +61,28 @@ export function createAgentDamageSystem(
 
               if (wh > 1.5) {
                 // Chest+ deep: dangerous
-                const damage = 3 * wh * FLOOD_DT * DMG_SCALE;
+                const damage = (4 * wh + 1.5 * velocity) * FLOOD_DT * DMG_SCALE;
                 AgentState.health[eid] = AgentState.health[eid]! - damage;
                 AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.2);
                 eventBus.emit({ type: "AGENT_DAMAGED", agentIndex: agent.index, position: [ax, Position.y[eid]!, az], damage, source: event.type });
                 manager.addEvent(agent.index, `Deep flooding! Water height ${wh.toFixed(1)}m.`);
               } else if (wh > 0.8) {
                 // Waist-deep: slow damage
-                const damage = 1 * wh * FLOOD_DT * DMG_SCALE;
+                const damage = (1.5 * wh + 0.8 * velocity) * FLOOD_DT * DMG_SCALE;
                 AgentState.health[eid] = AgentState.health[eid]! - damage;
                 AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.1);
                 eventBus.emit({ type: "AGENT_DAMAGED", agentIndex: agent.index, position: [ax, Position.y[eid]!, az], damage, source: event.type });
                 manager.addEvent(agent.index, `Waist-deep flooding! Water height ${wh.toFixed(1)}m.`);
               } else if (wh > 0.3) {
-                // Ankle-deep: panic only, no damage
+                // Ankle-deep: light damage + panic
+                const damage = (0.4 * wh + 0.3 * velocity) * FLOOD_DT * DMG_SCALE;
+                AgentState.health[eid] = AgentState.health[eid]! - damage;
                 AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.05);
               }
 
               // Velocity-based knockdown: swept away by current
-              if (velocity > 2 && wh > 0.5) {
-                const damage = 2 * velocity * FLOOD_DT * DMG_SCALE;
+              if (velocity > 1.5 && wh > 0.5) {
+                const damage = 2.5 * velocity * FLOOD_DT * DMG_SCALE;
                 AgentState.health[eid] = AgentState.health[eid]! - damage;
                 eventBus.emit({ type: "AGENT_DAMAGED", agentIndex: agent.index, position: [ax, Position.y[eid]!, az], damage, source: event.type });
                 manager.addEvent(agent.index, `Swept by flood current! Velocity ${velocity.toFixed(1)} m/s.`);
@@ -148,16 +150,17 @@ export function createAgentDamageSystem(
             }
 
             if (dist < coreRadius) {
-              // Core vortex: ~8 HP/s at core edge → ~12s to kill
+              // Core vortex: quadratic + quartic severity
               const speedRatio = windSpeed / maxWindSpeed;
-              const damage = 8 * speedRatio * speedRatio * WIND_DT * DMG_SCALE;
+              const damage = (10 * speedRatio * speedRatio + 12 * Math.pow(speedRatio, 4)) * WIND_DT * DMG_SCALE;
               AgentState.health[eid] = AgentState.health[eid]! - damage;
               AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.3);
               eventBus.emit({ type: "AGENT_DAMAGED", agentIndex: agent.index, position: [ax, Position.y[eid]!, az], damage, source: event.type });
 
-              // 8% chance of flying debris hit (20 HP)
-              if (Math.random() < 0.08) {
-                const debrisDmg = 20 * DMG_SCALE;
+              // Debris hit chance scales with wind intensity
+              const debrisChance = 0.06 + 0.12 * speedRatio;
+              if (Math.random() < debrisChance) {
+                const debrisDmg = (18 + 24 * speedRatio) * DMG_SCALE;
                 AgentState.health[eid] = AgentState.health[eid]! - debrisDmg;
                 AgentState.injured[eid] = AgentState.injured[eid]! | 1;
                 eventBus.emit({ type: "AGENT_DAMAGED", agentIndex: agent.index, position: [ax, Position.y[eid]!, az], damage: debrisDmg, source: "WIND_DEBRIS" });
@@ -166,9 +169,9 @@ export function createAgentDamageSystem(
                 manager.addEvent(agent.index, `In tornado core! Wind ${windSpeed.toFixed(0)} m/s, distance ${dist.toFixed(0)}m.`);
               }
             } else if (dist < outerRadius) {
-              // Outer vortex: ~3 HP/s chip damage
+              // Outer vortex: lighter but still hazardous
               const speedRatio = windSpeed / maxWindSpeed;
-              const damage = 3 * speedRatio * WIND_DT * DMG_SCALE;
+              const damage = (4 * speedRatio * speedRatio) * WIND_DT * DMG_SCALE;
               AgentState.health[eid] = AgentState.health[eid]! - damage;
               AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.15);
               eventBus.emit({ type: "AGENT_DAMAGED", agentIndex: agent.index, position: [ax, Position.y[eid]!, az], damage, source: event.type });
@@ -189,14 +192,16 @@ export function createAgentDamageSystem(
 
             if (dist < 50) {
               // Close range: ground shaking + falling objects
-              const damage = 2 * pga * QUAKE_DT * DMG_SCALE;
+              const magBoost = 0.8 + (magnitude - 5) * 0.25;
+              const damage = (4 * pga * magBoost) * QUAKE_DT * DMG_SCALE;
               AgentState.health[eid] = AgentState.health[eid]! - damage;
               AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.3 * (1 - dist / 50));
               eventBus.emit({ type: "AGENT_DAMAGED", agentIndex: agent.index, position: [ax, Position.y[eid]!, az], damage, source: event.type });
 
-              // 10% chance of debris hit scaled by magnitude
-              if (Math.random() < 0.1) {
-                const debrisDamage = 15 * (magnitude / 9) * DMG_SCALE;
+              // Debris hit chance scales with magnitude and proximity
+              const debrisChance = 0.08 + 0.05 * Math.max(0, magnitude - 6);
+              if (Math.random() < debrisChance) {
+                const debrisDamage = (18 + 10 * (magnitude - 6)) * DMG_SCALE;
                 AgentState.health[eid] = AgentState.health[eid]! - debrisDamage;
                 AgentState.injured[eid] = AgentState.injured[eid]! | 1;
                 eventBus.emit({ type: "AGENT_DAMAGED", agentIndex: agent.index, position: [ax, Position.y[eid]!, az], damage: debrisDamage, source: "QUAKE_DEBRIS" });
@@ -206,7 +211,8 @@ export function createAgentDamageSystem(
               }
             } else if (dist < 200) {
               // Medium range: lighter shaking damage
-              const damage = 0.5 * pga * QUAKE_DT * DMG_SCALE;
+              const magBoost = 0.7 + (magnitude - 5) * 0.18;
+              const damage = (1.2 * pga * magBoost) * QUAKE_DT * DMG_SCALE;
               AgentState.health[eid] = AgentState.health[eid]! - damage;
               AgentState.panicLevel[eid] = Math.min(1, AgentState.panicLevel[eid]! + 0.15 * (1 - dist / 200));
               eventBus.emit({ type: "AGENT_DAMAGED", agentIndex: agent.index, position: [ax, Position.y[eid]!, az], damage, source: event.type });
