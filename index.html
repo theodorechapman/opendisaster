@@ -67,6 +67,92 @@
       padding: 8px 20px; font-size: 13px; z-index: 15;
       display: none;
     }
+
+    /* ── Tornado control panel ── */
+    #tornado-panel {
+      position: fixed; top: 16px; right: 16px;
+      background: rgba(26,26,46,0.92); border: 1px solid #444;
+      border-radius: 10px; padding: 16px 20px;
+      width: 260px; z-index: 20;
+      font-size: 13px; color: #ccc;
+      display: none;
+      backdrop-filter: blur(6px);
+    }
+    #tornado-panel h3 {
+      margin: 0 0 2px; font-size: 15px; color: #eee;
+    }
+    #tornado-panel .tp-sub {
+      font-size: 11px; color: #888; margin-bottom: 12px;
+    }
+    #tornado-panel label {
+      display: block; margin-bottom: 2px; color: #aaa; font-size: 12px;
+    }
+    #tornado-panel input[type="range"] {
+      width: 100%; cursor: pointer; accent-color: #e04040;
+      margin-bottom: 10px;
+    }
+    #tornado-panel .ef-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 4px;
+      font-weight: 700; font-size: 13px; margin-right: 6px;
+    }
+    #tornado-panel .tp-row { display: flex; gap: 8px; margin-bottom: 8px; }
+    #tornado-panel button {
+      flex: 1; padding: 8px 0;
+      border: none; border-radius: 6px;
+      font-size: 13px; cursor: pointer;
+      transition: background 0.15s;
+    }
+    #tornado-panel button:hover { filter: brightness(1.15); }
+    #tornado-panel #spawn-btn {
+      background: #c0392b; color: #fff;
+    }
+    #tornado-panel #despawn-btn {
+      background: #555; color: #ddd; display: none;
+    }
+    #tornado-panel .tp-stats {
+      margin-top: 10px; padding-top: 8px;
+      border-top: 1px solid #333; font-size: 11px; color: #999;
+      display: none;
+    }
+    #tornado-panel .tp-stats span { color: #ddd; }
+
+    /* ── Earthquake control panel ── */
+    #quake-panel {
+      position: fixed; top: 16px; right: 16px;
+      background: rgba(26,26,46,0.92); border: 1px solid #444;
+      border-radius: 10px; padding: 16px 20px;
+      width: 260px; z-index: 20;
+      font-size: 13px; color: #ccc;
+      display: none;
+      backdrop-filter: blur(6px);
+    }
+    #quake-panel h3 {
+      margin: 0 0 2px; font-size: 15px; color: #eee;
+    }
+    #quake-panel .qp-sub {
+      font-size: 11px; color: #888; margin-bottom: 12px;
+    }
+    #quake-panel label {
+      display: block; margin-bottom: 2px; color: #aaa; font-size: 12px;
+    }
+    #quake-panel input[type="range"] {
+      width: 100%; cursor: pointer; accent-color: #e6b800;
+      margin-bottom: 10px;
+    }
+    #quake-panel .qp-row { display: flex; gap: 8px; margin-bottom: 8px; }
+    #quake-panel button {
+      flex: 1; padding: 8px 0;
+      border: none; border-radius: 6px;
+      font-size: 13px; cursor: pointer;
+      transition: background 0.15s;
+    }
+    #quake-panel button:hover { filter: brightness(1.15); }
+    #quake-panel #spawn-quake-btn {
+      background: #b58900; color: #fff;
+    }
+    #quake-panel #stop-quake-btn {
+      background: #555; color: #ddd; display: none;
+    }
   </style>
 </head>
 <body>
@@ -92,12 +178,62 @@
           <input id="lon" type="number" step="any" value="-73.9857" placeholder="e.g. -73.9857" />
         </div>
       </div>
+      <label for="sim-mode">Simulation Mode</label>
+      <select id="sim-mode" style="width:100%;padding:8px 12px;margin-bottom:14px;background:#0d0d1a;border:1px solid #444;border-radius:6px;color:#eee;font-size:15px;">
+        <option value="tornado" selected>Tornado</option>
+        <option value="earthquake">Earthquake</option>
+      </select>
       <button id="go">Load Buildings</button>
     </div>
   </div>
   <div id="crosshair"></div>
   <div id="hud"></div>
   <div id="loading">Loading building data…</div>
+
+  <!-- Tornado Simulator Panel -->
+  <div id="tornado-panel">
+    <h3>Tornado Simulator</h3>
+    <p class="tp-sub">Press <kbd>T</kbd> to spawn · <kbd>X</kbd> to stop</p>
+
+    <label>
+      Strength: <span id="ef-badge" class="ef-badge" style="background:#ff4400;">EF3</span>
+      <span id="ef-desc" style="font-size:11px;color:#999;">Severe · 136–165 mph</span>
+    </label>
+    <input id="ef-slider" type="range" min="0" max="5" step="1" value="3" />
+
+    <label>Core Radius (from EF): <strong id="radius-val">—</strong> m</label>
+    <div class="tp-sub" style="margin-top:-6px;">Median path width: <strong id="width-val">—</strong> m</div>
+
+    <label>Move Speed: <strong id="speed-val">15</strong> m/s</label>
+    <input id="speed-slider" type="range" min="0" max="60" step="1" value="15" />
+
+    <div class="tp-row">
+      <button id="spawn-btn">Spawn Tornado (T)</button>
+      <button id="despawn-btn">Stop (X)</button>
+    </div>
+
+    <div class="tp-stats" id="tornado-stats">
+      Wind at center: <span id="ts-wind">—</span> mph<br/>
+      Buildings damaged: <span id="ts-damaged">0</span><br/>
+      Buildings destroyed: <span id="ts-destroyed">0</span>
+    </div>
+  </div>
+
+  <!-- Earthquake Simulator Panel -->
+  <div id="quake-panel">
+    <h3>Earthquake Simulator</h3>
+    <p class="qp-sub">Press <kbd>T</kbd> to start · <kbd>X</kbd> to stop</p>
+
+    <label>Magnitude: <strong id="mag-val">6.0</strong></label>
+    <input id="mag-slider" type="range" min="4.0" max="9.5" step="0.1" value="6.0" />
+
+    <label>Affected Radius (MMI ≥ IV): <strong id="eq-radius-val">—</strong></label>
+
+    <div class="qp-row">
+      <button id="spawn-quake-btn">Start Quake (T)</button>
+      <button id="stop-quake-btn">Stop (X)</button>
+    </div>
+  </div>
   <script type="module" src="./src/main.ts"></script>
 </body>
 </html>
