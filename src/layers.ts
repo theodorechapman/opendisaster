@@ -80,16 +80,18 @@ export function buildAllLayers(
 
   const sampler = new HeightSampler(data.elevation, centerLat, centerLon, mpd);
 
-  // Parks and water are painted onto the terrain mesh via vertex colors
+  // Extract geometry for canvas painting
   const parkPolys = extractPolygonsXZ(data.parks, centerLat, centerLon, mpd);
   const waterPolys = extractPolygonsXZ(data.water, centerLat, centerLon, mpd);
-  root.add(buildTerrain(data.elevation, centerLat, centerLon, mpd, sampler, parkPolys, waterPolys));
+  const roadLines = extractRoadLinesXZ(data.roads, centerLat, centerLon, mpd);
+  const railLines = extractRoadLinesXZ(data.railways, centerLat, centerLon, mpd);
+
+  // All ground features painted directly onto the terrain texture
+  root.add(buildTerrain(data.elevation, centerLat, centerLon, mpd, sampler, parkPolys, waterPolys, roadLines, railLines));
 
   root.add(buildBuildings(data.buildings, centerLat, centerLon, mpd, sampler));
-  root.add(buildRoads(data.roads, centerLat, centerLon, mpd, sampler));
   root.add(buildWater(data.water, centerLat, centerLon, mpd, sampler));
   root.add(buildTrees(data.trees, centerLat, centerLon, mpd, sampler));
-  root.add(buildRailways(data.railways, centerLat, centerLon, mpd, sampler));
   root.add(buildBarriers(data.barriers, centerLat, centerLon, mpd, sampler));
 
   return root;
@@ -148,6 +150,31 @@ function extractPolygonsXZ(fc: FeatureCollection, cLat: number, cLon: number, mp
   return result;
 }
 
+type RoadLine2D = { points: [number, number][]; width: number; isFootpath: boolean };
+
+const ROAD_WIDTHS: Record<string, number> = {
+  motorway: 14, trunk: 12, primary: 10, secondary: 8, tertiary: 7,
+  residential: 6, service: 4, unclassified: 6, living_street: 5,
+  pedestrian: 4, footway: 2, cycleway: 2, path: 1.5,
+};
+
+/** Extract road/rail linestrings with widths as Three.js XZ coords. */
+function extractRoadLinesXZ(fc: FeatureCollection, cLat: number, cLon: number, mpd: Proj): RoadLine2D[] {
+  const result: RoadLine2D[] = [];
+  for (const feature of fc.features) {
+    const coords = getLineCoords(feature.geometry);
+    if (!coords || coords.length < 2) continue;
+    const props = feature.properties;
+    const highway = strProp(props.highway) ?? strProp(props.railway) ?? "residential";
+    const lanesWidth = (numProp(props._lanes) ?? 0) * 3.5;
+    const width = numProp(props._width) ?? (lanesWidth > 0 ? lanesWidth : null) ?? ROAD_WIDTHS[highway] ?? 6;
+    const isFootpath = highway === "footway" || highway === "cycleway" || highway === "path";
+    const points: [number, number][] = coords.map((c) => toXZ(c, cLat, cLon, mpd));
+    result.push({ points, width, isFootpath });
+  }
+  return result;
+}
+
 /** Ray-casting point-in-polygon test in 2D (x, z). */
 function pointInPolygon(x: number, z: number, poly: Poly2D): boolean {
   let inside = false;
@@ -180,6 +207,8 @@ function buildTerrain(
   sampler: HeightSampler,
   parkPolys: Poly2D[],
   waterPolys: Poly2D[],
+  roadLines: RoadLine2D[],
+  railLines: RoadLine2D[],
 ): THREE.Mesh {
   const gs = elev.gridSize;
   const xMin = (elev.west - cLon) * mpd.lon;
@@ -189,17 +218,22 @@ function buildTerrain(
   const width = xMax - xMin;
   const depth = zMax - zMin;
 
-  // --- Paint park/water polygons onto a canvas texture ---
+  // Pixels per meter for converting world widths to canvas stroke widths
+  const pxPerMeterX = TEX_SIZE / width;
+  const pxPerMeterZ = TEX_SIZE / depth;
+  const pxPerMeter = (pxPerMeterX + pxPerMeterZ) / 2;
+
+  // --- Paint all ground features onto a canvas texture ---
   const canvas = document.createElement("canvas");
   canvas.width = TEX_SIZE;
   canvas.height = TEX_SIZE;
   const ctx = canvas.getContext("2d")!;
 
-  // Fill with terrain base color
-  ctx.fillStyle = "#556b2f";
+  // Fill with terrain base color (dark grass green)
+  ctx.fillStyle = "#2d5a1e";
   ctx.fillRect(0, 0, TEX_SIZE, TEX_SIZE);
 
-  // Map world XZ → canvas UV: u = (x - xMin) / width, v = (z - zMin) / depth
+  // Map world XZ → canvas pixels
   function worldToCanvas(worldX: number, worldZ: number): [number, number] {
     const u = (worldX - xMin) / width;
     const v = (worldZ - zMin) / depth;
@@ -222,9 +256,31 @@ function buildTerrain(
     }
   }
 
-  // Draw parks first, then water on top
+  // Paint all ground features: parks, water, roads, railways
   drawPolys(parkPolys, "#3d8b37");
   drawPolys(waterPolys, "#3388cc");
+
+  // Draw road/rail lines as thick stroked paths
+  function drawLines(lines: RoadLine2D[], color: string, fallbackColor?: string) {
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    for (const line of lines) {
+      if (line.points.length < 2) continue;
+      ctx.strokeStyle = (fallbackColor && line.isFootpath) ? fallbackColor : color;
+      ctx.lineWidth = line.width * pxPerMeter;
+      ctx.beginPath();
+      const [sx, sy] = worldToCanvas(line.points[0]![0], line.points[0]![1]);
+      ctx.moveTo(sx, sy);
+      for (let i = 1; i < line.points.length; i++) {
+        const [px, py] = worldToCanvas(line.points[i]![0], line.points[i]![1]);
+        ctx.lineTo(px, py);
+      }
+      ctx.stroke();
+    }
+  }
+
+  drawLines(railLines, "#666666");
+  drawLines(roadLines, "#444444", "#999988");
 
   const texture = new THREE.CanvasTexture(canvas);
   texture.flipY = false; // canvas y=0 is top, UV v=0 maps to zMin — keep them aligned
@@ -255,6 +311,9 @@ function buildTerrain(
   const mat = new THREE.MeshPhongMaterial({
     map: texture,
     flatShading: true,
+    polygonOffset: true,
+    polygonOffsetFactor: 1,
+    polygonOffsetUnits: 1,
   });
 
   const mesh = new THREE.Mesh(geo, mat);
@@ -311,47 +370,6 @@ function buildBuildings(fc: FeatureCollection, cLat: number, cLon: number, mpd: 
       mesh.receiveShadow = true;
       group.add(mesh);
     }
-  }
-  return group;
-}
-
-// ─── Roads (flat ribbons draped on terrain) ─────────────────────────────────
-
-const ROAD_WIDTHS: Record<string, number> = {
-  motorway: 14, trunk: 12, primary: 10, secondary: 8, tertiary: 7,
-  residential: 6, service: 4, unclassified: 6, living_street: 5,
-  pedestrian: 4, footway: 2, cycleway: 2, path: 1.5,
-};
-
-function buildRoads(fc: FeatureCollection, cLat: number, cLon: number, mpd: Proj, sampler: HeightSampler): THREE.Group {
-  const group = new THREE.Group();
-  group.name = "roads";
-
-  const roadMat = new THREE.MeshPhongMaterial({ color: 0x333333 });
-  const footpathMat = new THREE.MeshPhongMaterial({ color: 0x999988 });
-
-  for (const feature of fc.features) {
-    const coords = getLineCoords(feature.geometry);
-    if (!coords || coords.length < 2) continue;
-
-    const props = feature.properties;
-    const highway = strProp(props.highway) ?? "residential";
-    const lanesWidth = (numProp(props._lanes) ?? 0) * 3.5;
-    const width = numProp(props._width) ?? (lanesWidth > 0 ? lanesWidth : null) ?? ROAD_WIDTHS[highway] ?? 6;
-    const isFootpath = highway === "footway" || highway === "cycleway" || highway === "path";
-
-    const points = coords.map((c) => {
-      const [x, z] = toXZ(c, cLat, cLon, mpd);
-      const y = sampler.sample(x, z) + 0.1;
-      return new THREE.Vector3(x, y, z);
-    });
-
-    const ribbonGeo = buildRibbon(points, width);
-    if (!ribbonGeo) continue;
-
-    const mesh = new THREE.Mesh(ribbonGeo, isFootpath ? footpathMat : roadMat);
-    mesh.receiveShadow = true;
-    group.add(mesh);
   }
   return group;
 }
@@ -455,34 +473,6 @@ function addTree(group: THREE.Group, x: number, z: number, height: number, sampl
   canopy.scale.setScalar(scale);
   canopy.castShadow = true;
   group.add(canopy);
-}
-
-// ─── Railways (on terrain) ──────────────────────────────────────────────────
-
-function buildRailways(fc: FeatureCollection, cLat: number, cLon: number, mpd: Proj, sampler: HeightSampler): THREE.Group {
-  const group = new THREE.Group();
-  group.name = "railways";
-
-  const railMat = new THREE.MeshPhongMaterial({ color: 0x666666 });
-
-  for (const feature of fc.features) {
-    const coords = getLineCoords(feature.geometry);
-    if (!coords || coords.length < 2) continue;
-
-    const points = coords.map((c) => {
-      const [x, z] = toXZ(c, cLat, cLon, mpd);
-      const y = sampler.sample(x, z) + 0.08;
-      return new THREE.Vector3(x, y, z);
-    });
-
-    const ribbonGeo = buildRibbon(points, 3);
-    if (!ribbonGeo) continue;
-
-    const mesh = new THREE.Mesh(ribbonGeo, railMat);
-    mesh.receiveShadow = true;
-    group.add(mesh);
-  }
-  return group;
 }
 
 // ─── Barriers (walls on terrain) ────────────────────────────────────────────
