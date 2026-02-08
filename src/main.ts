@@ -2,7 +2,7 @@ import * as THREE from "three";
 import { WebGPURenderer } from "three/webgpu";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { fetchLayers } from "./tiles.ts";
-import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, resetCarsToBase, sceneGroupRef, roadLinesRef } from "./layers.ts";
+import { buildAllLayers, type HeightSampler, buildingRegistry, getTerrainHeight, terrainBoundsRef, terrainMeshRef, resetCarsToBase, sceneGroupRef, roadLinesRef } from "./layers.ts";
 import { FlyControls } from "./controls.ts";
 import { TornadoSimulator, EF_SCALE } from "./disasters/tornado.ts";
 import { EarthquakeSimulator } from "./disasters/earthquake.ts";
@@ -18,7 +18,7 @@ import { SteppedSimulation } from "./agents/SteppedSimulation.ts";
 import { ReplayRecorder } from "./replay/ReplayRecorder.ts";
 import { createAgentActionSystem, type Obstacle } from "./agents/AgentActionSystem.ts";
 import { createAgentDamageSystem } from "./agents/AgentDamageSystem.ts";
-import { startTestFire, type FireConfig } from "./scenarios/TestFire.ts";
+import { FireSimulator } from "./scenarios/TestFire.ts";
 import type { AgentConfig } from "./agents/types.ts";
 import { RoadGraph } from "./agents/RoadGraph.ts";
 import { Position } from "./core/Components.ts";
@@ -40,23 +40,17 @@ const loading = document.getElementById("loading")!;
 const hud = document.getElementById("hud")!;
 const info = document.getElementById("info")!;
 const stopSimBtn = document.getElementById("stop-sim-btn") as HTMLButtonElement;
+const exitSimBtn = document.getElementById("exit-sim-btn") as HTMLButtonElement;
 
-// Fire config panel elements
+// Fire panel elements
 const fireConfigPanel = document.getElementById("fire-config-panel")!;
-const fireXInput = document.getElementById("fire-x") as HTMLInputElement;
-const fireZInput = document.getElementById("fire-z") as HTMLInputElement;
 const fireSizeInput = document.getElementById("fire-size") as HTMLInputElement;
 const fireSpreadInput = document.getElementById("fire-spread") as HTMLInputElement;
-const fireXVal = document.getElementById("fire-x-val")!;
-const fireZVal = document.getElementById("fire-z-val")!;
 const fireSizeVal = document.getElementById("fire-size-val")!;
 const fireSpreadVal = document.getElementById("fire-spread-val")!;
-const fireStartBtn = document.getElementById("fire-start-btn") as HTMLButtonElement;
-const fireBackBtn = document.getElementById("fire-back-btn") as HTMLButtonElement;
+const fireSpawnBtn = document.getElementById("fire-spawn-btn") as HTMLButtonElement;
+const fireStopBtn = document.getElementById("fire-stop-btn") as HTMLButtonElement;
 
-// Live value updates for fire sliders
-fireXInput.addEventListener("input", () => { fireXVal.textContent = fireXInput.value; });
-fireZInput.addEventListener("input", () => { fireZVal.textContent = fireZInput.value; });
 fireSizeInput.addEventListener("input", () => { fireSizeVal.textContent = fireSizeInput.value; });
 fireSpreadInput.addEventListener("input", () => { fireSpreadVal.textContent = fireSpreadInput.value; });
 
@@ -174,6 +168,7 @@ window.addEventListener("resize", () => {
 const tornado = new TornadoSimulator(scene);
 const quake = new EarthquakeSimulator(scene);
 const flood = new FloodSimulator(scene);
+const fire = new FireSimulator(scene);
 const raycaster = new THREE.Raycaster();
 
 const EF_COLORS = ["#22cc22", "#cccc00", "#ff8800", "#ff4400", "#ff0000", "#880000"];
@@ -216,6 +211,18 @@ function updateFloodDisplay() {
 floodHeightSlider.addEventListener("input", updateFloodDisplay);
 updateFloodDisplay();
 
+function updateFireDisplay() {
+  const size = parseFloat(fireSizeInput.value);
+  const spread = parseInt(fireSpreadInput.value);
+  fireSizeVal.textContent = fireSizeInput.value;
+  fireSpreadVal.textContent = fireSpreadInput.value;
+  fire.setMaxRadius(size);
+  fire.setMaxFires(spread);
+}
+fireSizeInput.addEventListener("input", updateFireDisplay);
+fireSpreadInput.addEventListener("input", updateFireDisplay);
+updateFireDisplay();
+
 // --- Gradual storm atmosphere transition ---
 const clearSky = {
   bg: new THREE.Color(skyColor),
@@ -252,7 +259,7 @@ function updateAtmosphere(t: number) {
 }
 
 // Track active disaster for auto-despawn detection
-let activeDisasterType: "tornado" | "earthquake" | "flood" | null = null;
+let activeDisasterType: "tornado" | "earthquake" | "flood" | "fire" | null = null;
 let wasTornadoActive = false;
 let wasQuakeActive = false;
 
@@ -295,6 +302,24 @@ function spawnFloodAtCrosshair() {
   }
 }
 
+function spawnFireAtCrosshair() {
+  const terrain = terrainMeshRef ?? sceneGroup?.getObjectByName("terrain");
+  if (!terrain) return;
+  raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const hits = raycaster.intersectObject(terrain);
+  if (hits.length > 0) {
+    fire.spawn(hits[0]!.point);
+    fireSpawnBtn.style.display = "none";
+    fireStopBtn.style.display = "block";
+  } else {
+    const fallback = new THREE.Vector3(camera.position.x, 0, camera.position.z);
+    fallback.y = getTerrainHeight(fallback.x, fallback.z);
+    fire.spawn(fallback);
+    fireSpawnBtn.style.display = "none";
+    fireStopBtn.style.display = "block";
+  }
+}
+
 function stopTornado() {
   tornado.despawn();
   stormTarget = 0;
@@ -315,12 +340,20 @@ function stopFlood() {
   stopFloodBtn.style.display = "none";
 }
 
+function stopFire() {
+  fire.stop();
+  fireSpawnBtn.style.display = "block";
+  fireStopBtn.style.display = "none";
+}
+
 spawnBtn.addEventListener("click", spawnTornadoAtCrosshair);
 despawnBtn.addEventListener("click", stopTornado);
 spawnQuakeBtn.addEventListener("click", spawnQuakeAtCrosshair);
 stopQuakeBtn.addEventListener("click", stopQuake);
 spawnFloodBtn.addEventListener("click", spawnFloodAtCrosshair);
 stopFloodBtn.addEventListener("click", stopFlood);
+fireSpawnBtn.addEventListener("click", spawnFireAtCrosshair);
+fireStopBtn.addEventListener("click", stopFire);
 
 window.addEventListener("keydown", (e) => {
   if (landingRoot && landingRoot.firstChild) return; // landing still visible
@@ -330,6 +363,9 @@ window.addEventListener("keydown", (e) => {
   } else if (activeDisasterType === "earthquake") {
     if (e.code === "KeyT") spawnQuakeAtCrosshair();
     if (e.code === "KeyX") stopQuake();
+  } else if (activeDisasterType === "fire") {
+    if (e.code === "KeyT") spawnFireAtCrosshair();
+    if (e.code === "KeyX") stopFire();
   } else if (activeDisasterType === "flood") {
     if (e.code === "KeyT") spawnFloodAtCrosshair();
     if (e.code === "KeyX") stopFlood();
@@ -358,7 +394,7 @@ interface ScenarioDefinition {
   description: string;
   icon: string;
   available: boolean;
-  launch: (scene: THREE.Scene, eventBus: EventBus, sampler: HeightSampler, fireConfig?: FireConfig) => void;
+  launch: (scene: THREE.Scene, eventBus: EventBus, sampler: HeightSampler) => void;
 }
 
 const scenarios: ScenarioDefinition[] = [
@@ -368,7 +404,14 @@ const scenarios: ScenarioDefinition[] = [
     description: "Building fire with smoke and flames",
     icon: "\uD83D\uDD25",
     available: true,
-    launch: (sc, eb, s, fireConfig?: FireConfig) => startTestFire(sc, eb, s, fireConfig),
+    launch: (_sc, eb, sampler) => {
+      activeDisasterType = "fire";
+      fire.setContext(eb, sampler);
+      fireConfigPanel.style.display = "block";
+      tornadoPanel.style.display = "none";
+      quakePanel.style.display = "none";
+      floodPanel.style.display = "none";
+    },
   },
   {
     id: "tornado",
@@ -381,6 +424,7 @@ const scenarios: ScenarioDefinition[] = [
       tornadoPanel.style.display = "block";
       quakePanel.style.display = "none";
       floodPanel.style.display = "none";
+      fireConfigPanel.style.display = "none";
     },
   },
   {
@@ -394,6 +438,7 @@ const scenarios: ScenarioDefinition[] = [
       quakePanel.style.display = "block";
       tornadoPanel.style.display = "none";
       floodPanel.style.display = "none";
+      fireConfigPanel.style.display = "none";
     },
   },
   {
@@ -408,6 +453,7 @@ const scenarios: ScenarioDefinition[] = [
       floodPanel.style.display = "block";
       tornadoPanel.style.display = "none";
       quakePanel.style.display = "none";
+      fireConfigPanel.style.display = "none";
     },
   },
   {
@@ -594,7 +640,7 @@ async function initExploration(sceneGrp: THREE.Group, sceneSize: number, sampler
  * Phase B: Spawn agents, register systems, start simulation,
  * then trigger the chosen scenario.
  */
-function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
+function launchScenario(scenarioId: string) {
   if (!explorationReady || !world || !agentManager || !heightSampler || !sharedEventBus) {
     console.error("[Agents] Cannot launch scenario — exploration not ready");
     return;
@@ -668,7 +714,7 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
   steppedSim.start();
 
   // 5. Launch the chosen scenario
-  scenario.launch(scene, sharedEventBus, sampler, fireConfig);
+  scenario.launch(scene, sharedEventBus, sampler);
 
   // 6. Hide scenario panel, show stop button
   scenarioPanel.classList.remove("visible");
@@ -695,37 +741,12 @@ function buildScenarioPanel() {
     `;
     if (s.available) {
       card.addEventListener("click", () => {
-        if (s.id === "fire") {
-          scenarioPanel.classList.remove("visible");
-          fireConfigPanel.classList.add("visible");
-        } else if (s.id === "tornado" || s.id === "earthquake") {
-          // Launch scenario immediately (agents + disaster panels)
-          launchScenario(s.id);
-        } else {
-          launchScenario(s.id);
-        }
+        launchScenario(s.id);
       });
     }
     scenarioPanel.appendChild(card);
   }
 }
-
-// --- Fire config panel buttons ---
-fireStartBtn.addEventListener("click", () => {
-  const config: FireConfig = {
-    offsetX: parseInt(fireXInput.value),
-    offsetZ: parseInt(fireZInput.value),
-    maxRadius: parseInt(fireSizeInput.value),
-    maxFires: parseInt(fireSpreadInput.value),
-  };
-  fireConfigPanel.classList.remove("visible");
-  launchScenario("fire", config);
-});
-
-fireBackBtn.addEventListener("click", () => {
-  fireConfigPanel.classList.remove("visible");
-  scenarioPanel.classList.add("visible");
-});
 
 // --- Stop simulation button ---
 stopSimBtn.addEventListener("click", async () => {
@@ -752,6 +773,9 @@ stopSimBtn.addEventListener("click", async () => {
     flood.despawn();
     stopFlood();
     floodPanel.style.display = "none";
+  } else if (activeDisasterType === "fire") {
+    stopFire();
+    fireConfigPanel.style.display = "none";
   }
   activeDisasterType = null;
   flood.setEventBus(null);
@@ -763,12 +787,83 @@ stopSimBtn.addEventListener("click", async () => {
   info.textContent = "Simulation stopped. Replay saved.";
 });
 
+exitSimBtn.addEventListener("click", async () => {
+  if (replayCaptureSystem) {
+    replayCaptureSystem.dispose();
+    replayCaptureSystem = null;
+  }
+  if (steppedSim) {
+    await steppedSim.stop();
+    steppedSim = null;
+  }
+
+  // Clean up any active disaster
+  if (activeDisasterType === "tornado") {
+    tornado.reset();
+    stopTornado();
+    tornadoPanel.style.display = "none";
+  } else if (activeDisasterType === "earthquake") {
+    quake.despawn();
+    stopQuake();
+    quakePanel.style.display = "none";
+  } else if (activeDisasterType === "flood") {
+    flood.despawn();
+    stopFlood();
+    floodPanel.style.display = "none";
+  } else if (activeDisasterType === "fire") {
+    stopFire();
+    fireConfigPanel.style.display = "none";
+  }
+  activeDisasterType = null;
+  flood.setEventBus(null);
+  stormTarget = 0;
+
+  // Remove scene group
+  if (sceneGroup) {
+    scene.remove(sceneGroup);
+    sceneGroup.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) {
+        obj.geometry.dispose();
+        if (Array.isArray(obj.material)) {
+          obj.material.forEach((m) => m.dispose());
+        } else {
+          (obj.material as THREE.Material).dispose();
+        }
+      }
+    });
+    sceneGroup = null;
+  }
+
+  stopSimBtn.style.display = "none";
+  exitSimBtn.style.display = "none";
+  info.textContent = "Exited simulation.";
+  mountLandingOverlay();
+});
+
 // --- Load all layers ---
 let sceneGroup: THREE.Group | null = null;
 const landingRoot = document.getElementById("landing-root")!;
 let reactRoot: ReturnType<typeof createRoot> | null = null;
 
 let landingEnableAgents = true;
+
+function mountLandingOverlay() {
+  if (!reactRoot) {
+    reactRoot = createRoot(landingRoot);
+  }
+  landingRoot.style.display = "block";
+  reactRoot.render(
+    React.createElement(LandingOverlay, {
+      defaultLat: 40.7484,
+      defaultLon: -73.9857,
+      onLookup: doLookup,
+      onLaunch: (lat: number, lon: number, size: number, scenario: string, enableAgents: boolean) => {
+        landingAddress = "";
+        void loadScene(lat, lon, size, scenario, enableAgents);
+      },
+    })
+  );
+}
 
 async function loadScene(lat: number, lon: number, size: number, scenarioId: string, enableAgents: boolean = true) {
   landingEnableAgents = enableAgents;
@@ -792,6 +887,7 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
     steppedSim = null;
   }
   stopSimBtn.style.display = "none";
+  exitSimBtn.style.display = "none";
   world = null;
   agentManager = null;
   heightSampler = null;
@@ -802,12 +898,13 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
   sharedSceneSize = 0;
   sharedRoadGraph = null;
   scenarioPanel.classList.remove("visible");
-  fireConfigPanel.classList.remove("visible");
+  fireConfigPanel.style.display = "none";
   tornadoPanel.style.display = "none";
   quakePanel.style.display = "none";
   floodPanel.style.display = "none";
   activeDisasterType = null;
   flood.setEventBus(null);
+  exitSimBtn.style.display = "none";
 
   // Store for later use by agent system
   landingLat = lat;
@@ -833,13 +930,14 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
       });
     }
 
-    // Reset tornado state from previous session
-    tornado.reset();
-    stopTornado();
-    quake.despawn();
-    stopQuake();
-    flood.despawn();
-    stopFlood();
+  // Reset tornado state from previous session
+  tornado.reset();
+  stopTornado();
+  quake.despawn();
+  stopQuake();
+  flood.despawn();
+  stopFlood();
+  stopFire();
 
     const buildResult = buildAllLayers(layers, lat, lon, carTemplate);
     sceneGroup = buildResult.group;
@@ -868,6 +966,7 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
       }
       info.textContent = "Disaster active (agents disabled)";
     }
+    exitSimBtn.style.display = "block";
   } catch (err) {
     console.error("Failed to load:", err);
     alert("Failed to load data. Check console for details.");
@@ -877,18 +976,7 @@ async function loadScene(lat: number, lon: number, size: number, scenarioId: str
 }
 
 // --- Mount React landing overlay ---
-reactRoot = createRoot(landingRoot);
-reactRoot.render(
-  React.createElement(LandingOverlay, {
-    defaultLat: 40.7484,
-    defaultLon: -73.9857,
-    onLookup: doLookup,
-    onLaunch: (lat: number, lon: number, size: number, scenario: string, enableAgents: boolean) => {
-      landingAddress = "";
-      void loadScene(lat, lon, size, scenario, enableAgents);
-    },
-  })
-);
+mountLandingOverlay();
 
 // --- Render loop ---
 let lastTime = performance.now();
@@ -921,6 +1009,8 @@ function animate() {
   tornado.update(dt, buildingRegistry);
   quake.update(dt, buildingRegistry);
   flood.update(dt);
+  fire.setBillboardQuaternion(camera.quaternion);
+  fire.update(dt);
   if (flood.active) {
     floodRadiusVal.textContent = `${Math.round(flood.affectedRadiusMeters)} m`;
   }
