@@ -568,6 +568,9 @@ Bun.serve({
       const html = (await htmlFile.text()).replace("./src/main.ts", "/dist/main.js");
       return new Response(html, { headers: { "Content-Type": "text/html" } });
     }
+    if (url.pathname === "/favicon.ico") {
+      return new Response(null, { status: 204 });
+    }
 
     // --- Static: bundled JS ---
     if (url.pathname.startsWith("/dist/")) {

@@ -133,7 +133,22 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const skyColor = 0x87ceeb;
 scene.background = new THREE.Color(skyColor);
-// No fog
+
+// Sunny, partly-cloudy skybox (equirectangular panorama)
+const skyLoader = new THREE.TextureLoader();
+skyLoader.load(
+  "/skybox/kloppenheim_05_puresky.jpg",
+  (tex) => {
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    scene.background = tex;
+    scene.environment = tex;
+  },
+  undefined,
+  (err) => {
+    console.warn("[Skybox] Failed to load sky texture:", err);
+  },
+);
 
 const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.5, 1000);
 camera.position.set(0, 80, 200);
