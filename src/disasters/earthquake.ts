@@ -52,6 +52,18 @@ export class EarthquakeSimulator {
     ttl: number;
     grounded?: boolean;
   }[] = [];
+  /** Buildings currently collapsing progressively. */
+  private collapsing: {
+    building: BuildingRecord;
+    progress: number; // 0→1
+    cx: number;
+    cz: number;
+    baseY: number;
+    height: number;
+    halfX: number;
+    halfZ: number;
+    nextFragment: number; // progress threshold for next fragment burst
+  }[] = [];
   private debrisGeos: THREE.BufferGeometry[];
   private concreteMat: THREE.MeshPhongMaterial;
   private glassMat: THREE.MeshPhongMaterial;
@@ -124,7 +136,10 @@ export class EarthquakeSimulator {
       this.updateCars(dt);
     }
 
-    // Debris keeps simulating after quake ends until settled/expired
+    // Progressive collapses + debris keep running after quake ends
+    if (this.collapsing.length > 0) {
+      this.updateCollapses(dt);
+    }
     if (this.debris.length > 0) {
       this.updateDebris(dt, buildings);
     }
@@ -292,6 +307,7 @@ export class EarthquakeSimulator {
       const damageIntensity = Math.pow((mmi - 6.0) / 4.0, 1.4);
       const damageRate = damageIntensity * 0.10 / b.structuralStrength;
       b.damageLevel = Math.min(1, b.damageLevel + damageRate * dt);
+      this.applyDamage(b);
 
       const magFactor = Math.min(1.0, Math.max(0, (this.magnitude - 5.5) / 2.0));
       const quakeFade = 1 - smoothstep(0.35, 1.0, this.time / this.duration);
@@ -306,16 +322,16 @@ export class EarthquakeSimulator {
         const sideY = bboxLive.min.y + (bboxLive.max.y - bboxLive.min.y) * (0.70 + Math.random() * 0.25);
         const count = Math.max(1, Math.floor((3 + 3 * magFactor) * quakeFade));
 
-        // Spawn debris from building sides (not from the center)
+        // Spawn debris from actual building AABB edges
         const side = Math.random() < 0.5 ? "x" : "z";
         const sign = Math.random() < 0.5 ? -1 : 1;
-        const edgeOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.6 * sign;
+        const edgeOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.5 * sign;
 
-        const dx = side === "x" ? edgeOffset : (Math.random() - 0.5) * sizeLive.x * 0.5;
-        const dz = side === "z" ? edgeOffset : (Math.random() - 0.5) * sizeLive.z * 0.5;
+        const dx = side === "x" ? edgeOffset : (Math.random() - 0.5) * sizeLive.x * 0.8;
+        const dz = side === "z" ? edgeOffset : (Math.random() - 0.5) * sizeLive.z * 0.8;
 
         const outward = side === "x" ? { nx: sign, nz: 0 } : { nx: 0, nz: sign };
-        const minOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.5 + 1.5;
+        const minOffset = 0.3; // spawn just outside the face
         // Early quake: more glass; later: more concrete
         const glassBias = THREE.MathUtils.clamp(0.85 * quakeFade + 0.05, 0.1, 0.9);
         const glassCount = Math.max(1, Math.floor(count * glassBias));
@@ -331,11 +347,11 @@ export class EarthquakeSimulator {
       if (this.magnitude >= 6.5 && mmi >= 6.5 && b.damageLevel >= 0.6 && Math.random() < 0.01 * damageIntensity) {
         const side = Math.random() < 0.5 ? "x" : "z";
         const sign = Math.random() < 0.5 ? -1 : 1;
-        const edgeOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.6 * sign;
-        const dx = side === "x" ? edgeOffset : (Math.random() - 0.5) * sizeLive.x * 0.5;
-        const dz = side === "z" ? edgeOffset : (Math.random() - 0.5) * sizeLive.z * 0.5;
+        const edgeOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.5 * sign;
+        const dx = side === "x" ? edgeOffset : (Math.random() - 0.5) * sizeLive.x * 0.8;
+        const dz = side === "z" ? edgeOffset : (Math.random() - 0.5) * sizeLive.z * 0.8;
         const outward = side === "x" ? { nx: sign, nz: 0 } : { nx: 0, nz: sign };
-        const minOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.6 + 2.0;
+        const minOffset = 0.5;
         const sideY = bboxLive.min.y + (bboxLive.max.y - bboxLive.min.y) * (0.5 + Math.random() * 0.3);
         this.spawnChunkDebris(centerLive.x + dx, centerLive.z + dz, sideY, this.concreteMat, outward, minOffset);
       }
@@ -377,25 +393,26 @@ export class EarthquakeSimulator {
         b.mesh.position.y += (groundBaseY - bboxNow.min.y);
       }
 
-      // Only very large quakes collapse some tall buildings
-      if (this.magnitude >= 8.0 && mmi >= 8.0) {
-        const tiltMag = Math.abs(b.mesh.rotation.x) + Math.abs(b.mesh.rotation.z);
-        const tiltBoost = 1 + Math.min(2.0, tiltMag * 3.0);
-        const magBoost = this.magnitude >= 8.5 ? 1.8 : 1.0;
-        if (b.height >= 30 && prev < 0.95 && b.damageLevel >= 0.95 && Math.random() < 0.01 * tiltBoost * magBoost) {
-          b.destroyed = true;
-          this.spawnRubble(centerLive.x, centerLive.z, 16);
-          this.spawnCollapseChunks(centerLive.x, centerLive.z, bboxLive.min.y + 0.2, 6);
-          // Debris from building sides only
-          const side = Math.random() < 0.5 ? "x" : "z";
-          const sign = Math.random() < 0.5 ? -1 : 1;
-          const edgeOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.55 * sign;
-          const dx = side === "x" ? edgeOffset : (Math.random() - 0.5) * sizeLive.x * 0.5;
-          const dz = side === "z" ? edgeOffset : (Math.random() - 0.5) * sizeLive.z * 0.5;
-          const outward = side === "x" ? { nx: sign, nz: 0 } : { nx: 0, nz: sign };
-          const minOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.5 + 1.5;
-          this.spawnDebrisBurst(centerLive.x + dx, centerLive.z + dz, bboxLive.min.y + (bboxLive.max.y - bboxLive.min.y) * 0.4, 10, this.concreteMat, outward, minOffset);
-        }
+      // Begin progressive collapse when damage is high enough
+      // M6.5+: buildings with 85%+ damage start collapsing
+      // M7.5+: 75%+ damage; M8.0+: taller buildings at 70%+
+      const collapseThreshold = this.magnitude >= 8.0 ? 0.70
+        : this.magnitude >= 7.5 ? 0.75
+        : this.magnitude >= 6.5 ? 0.85
+        : 1.1; // never for < M6.5
+      const alreadyCollapsing = this.collapsing.some((c) => c.building === b);
+      if (!alreadyCollapsing && b.damageLevel >= collapseThreshold && mmi >= 6.5 && Math.random() < 0.08 * damageIntensity) {
+        this.collapsing.push({
+          building: b,
+          progress: 0,
+          cx: centerLive.x,
+          cz: centerLive.z,
+          baseY: b.baseY,
+          height: b.height,
+          halfX: b.halfX,
+          halfZ: b.halfZ,
+          nextFragment: 0.05,
+        });
       }
 
       // Strong quakes: tall buildings shower glass and some concrete
@@ -404,11 +421,11 @@ export class EarthquakeSimulator {
         if (Math.random() < showerChance) {
           const side = Math.random() < 0.5 ? "x" : "z";
           const sign = Math.random() < 0.5 ? -1 : 1;
-          const edgeOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.55 * sign;
-          const dx = side === "x" ? edgeOffset : (Math.random() - 0.5) * sizeLive.x * 0.5;
-          const dz = side === "z" ? edgeOffset : (Math.random() - 0.5) * sizeLive.z * 0.5;
+          const edgeOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.5 * sign;
+          const dx = side === "x" ? edgeOffset : (Math.random() - 0.5) * sizeLive.x * 0.8;
+          const dz = side === "z" ? edgeOffset : (Math.random() - 0.5) * sizeLive.z * 0.8;
           const outward = side === "x" ? { nx: sign, nz: 0 } : { nx: 0, nz: sign };
-          const minOffset = (side === "x" ? sizeLive.x : sizeLive.z) * 0.5 + 1.5;
+          const minOffset = 0.3;
           const sideY = bboxLive.min.y + (bboxLive.max.y - bboxLive.min.y) * (0.75 + Math.random() * 0.2);
           this.spawnDebrisBurst(centerLive.x + dx, centerLive.z + dz, sideY, Math.max(3, Math.floor((8 + 6 * magFactor) * quakeFade)), this.glassMat, outward, minOffset);
           if (Math.random() < 0.35) {
@@ -422,20 +439,58 @@ export class EarthquakeSimulator {
 
   private applyDamage(b: BuildingRecord) {
     const d = b.damageLevel;
-    const mat = b.mesh.material as THREE.MeshPhongMaterial;
+    const matRaw = b.mesh.material;
+    const mats = Array.isArray(matRaw) ? matRaw : [matRaw];
+    // Apply damage tint to all phong materials that have a settable color
+    for (const m of mats) {
+      if (!m || !('color' in m) || !(m as any).color || typeof (m as any).color.copy !== 'function') continue;
+      const col = (m as THREE.MeshPhongMaterial).color;
+      const rubble = new THREE.Color(0x333333);
+      const dmgTint = new THREE.Color(0x665544);
 
-    const rubble = new THREE.Color(0x333333);
-    const dmgTint = new THREE.Color(0x665544);
-
-    if (d < 0.3) {
-      mat.color.copy(b.originalColor).lerp(dmgTint, d * 2.5);
-    } else if (d < 0.65) {
-      mat.color.lerpColors(dmgTint, rubble, (d - 0.3) / 0.35);
-    } else {
-      mat.color.copy(rubble);
+      if (d < 0.3) {
+        col.copy(b.originalColor).lerp(dmgTint, d * 2.5);
+      } else if (d < 0.65) {
+        col.lerpColors(dmgTint, rubble, (d - 0.3) / 0.35);
+      } else {
+        col.copy(rubble);
+      }
     }
+  }
 
-    // No vertical sinking; damage is expressed via tilt and debris.
+  private updateCollapses(dt: number) {
+    for (let i = this.collapsing.length - 1; i >= 0; i--) {
+      const c = this.collapsing[i]!;
+      const b = c.building;
+      // Collapse over ~3 seconds, accelerating
+      const speed = 0.15 + c.progress * 0.5;
+      c.progress = Math.min(1, c.progress + speed * dt);
+
+      // Sink building straight down into the ground (no scale — avoids pivot issues)
+      const sinkAmount = c.progress * c.height;
+      b.mesh.position.y = c.baseY - sinkAmount;
+
+      // Spawn a single large chunk at ~33% and ~66% progress
+      if (c.progress >= c.nextFragment) {
+        c.nextFragment += 0.5;
+        const frontY = c.baseY + c.height * (1 - c.progress);
+        const side = Math.floor(Math.random() * 4);
+        const isX = side < 2;
+        const sign = (side % 2 === 0) ? 1 : -1;
+        const ex = isX ? c.halfX * sign : (Math.random() - 0.5) * c.halfX;
+        const ez = isX ? (Math.random() - 0.5) * c.halfZ : c.halfZ * sign;
+        const outward = isX ? { nx: sign, nz: 0 } : { nx: 0, nz: sign };
+        this.spawnChunkDebris(c.cx + ex, c.cz + ez, frontY, this.concreteMat, outward, 0.3);
+      }
+
+      // Collapse complete
+      if (c.progress >= 1) {
+        b.destroyed = true;
+        b.mesh.visible = false;
+        this.spawnCollapseChunks(c.cx, c.cz, c.baseY + 0.2, 2 + Math.floor(c.height / 20));
+        this.collapsing.splice(i, 1);
+      }
+    }
   }
 
   private spawnRubble(x: number, z: number, count: number) {
@@ -483,12 +538,12 @@ export class EarthquakeSimulator {
         ? (Math.random() < 0.6 ? this.debrisGeos[0]! : this.debrisGeos[1]!)
         : this.debrisGeos[2 + (i % (this.debrisGeos.length - 2))]!;
       const mesh = new THREE.Mesh(geo, mat);
-      const outX = outward ? outward.nx * (minOffset + 2 + Math.random() * 4) : 0;
-      const outZ = outward ? outward.nz * (minOffset + 2 + Math.random() * 4) : 0;
+      const outX = outward ? outward.nx * (minOffset + 0.2 + Math.random() * 0.6) : 0;
+      const outZ = outward ? outward.nz * (minOffset + 0.2 + Math.random() * 0.6) : 0;
       mesh.position.set(
-        x + outX + (Math.random() - 0.5) * 1.5,
+        x + outX + (Math.random() - 0.5) * 0.8,
         y + (Math.random() - 0.5) * 0.4,
-        z + outZ + (Math.random() - 0.5) * 1.5,
+        z + outZ + (Math.random() - 0.5) * 0.8,
       );
       if (isGlass) {
         mesh.rotation.set(
@@ -615,12 +670,12 @@ export class EarthquakeSimulator {
     const geoIdx = 3 + Math.floor(Math.random() * 2); // chunk/wedge
     const geo = this.debrisGeos[geoIdx]!;
     const mesh = new THREE.Mesh(geo, mat);
-    const outX = outward ? outward.nx * (minOffset + 2 + Math.random() * 4) : 0;
-    const outZ = outward ? outward.nz * (minOffset + 2 + Math.random() * 4) : 0;
+    const outX = outward ? outward.nx * (minOffset + 0.3 + Math.random() * 0.8) : 0;
+    const outZ = outward ? outward.nz * (minOffset + 0.3 + Math.random() * 0.8) : 0;
     mesh.position.set(
-      x + outX + (Math.random() - 0.5) * 1.0,
+      x + outX + (Math.random() - 0.5) * 0.6,
       y + (Math.random() - 0.5) * 0.3,
-      z + outZ + (Math.random() - 0.5) * 1.0,
+      z + outZ + (Math.random() - 0.5) * 0.6,
     );
     mesh.rotation.set(Math.random() * Math.PI, Math.random() * Math.PI, Math.random() * Math.PI);
     mesh.scale.setScalar(1.0 + Math.random() * 1.2);
@@ -656,26 +711,58 @@ export class EarthquakeSimulator {
       const groundY = getTerrainHeight(d.mesh.position.x, d.mesh.position.z) + 0.05;
       const isSettled = d.velocity.lengthSq() < 0.0005 && d.mesh.position.y <= groundY + 0.02;
 
-      // Building collision (push out + damp)
+      // Building AABB collision (push out + damp)
       if (buildings && !isSettled) {
+        const px = d.mesh.position.x;
+        const py = d.mesh.position.y;
+        const pz = d.mesh.position.z;
         for (const b of buildings) {
           if (b.destroyed) continue;
-          const bx = b.centerX;
-          const bz = b.centerZ;
-          const dx = d.mesh.position.x - bx;
-          const dz = d.mesh.position.z - bz;
-          const dist = Math.hypot(dx, dz);
-          const bRadius = b.width * 0.6;
           const byMin = b.baseY;
           const byMax = b.baseY + b.height;
-          if (dist < bRadius + 0.8 && d.mesh.position.y >= byMin && d.mesh.position.y <= byMax + 0.5) {
-            const nx = dx / Math.max(dist, 0.001);
-            const nz = dz / Math.max(dist, 0.001);
-            d.mesh.position.x = bx + nx * (bRadius + 0.9);
-            d.mesh.position.z = bz + nz * (bRadius + 0.9);
-            d.velocity.x *= -0.2;
-            d.velocity.z *= -0.2;
+          if (py < byMin || py > byMax + 0.5) continue;
+          const hx = b.halfX + 0.4; // small margin
+          const hz = b.halfZ + 0.4;
+          const dx = px - b.centerX;
+          const dz = pz - b.centerZ;
+          if (Math.abs(dx) < hx && Math.abs(dz) < hz) {
+            // Inside AABB — push out along shortest penetration axis
+            const overlapX = hx - Math.abs(dx);
+            const overlapZ = hz - Math.abs(dz);
+            if (overlapX < overlapZ) {
+              const sign = dx >= 0 ? 1 : -1;
+              d.mesh.position.x = b.centerX + sign * hx;
+              d.velocity.x *= -0.25;
+              d.velocity.z *= 0.7;
+            } else {
+              const sign = dz >= 0 ? 1 : -1;
+              d.mesh.position.z = b.centerZ + sign * hz;
+              d.velocity.z *= -0.25;
+              d.velocity.x *= 0.7;
+            }
             d.velocity.y *= 0.6;
+            break;
+          }
+        }
+        // Car AABB collision
+        for (const car of carRegistry) {
+          if (car.uprooted) continue;
+          const cdx = px - car.x;
+          const cdz = pz - car.z;
+          // Cars are roughly 2m x 4.5m
+          const chx = 1.2, chz = 2.5;
+          const cy = car.baseY;
+          if (py >= cy && py <= cy + 1.8 && Math.abs(cdx) < chx && Math.abs(cdz) < chz) {
+            const ox = chx - Math.abs(cdx);
+            const oz = chz - Math.abs(cdz);
+            if (ox < oz) {
+              d.mesh.position.x = car.x + (cdx >= 0 ? chx : -chx);
+              d.velocity.x *= -0.3;
+            } else {
+              d.mesh.position.z = car.z + (cdz >= 0 ? chz : -chz);
+              d.velocity.z *= -0.3;
+            }
+            d.velocity.y *= 0.5;
             break;
           }
         }

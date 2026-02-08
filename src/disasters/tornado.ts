@@ -11,7 +11,7 @@
  */
 
 import * as THREE from "three";
-import { SpriteNodeMaterial, MeshBasicNodeMaterial } from "three/webgpu";
+import { SpriteNodeMaterial, MeshBasicNodeMaterial, WebGPURenderer } from "three/webgpu";
 import {
   uniform, attribute,
   float, vec2, vec3, vec4,
@@ -29,6 +29,7 @@ import {
   treeRegistry,
   carRegistry,
 } from "../layers.ts";
+import * as GPU from "./tornadoCompute.ts";
 
 // ─── Enhanced Fujita Scale ──────────────────────────────────────────────────
 
@@ -220,6 +221,19 @@ export class TornadoSimulator {
   private rubbleMat!: THREE.MeshPhongMaterial;
   private stumpMat!: THREE.MeshPhongMaterial;
 
+  /* ── building collapse queue ── */
+  private collapsing: {
+    building: BuildingRecord;
+    progress: number;
+    cx: number;
+    cz: number;
+    baseY: number;
+    height: number;
+    halfX: number;
+    halfZ: number;
+    nextFragment: number;
+  }[] = [];
+
   /* ── timing ── */
   private time = 0;
   private lastDirtSpawn = 0;
@@ -228,8 +242,11 @@ export class TornadoSimulator {
   // Constructor
   // ─────────────────────────────────────────────────────────────────────────
 
-  constructor(scene: THREE.Scene) {
+  private renderer: WebGPURenderer;
+
+  constructor(scene: THREE.Scene, renderer: WebGPURenderer) {
     this.scene = scene;
+    this.renderer = renderer;
 
     this.tornadoGroup = new THREE.Group();
     this.tornadoGroup.name = "tornado";
@@ -374,20 +391,48 @@ export class TornadoSimulator {
     this.despawn();
     // Remove ALL remaining debris (including grounded)
     while (this.debris.length > 0) this.removeDebris(0);
+    this.collapsing.length = 0;
     this.buildingsDamaged = 0;
     this.buildingsDestroyed = 0;
   }
 
-  /** Main tick. */
+  /** Main tick — dispatches GPU compute shaders, then runs CPU-side mesh work. */
   update(dt: number, buildings: BuildingRecord[]) {
+    // Collapses keep running even after tornado despawns
+    this.updateCollapses(dt);
+
     if (!this.active) return;
     this.time += dt;
     this.updateMovement(dt);
     this.updateFunnel(dt);
+
+    // ── GPU compute: funnel particles only (12k particles, too heavy for CPU) ──
+    GPU.syncUniforms({
+      position: this.position,
+      maxWindSpeed: this.maxWindSpeed,
+      coreRadius: this.coreRadius,
+      outerRadius: this.outerRadius,
+      heading: this.heading,
+      translationSpeed: this.translationSpeed,
+      time: this.time,
+      dt,
+      bendDir: this.bendDir,
+      bendStrength: this.bendStrength,
+      efRating: this.efRating,
+      active: this.active,
+      buildingCount: 0,
+      debrisCount: 0,
+      leanDir: this.leanDir,
+      leanStrength: this.leanStrength,
+    });
+    this.renderer.compute(GPU.computeFunnelParticles);
+
+    // ── CPU-side simulation ──
+    this.updateBuildingMeshes(dt, buildings);
+    this.updateDebris(dt, buildings);
     this.updateTrees();
     this.updateCars();
-    this.updateBuildings(dt, buildings);
-    this.updateDebris(dt, buildings);
+
     // Spawn dirt chunks from the earth being ripped up
     if (this.time - this.lastDirtSpawn > 0.25) {
       this.spawnDirtDebris();
@@ -478,13 +523,11 @@ export class TornadoSimulator {
     // Use a small quad as base geometry for each particle (replaces GL_POINTS)
     const quadGeo = new THREE.PlaneGeometry(1, 1);
 
-    // Per-instance attributes
-    const positionAttr = new THREE.InstancedBufferAttribute(new Float32Array(FUNNEL_PARTICLES * 3), 3);
+    // Per-instance attributes — positions come from GPU compute storage buffer
     const pSizeAttr    = new THREE.InstancedBufferAttribute(new Float32Array(FUNNEL_PARTICLES), 1);
     const pAlphaAttr   = new THREE.InstancedBufferAttribute(new Float32Array(FUNNEL_PARTICLES), 1);
     const pColorAttr   = new THREE.InstancedBufferAttribute(new Float32Array(FUNNEL_PARTICLES * 3), 3);
 
-    quadGeo.setAttribute("instancePosition", positionAttr);
     quadGeo.setAttribute("pSize",            pSizeAttr);
     quadGeo.setAttribute("pAlpha",           pAlphaAttr);
     quadGeo.setAttribute("pColor",           pColorAttr);
@@ -497,8 +540,8 @@ export class TornadoSimulator {
     this.funnelMat.depthWrite = false;
     this.funnelMat.blending = THREE.NormalBlending;
 
-    // Read per-instance attributes
-    const instPos   = attribute("instancePosition");
+    // Position from GPU compute storage buffer (toAttribute converts storage → vertex attribute)
+    const instPos   = GPU.particlePositions.toAttribute();
     const instSize  = attribute("pSize");
     const instAlpha = attribute("pAlpha");
     const instColor = attribute("pColor");
@@ -517,7 +560,7 @@ export class TornadoSimulator {
     const vAlpha = varying(instAlpha.mul(pulse), "vAlpha");
     const vColor = varying(instColor, "vColor");
 
-    // Position node: use instanced position
+    // Position node: use GPU-computed position
     this.funnelMat.positionNode = instPos;
 
     // Fragment: radial falloff, noise grain, color modulation
@@ -777,11 +820,12 @@ export class TornadoSimulator {
     const cArr = (this.funnelPoints.geometry.attributes.pColor as THREE.InstancedBufferAttribute).array as Float32Array;
     const sizeScale = THREE.MathUtils.clamp(this.coreRadius / 50, 0.35, 2.4);
 
+    // CPU-side typed arrays for GPU storage buffer upload
+    const paramsData = new Float32Array(FUNNEL_PARTICLES * 4);
+    const oscData = new Float32Array(FUNNEL_PARTICLES * 4);
+    const osc2Data = new Float32Array(FUNNEL_PARTICLES * 4);
+
     for (let i = 0; i < FUNNEL_PARTICLES; i++) {
-      // Particle distribution:
-      //   18% — ground-level dust/debris cloud (wide, very dark)
-      //   40% — tight funnel wall (defines the visible dark cone)
-      //   42% — inner body / fill
       const roll = Math.random();
       const isGroundDust = roll < 0.18;
       const isFunnelWall = roll >= 0.18 && roll < 0.58;
@@ -793,11 +837,9 @@ export class TornadoSimulator {
         baseRadius = this.coreRadius * (0.5 + Math.random() * 3.0);
         angularSpeed = (this.maxWindSpeed / Math.max(baseRadius, 1)) * (0.4 + Math.random() * 0.5);
       } else if (isFunnelWall) {
-        // Tightly concentrated along the funnel edge — makes the dark cone shape
         const t = Math.random();
         height = Math.pow(t, 0.35) * FUNNEL_HEIGHT;
         const funnelR = this.coreRadius * (0.12 + 0.88 * Math.pow(height / FUNNEL_HEIGHT, 0.45));
-        // Very tight spread around the wall (0.90–1.10 of funnel radius)
         baseRadius = funnelR * (0.90 + Math.random() * 0.20);
         angularSpeed = this.maxWindSpeed / this.coreRadius * (0.9 + Math.random() * 0.2);
       } else {
@@ -813,24 +855,40 @@ export class TornadoSimulator {
         angularSpeed *= 0.8 + Math.random() * 0.4;
       }
 
+      const angle = Math.random() * Math.PI * 2;
+      const radOscAmp = baseRadius * (0.03 + Math.random() * 0.12);
+      const radOscFreq = 1 + Math.random() * 3;
+      const radOscPhase = Math.random() * Math.PI * 2;
+      const vertOscAmp = 1.0 + Math.random() * 5;
+      const vertOscFreq = 0.5 + Math.random() * 2.5;
+      const vertOscPhase = Math.random() * Math.PI * 2;
+
       this.funnelData.push({
-        baseRadius, height,
-        angle: Math.random() * Math.PI * 2,
-        angularSpeed,
-        radOscAmp:   baseRadius * (0.03 + Math.random() * 0.12),
-        radOscFreq:  1 + Math.random() * 3,
-        radOscPhase: Math.random() * Math.PI * 2,
-        vertOscAmp:  1.0 + Math.random() * 5,
-        vertOscFreq: 0.5 + Math.random() * 2.5,
-        vertOscPhase: Math.random() * Math.PI * 2,
+        baseRadius, height, angle, angularSpeed,
+        radOscAmp, radOscFreq, radOscPhase,
+        vertOscAmp, vertOscFreq, vertOscPhase,
       });
 
-      const hNorm = height / FUNNEL_HEIGHT;
+      // Write to GPU storage buffer arrays
+      paramsData[i * 4]     = baseRadius;
+      paramsData[i * 4 + 1] = height;
+      paramsData[i * 4 + 2] = angle;
+      paramsData[i * 4 + 3] = angularSpeed;
 
-      // EF-dependent colour darkness & opacity boost
+      oscData[i * 4]     = radOscAmp;
+      oscData[i * 4 + 1] = radOscFreq;
+      oscData[i * 4 + 2] = radOscPhase;
+      oscData[i * 4 + 3] = vertOscAmp;
+
+      osc2Data[i * 4]     = vertOscFreq;
+      osc2Data[i * 4 + 1] = vertOscPhase;
+      osc2Data[i * 4 + 2] = 0;
+      osc2Data[i * 4 + 3] = 0;
+
+      const hNorm = height / FUNNEL_HEIGHT;
       const ef = this.efRating;
-      const darkMul = 1.0 - ef * 0.11;          // colour multiplier: EF0 1.0 → EF5 0.45
-      const alphaMul = 1.0 + ef * 0.10;          // opacity boost:     EF0 1.0 → EF5 1.50
+      const darkMul = 1.0 - ef * 0.11;
+      const alphaMul = 1.0 + ef * 0.10;
 
       if (isGroundDust) {
         sArr[i] = (30 + Math.random() * 22) * sizeScale;
@@ -855,30 +913,169 @@ export class TornadoSimulator {
       }
     }
 
+    // Upload particle data to GPU storage buffers
+    this.uploadParticleBuffers(paramsData, oscData, osc2Data);
+
     (this.funnelPoints.geometry.attributes.pSize  as THREE.InstancedBufferAttribute).needsUpdate = true;
     (this.funnelPoints.geometry.attributes.pAlpha as THREE.InstancedBufferAttribute).needsUpdate = true;
     (this.funnelPoints.geometry.attributes.pColor as THREE.InstancedBufferAttribute).needsUpdate = true;
+  }
+
+  /** Upload particle initialization data to GPU storage buffers. */
+  private uploadParticleBuffers(params: Float32Array, osc: Float32Array, osc2: Float32Array) {
+    // Write data into the storage buffer backing arrays
+    const paramsNode = GPU.particleParams;
+    const oscNode = GPU.particleOsc;
+    const osc2Node = GPU.particleOsc2;
+    // Access the underlying StorageBufferAttribute and copy data
+    const pAttr = (paramsNode as any).value ?? (paramsNode as any).attribute;
+    const oAttr = (oscNode as any).value ?? (oscNode as any).attribute;
+    const o2Attr = (osc2Node as any).value ?? (osc2Node as any).attribute;
+    if (pAttr?.array) (pAttr.array as Float32Array).set(params);
+    if (oAttr?.array) (oAttr.array as Float32Array).set(osc);
+    if (o2Attr?.array) (o2Attr.array as Float32Array).set(osc2);
+    if (pAttr) pAttr.needsUpdate = true;
+    if (oAttr) oAttr.needsUpdate = true;
+    if (o2Attr) o2Attr.needsUpdate = true;
+  }
+
+  /** Upload building data to GPU storage buffers for compute shaders. */
+  uploadBuildingData(buildings: BuildingRecord[]) {
+    const count = Math.min(buildings.length, 512);
+    const s0Attr = (GPU.buildingSlot0 as any).value ?? (GPU.buildingSlot0 as any).attribute;
+    const s1Attr = (GPU.buildingSlot1 as any).value ?? (GPU.buildingSlot1 as any).attribute;
+    const s2Attr = (GPU.buildingSlot2 as any).value ?? (GPU.buildingSlot2 as any).attribute;
+    if (!s0Attr?.array) return;
+    const a0 = s0Attr.array as Float32Array;
+    const a1 = s1Attr.array as Float32Array;
+    const a2 = s2Attr.array as Float32Array;
+    for (let i = 0; i < count; i++) {
+      const b = buildings[i]!;
+      a0[i * 4]     = b.centerX;
+      a0[i * 4 + 1] = b.centerZ;
+      a0[i * 4 + 2] = b.baseY;
+      a0[i * 4 + 3] = b.height;
+      a1[i * 4]     = b.halfX;
+      a1[i * 4 + 1] = b.halfZ;
+      a1[i * 4 + 2] = b.width;
+      a1[i * 4 + 3] = b.structuralStrength;
+      a2[i * 4]     = b.damageLevel;
+      a2[i * 4 + 1] = b.destroyed ? 1.0 : 0.0;
+      a2[i * 4 + 2] = 0;
+      a2[i * 4 + 3] = 0;
+    }
+    s0Attr.needsUpdate = true;
+    s1Attr.needsUpdate = true;
+    s2Attr.needsUpdate = true;
+  }
+
+  /** Read back building damage levels from GPU after compute. */
+  private readBackBuildingDamage(buildings: BuildingRecord[]) {
+    const count = Math.min(buildings.length, 512);
+    const s2Attr = (GPU.buildingSlot2 as any).value ?? (GPU.buildingSlot2 as any).attribute;
+    if (!s2Attr?.array) return;
+    const a2 = s2Attr.array as Float32Array;
+    for (let i = 0; i < count; i++) {
+      const b = buildings[i]!;
+      if (b.destroyed) continue;
+      const newDmg = a2[i * 4]!;
+      if (newDmg > b.damageLevel) {
+        b.damageLevel = newDmg;
+      }
+    }
+  }
+
+  /** Upload active debris state to GPU storage buffers. */
+  private uploadDebrisData() {
+    const s0Attr = (GPU.debrisSlot0 as any).value ?? (GPU.debrisSlot0 as any).attribute;
+    const s1Attr = (GPU.debrisSlot1 as any).value ?? (GPU.debrisSlot1 as any).attribute;
+    const s2Attr = (GPU.debrisSlot2 as any).value ?? (GPU.debrisSlot2 as any).attribute;
+    const exAttr = (GPU.debrisExtra as any).value ?? (GPU.debrisExtra as any).attribute;
+    if (!s0Attr?.array) return;
+    const a0 = s0Attr.array as Float32Array;
+    const a1 = s1Attr.array as Float32Array;
+    const a2 = s2Attr.array as Float32Array;
+    const ex = exAttr.array as Float32Array;
+    for (let i = 0; i < this.debris.length && i < MAX_DEBRIS; i++) {
+      const d = this.debris[i]!;
+      const pos = d.mesh.position;
+      a0[i * 4]     = pos.x;
+      a0[i * 4 + 1] = pos.y;
+      a0[i * 4 + 2] = pos.z;
+      a0[i * 4 + 3] = d.velocity.x;
+      a1[i * 4]     = d.velocity.y;
+      a1[i * 4 + 1] = d.velocity.z;
+      a1[i * 4 + 2] = d.angularVel.x;
+      a1[i * 4 + 3] = d.angularVel.y;
+      // flags: bit0=captured, bit1=grounded, bit2=lockCaptured, bit3=allowSpinOut
+      let flags = 0;
+      if (d.captured) flags |= 1;
+      if (d.grounded) flags |= 2;
+      if (d.lockCaptured) flags |= 4;
+      if (d.allowSpinOut !== false) flags |= 8;
+      a2[i * 4]     = d.angularVel.z;
+      a2[i * 4 + 1] = d.life;
+      a2[i * 4 + 2] = d.mass;
+      a2[i * 4 + 3] = flags;
+      ex[i * 4]     = d.orbitRadius ?? (this.coreRadius * (0.7 + Math.random() * 0.7));
+      ex[i * 4 + 1] = d.orbitHeight ?? (this.position.y + FUNNEL_HEIGHT * (0.25 + Math.random() * 0.35));
+      ex[i * 4 + 2] = d.orbitDrift ?? ((Math.random() - 0.5) * 0.25);
+      ex[i * 4 + 3] = d.radius ?? 1.5;
+    }
+    s0Attr.needsUpdate = true;
+    s1Attr.needsUpdate = true;
+    s2Attr.needsUpdate = true;
+    exAttr.needsUpdate = true;
+  }
+
+  /** Read back debris state from GPU after compute. */
+  private readBackDebrisState() {
+    const s0Attr = (GPU.debrisSlot0 as any).value ?? (GPU.debrisSlot0 as any).attribute;
+    const s1Attr = (GPU.debrisSlot1 as any).value ?? (GPU.debrisSlot1 as any).attribute;
+    const s2Attr = (GPU.debrisSlot2 as any).value ?? (GPU.debrisSlot2 as any).attribute;
+    if (!s0Attr?.array) return;
+    const a0 = s0Attr.array as Float32Array;
+    const a1 = s1Attr.array as Float32Array;
+    const a2 = s2Attr.array as Float32Array;
+    const AIRBORNE_TTL = 20;
+    const GROUNDED_TTL = 8;
+
+    for (let i = this.debris.length - 1; i >= 0; i--) {
+      if (i >= MAX_DEBRIS) continue;
+      const d = this.debris[i]!;
+      // Read position
+      d.mesh.position.set(a0[i * 4]!, a0[i * 4 + 1]!, a0[i * 4 + 2]!);
+      d.velocity.set(a0[i * 4 + 3]!, a1[i * 4]!, a1[i * 4 + 1]!);
+      d.angularVel.set(a1[i * 4 + 2]!, a1[i * 4 + 3]!, a2[i * 4]!);
+      d.life = a2[i * 4 + 1]!;
+      const flags = Math.round(a2[i * 4 + 3]!);
+      d.captured = !!(flags & 1);
+      d.grounded = !!(flags & 2);
+
+      // Apply angular rotation on CPU (mesh.rotation)
+      d.mesh.rotation.x += d.angularVel.x * (GPU.uDt.value as number);
+      d.mesh.rotation.y += d.angularVel.y * (GPU.uDt.value as number);
+      d.mesh.rotation.z += d.angularVel.z * (GPU.uDt.value as number);
+
+      // TTL cleanup
+      if (d.grounded && d.life > GROUNDED_TTL) {
+        this.removeDebris(i);
+        continue;
+      }
+      const ttl = d.ttl ?? AIRBORNE_TTL;
+      if (!d.grounded && d.life > ttl) {
+        this.removeDebris(i);
+        continue;
+      }
+    }
   }
 
   private updateFunnel(dt: number) {
     this.particleTimeUniform.value = this.time;
     this.updateBend(dt);
 
-    const posArr = (this.funnelPoints.geometry.attributes.instancePosition as THREE.InstancedBufferAttribute).array as Float32Array;
-    for (let i = 0; i < FUNNEL_PARTICLES; i++) {
-      const p = this.funnelData[i]!;
-      p.angle += p.angularSpeed * dt;
-      const h = p.height     + p.vertOscAmp * Math.sin(this.time * p.vertOscFreq + p.vertOscPhase);
-      const rope = this.getRopeOutFactor();
-      const hNorm = THREE.MathUtils.clamp(h / FUNNEL_HEIGHT, 0, 1);
-      const ropeTaper = 1.0 - rope * Math.pow(hNorm, 1.1) * 0.75;
-      const r = (p.baseRadius + p.radOscAmp * Math.sin(this.time * p.radOscFreq + p.radOscPhase)) * ropeTaper;
-      const bend = this.getBendOffset(h);
-      posArr[i * 3]     = r * Math.cos(p.angle) + bend.x;
-      posArr[i * 3 + 1] = Math.max(0, h);
-      posArr[i * 3 + 2] = r * Math.sin(p.angle) + bend.y;
-    }
-    (this.funnelPoints.geometry.attributes.instancePosition as THREE.InstancedBufferAttribute).needsUpdate = true;
+    // Particle positions are now computed on GPU — dispatch happens in update()
+    // No CPU particle loop needed
 
     // Tick funnel shader time uniforms
     this.coneTimeUniform.value = this.time;
@@ -1129,14 +1326,45 @@ export class TornadoSimulator {
   }
 
   // ─────────────────────────────────────────────────────────────────────────
+  // Building pivot centering
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Building geometry has world-space positions baked into vertices (from
+   * ExtrudeGeometry + geo.translate) while mesh.position is (0,0,0).
+   * This causes rotation to pivot around the world origin and
+   * getWorldPosition to return (0,0,0).
+   *
+   * This helper re-centers the geometry so vertices are relative to the
+   * building's base center, then sets mesh.position to compensate.
+   * Called lazily before any rotation or reparenting.
+   */
+  private centerBuildingPivot(b: BuildingRecord) {
+    if ((b as any)._pivotCentered) return;
+    (b as any)._pivotCentered = true;
+    const cx = b.centerX;
+    const cy = b.baseY;
+    const cz = b.centerZ;
+    b.mesh.geometry.translate(-cx, -cy, -cz);
+    b.mesh.position.set(cx, cy, cz);
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
   // Building damage
   // ─────────────────────────────────────────────────────────────────────────
 
-  private updateBuildings(dt: number, buildings: BuildingRecord[]) {
+  /**
+   * CPU-side building mesh work — damage was already computed on GPU.
+   * Handles visual effects: tilt, color, debris spawning, collapse queue.
+   */
+  private updateBuildingMeshes(dt: number, buildings: BuildingRecord[]) {
     let damaged = 0;
     let destroyed = 0;
+    // Track previous damage for debris spawning thresholds
+    if (!this._prevDamage) this._prevDamage = new Float32Array(512);
 
-    for (const b of buildings) {
+    for (let idx = 0; idx < buildings.length; idx++) {
+      const b = buildings[idx]!;
       if (b.damageLevel > 0) damaged++;
       if (b.destroyed) { destroyed++; continue; }
 
@@ -1148,33 +1376,30 @@ export class TornadoSimulator {
       const effectiveSpeed = windSpeed / b.structuralStrength;
       if (effectiveSpeed < DMG.roofCovering * 0.8) continue;
 
-      // Slower, EF-scaled damage progression (EF scale is wind-based damage proxy)
-      const intensity = THREE.MathUtils.clamp(
-        (effectiveSpeed - DMG.roofCovering) / (DMG.totalCollapse - DMG.roofCovering),
-        0,
-        1,
-      );
+      // CPU-side damage progression
+      const intensity = Math.min(1, Math.max(0,
+        (effectiveSpeed - DMG.roofCovering) / (DMG.totalCollapse - DMG.roofCovering)));
       const efRatio = this.maxWindSpeed / EF_SCALE[5]!.speedMs;
-      const efScale = 0.05 + Math.pow(efRatio, 1.3) * 0.9; // EF0–EF5 wind-based scaling
+      const efScale = 0.05 + Math.pow(efRatio, 1.3) * 0.9;
       const damageRate = Math.pow(intensity, 2.6) * efScale * 0.35;
-
-      const prev = b.damageLevel;
       b.damageLevel = Math.min(1, b.damageLevel + damageRate * dt);
 
-      // Extremely rare: only very small, low buildings can be lofted in EF5
+      const prev = this._prevDamage[idx] ?? 0;
+
+      // Small, low buildings can be ripped whole from foundations in EF4-5
       const floors = Math.max(1, Math.round(b.height / 3));
-      const isNarrow = b.width <= 14;
       if (
-        this.efRating >= 5 &&
-        isNarrow &&
-        floors <= 1 &&
+        this.efRating >= 4 &&
+        b.width <= 20 &&
+        floors <= 2 &&
         effectiveSpeed >= DMG.totalCollapse &&
         prev < 0.60 &&
         b.damageLevel >= 0.60 &&
-        Math.random() < 0.08
+        Math.random() < 0.12
       ) {
         this.uprootBuilding(b);
         destroyed++;
+        this._prevDamage[idx] = b.damageLevel;
         continue;
       }
 
@@ -1188,34 +1413,110 @@ export class TornadoSimulator {
         b.mesh.position.y -= (bboxNow.min.y - b.baseY);
       }
 
-      if (b.damageLevel >= 0.98 && !b.destroyed) {
-        // Rare collapse for tall, heavily damaged buildings
-        const tiltMag = Math.abs(b.mesh.rotation.x) + Math.abs(b.mesh.rotation.z);
-        const tiltBoost = 1 + Math.min(2.0, tiltMag * 3.0);
-        if (b.height >= 35 && Math.random() < 0.015 * tiltBoost) {
-          b.destroyed = true;
-          // Leave a rubble pile at the collapsed building site
-          this.spawnGroundRubble(b.centerX, b.centerZ, 5, this.rubbleMat, 10, [0.3, 0.8]);
-        }
+      // Begin progressive collapse when damage is high enough.
+      const collapseThreshold = this.efRating >= 5 ? 0.60
+        : this.efRating >= 4 ? 0.70
+        : this.efRating >= 3 ? 0.80
+        : this.efRating >= 2 ? 0.90
+        : 1.1;
+      const alreadyCollapsing = this.collapsing.some((c) => c.building === b);
+      if (
+        !alreadyCollapsing &&
+        b.damageLevel >= collapseThreshold &&
+        effectiveSpeed >= DMG.partialCollapse &&
+        Math.random() < 0.06 * (b.damageLevel - collapseThreshold + 0.1)
+      ) {
+        const bboxC = new THREE.Box3().setFromObject(b.mesh);
+        const centerC = bboxC.getCenter(new THREE.Vector3());
+        this.collapsing.push({
+          building: b,
+          progress: 0,
+          cx: centerC.x,
+          cz: centerC.z,
+          baseY: b.baseY,
+          height: b.height,
+          halfX: b.halfX,
+          halfZ: b.halfZ,
+          nextFragment: 0.05,
+        });
       }
+
+      this._prevDamage[idx] = b.damageLevel;
     }
 
     this.buildingsDamaged = damaged;
     this.buildingsDestroyed = destroyed;
   }
+  private _prevDamage: Float32Array | null = null;
+
+  /**
+   * Progressive building collapse — sinks buildings into the ground over ~3s,
+   * spawning debris along the way, then hides and marks as destroyed.
+   * Modeled on the earthquake collapse system.
+   */
+  private updateCollapses(dt: number) {
+    for (let i = this.collapsing.length - 1; i >= 0; i--) {
+      const c = this.collapsing[i]!;
+      const b = c.building;
+      // Collapse over ~3 seconds, accelerating
+      const speed = 0.15 + c.progress * 0.5;
+      c.progress = Math.min(1, c.progress + speed * dt);
+
+      // Ensure pivot is centered so sinking works correctly
+      this.centerBuildingPivot(b);
+
+      // Sink building straight down into the ground
+      const sinkAmount = c.progress * c.height;
+      b.mesh.position.y = c.baseY - sinkAmount;
+
+      // Spawn fragment burst from a random side at each progress step
+      if (c.progress >= c.nextFragment) {
+        c.nextFragment += 0.20 + Math.random() * 0.10;
+        const frontY = c.baseY + c.height * (1 - c.progress);
+        const side = Math.floor(Math.random() * 4);
+        const isX = side < 2;
+        const sign = (side % 2 === 0) ? 1 : -1;
+        const ex = isX ? c.halfX * sign : (Math.random() - 0.5) * c.halfX * 1.6;
+        const ez = isX ? (Math.random() - 0.5) * c.halfZ * 1.6 : c.halfZ * sign;
+        // Spawn chunk debris at the collapse front
+        const geoIdx = Math.floor(Math.random() * this.debrisGeos.length);
+        this.spawnBuildingFragment(
+          c.cx + ex, frontY + Math.random() * 2, c.cz + ez,
+          geoIdx, b.originalColor,
+        );
+        this.spawnGroundRubble(c.cx, c.cz, 1, this.rubbleMat, 3, [0.2, 0.5]);
+      }
+
+      // Collapse complete
+      if (c.progress >= 1) {
+        b.destroyed = true;
+        b.mesh.visible = false;
+        this.spawnGroundRubble(c.cx, c.cz, 3 + Math.floor(c.height / 10), this.rubbleMat, 8, [0.3, 0.8]);
+        this.collapsing.splice(i, 1);
+      }
+    }
+  }
 
   private applyDamage(b: BuildingRecord) {
     const d = b.damageLevel;
-    const mat = b.mesh.material as THREE.MeshPhongMaterial;
-
     const dark = b.originalColor.clone().multiplyScalar(0.8);
-    mat.color.copy(b.originalColor).lerp(dark, Math.min(d * 0.6, 0.6));
+    const target = b.originalColor.clone().lerp(dark, Math.min(d * 0.6, 0.6));
 
-    // No vertical sinking; damage is expressed via fragments/tilt.
+    // Material may be a single mat or [roofMat, wallMat] array
+    const mats = Array.isArray(b.mesh.material) ? b.mesh.material : [b.mesh.material];
+    for (const mat of mats) {
+      if (mat && (mat as THREE.MeshPhongMaterial).color) {
+        (mat as THREE.MeshPhongMaterial).color.copy(target);
+      }
+    }
   }
 
   private maybeTiltBuilding(b: BuildingRecord, effectiveSpeed: number) {
     if (b.tiltTargetX !== undefined || b.tiltTargetZ !== undefined) {
+      // Ensure geometry is centered so rotation pivots around the building's
+      // base rather than the world origin.
+      this.centerBuildingPivot(b);
+
       const targetX = b.tiltTargetX ?? 0;
       const targetZ = b.tiltTargetZ ?? 0;
       b.mesh.rotation.x = THREE.MathUtils.lerp(b.mesh.rotation.x, targetX, 0.05);
@@ -1307,16 +1608,17 @@ export class TornadoSimulator {
     // Leave a rubble foundation at the original site
     this.spawnGroundRubble(b.centerX, b.centerZ, 6, this.rubbleMat, 8, [0.3, 0.7]);
 
+    // Re-center geometry so mesh.position tracks the building's world location
+    // (needed for debris physics which use mesh.position for vortex distance etc.)
+    this.centerBuildingPivot(b);
+
     const mesh = b.mesh;
-    const wp = new THREE.Vector3();
-    mesh.getWorldPosition(wp);
     mesh.parent?.remove(mesh);
-    mesh.position.copy(wp);
     // Restore full height so the whole building is visible flying
     mesh.scale.y = 1;
     this.debrisGroup.add(mesh);
 
-    const wind = this.getWindVector(wp.x, wp.y + b.height * 0.5, wp.z);
+    const wind = this.getWindVector(b.centerX, b.baseY + b.height * 0.5, b.centerZ);
     this.debris.push({
       mesh,
       velocity: new THREE.Vector3(
@@ -1409,6 +1711,9 @@ export class TornadoSimulator {
     }
     pos.needsUpdate = true;
     geom.computeVertexNormals();
+    if (geom.attributes.normal) {
+      (geom.attributes.normal as THREE.BufferAttribute).needsUpdate = true;
+    }
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -1475,8 +1780,8 @@ export class TornadoSimulator {
 
   private updateDebris(dt: number, buildings: BuildingRecord[]) {
     const captureR = this.coreRadius * 3;
-    const AIRBORNE_TTL = 20;   // seconds before airborne debris is removed (unless overridden)
-    const GROUNDED_TTL = 8;    // seconds a grounded piece stays before cleanup
+    const AIRBORNE_TTL = 20;
+    const GROUNDED_TTL = 8;
 
     for (let i = this.debris.length - 1; i >= 0; i--) {
       const d = this.debris[i]!;
@@ -1487,18 +1792,9 @@ export class TornadoSimulator {
         d.radius = Math.max(size.x, size.z, size.y) * 0.45;
       }
 
-      // ── TTL cleanup ──
-      if (d.grounded && d.life > GROUNDED_TTL) {
-        this.removeDebris(i);
-        continue;
-      }
+      if (d.grounded && d.life > GROUNDED_TTL) { this.removeDebris(i); continue; }
       const ttl = d.ttl ?? AIRBORNE_TTL;
-      if (!d.grounded && d.life > ttl) {
-        this.removeDebris(i);
-        continue;
-      }
-
-      // Grounded debris doesn't need physics
+      if (!d.grounded && d.life > ttl) { this.removeDebris(i); continue; }
       if (d.grounded) continue;
 
       const pos = d.mesh.position;
@@ -1506,7 +1802,6 @@ export class TornadoSimulator {
       const dz = pos.z - this.position.z;
       const distToVortex = Math.sqrt(dx * dx + dz * dz);
 
-      // ── Capture logic ──
       if (!d.captured && this.active && distToVortex < captureR) {
         const ws = this.getWindSpeedAtGround(pos.x, pos.z);
         if (ws > 20 / d.mass) {
@@ -1522,21 +1817,16 @@ export class TornadoSimulator {
         d.captured = false;
       }
 
-      // ── Physics: captured vs free ──
-      let dragC: number;
-      let gravScale: number;
-
+      let dragC: number, gravScale: number;
       if (d.captured) {
         const proximity = 1 - Math.min(distToVortex / captureR, 1);
-        // Very high drag so debris velocity closely tracks the circular wind
-        dragC = 2.5 + proximity * 2.5;           // 2.5 – 5.0
-        gravScale = 0.05;                         // almost weightless inside vortex
+        dragC = 2.5 + proximity * 2.5;
+        gravScale = 0.05;
       } else {
         dragC = 0.35;
         gravScale = 1.0;
       }
 
-      // ── Forces ──
       const wind = this.getWindVector(pos.x, pos.y, pos.z);
       const relVel = wind.clone().sub(d.velocity);
       const dragForce = relVel.multiplyScalar(dragC);
@@ -1544,18 +1834,12 @@ export class TornadoSimulator {
       d.velocity.y += -9.81 * gravScale * dt;
       d.velocity.add(dragForce.clone().multiplyScalar(dt));
 
-      // ── Orbit targeting for captured debris ──
-      // Spring force holds debris at mid-funnel height & near core radius
       if (d.captured) {
-        // Target height: 30–50 % of funnel, varies per piece for visual spread
         const drift = (d.orbitDrift ?? 0) * Math.sin(d.life * 0.4);
         const targetY = (d.orbitHeight ?? (this.position.y + FUNNEL_HEIGHT * 0.35)) + drift * FUNNEL_HEIGHT * 0.05;
         d.velocity.y += (targetY - pos.y) * 2.0 * dt;
 
-        // Gentle radial spring keeps debris near the core wall (visible orbit ring)
-        const targetR = d.lockCaptured
-          ? this.coreRadius * 1.05
-          : (d.orbitRadius ?? this.coreRadius * 0.9);
+        const targetR = d.lockCaptured ? this.coreRadius * 1.05 : (d.orbitRadius ?? this.coreRadius * 0.9);
         if (distToVortex > 0.1) {
           const radialErr = targetR - distToVortex;
           const pushX = (dx / distToVortex) * radialErr * 1.2 * dt;
@@ -1564,7 +1848,6 @@ export class TornadoSimulator {
           d.velocity.z += pushZ;
         }
 
-        // Low chance spin-out: lose capture and fling outward
         if (!d.lockCaptured && d.allowSpinOut !== false && this.efRating >= 3 && Math.random() < 0.0006) {
           const out = Math.max(distToVortex, 1);
           const nx = dx / out;
@@ -1580,7 +1863,6 @@ export class TornadoSimulator {
       pos.y += d.velocity.y * dt;
       pos.z += d.velocity.z * dt;
 
-      // ── Building collision ──
       for (const b of buildings) {
         if (b.destroyed) continue;
         const dxB = pos.x - b.centerX;
@@ -1603,9 +1885,7 @@ export class TornadoSimulator {
           d.angularVel.x += (Math.random() - 0.5) * 0.6;
           d.angularVel.y += (Math.random() - 0.5) * 0.6;
           d.angularVel.z += (Math.random() - 0.5) * 0.6;
-          if (Math.abs(vn) > 10) {
-            b.damageLevel = Math.min(1, b.damageLevel + 0.02);
-          }
+          if (Math.abs(vn) > 10) b.damageLevel = Math.min(1, b.damageLevel + 0.02);
         }
       }
 
@@ -1613,7 +1893,6 @@ export class TornadoSimulator {
       d.mesh.rotation.y += d.angularVel.y * dt;
       d.mesh.rotation.z += d.angularVel.z * dt;
 
-      // ── Ground collision ──
       const groundY = getTerrainHeight(pos.x, pos.z);
       if (pos.y <= groundY + 0.3) {
         if (d.captured && distToVortex < captureR) {
@@ -1623,7 +1902,7 @@ export class TornadoSimulator {
           pos.y = groundY + 0.3;
           if (Math.abs(d.velocity.y) < 3) {
             d.grounded = true;
-            d.life = 0; // reset timer for grounded TTL
+            d.life = 0;
             d.velocity.set(0, 0, 0);
             d.angularVel.set(0, 0, 0);
           } else {
