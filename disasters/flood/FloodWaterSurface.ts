@@ -1,6 +1,12 @@
 import * as THREE from "three";
 import type { FloodRaster } from "./FloodTypes.ts";
-import type { ShallowWaterSolver } from "./ShallowWaterSolver.ts";
+
+export interface FloodSurfaceSolverState {
+  depth: Float32Array;
+  mx: Float32Array;
+  my: Float32Array;
+  obstacle: Uint8Array;
+}
 
 type ImpactPulse = {
   x: number;
@@ -244,7 +250,7 @@ export class FloodWaterSurface {
     this.mesh.name = "flood-water-surface";
   }
 
-  updateFromSolver(solver: ShallowWaterSolver, dt: number): void {
+  updateFromSolver(solver: FloodSurfaceSolverState, dt: number): void {
     this.updateRippleField(solver, dt);
     const eps = 1e-5;
     let wetCount = 0;
@@ -310,7 +316,7 @@ export class FloodWaterSurface {
    * velocity *= damping
    * height += velocity
    */
-  private updateRippleField(solver: ShallowWaterSolver, dt: number): void {
+  private updateRippleField(solver: FloodSurfaceSolverState, dt: number): void {
     const w = this.raster.width;
     const h = this.raster.height;
     const steps = Math.max(1, Math.min(4, Math.round(dt * 120)));
@@ -386,7 +392,7 @@ export class FloodWaterSurface {
     }
   }
 
-  private applyPendingImpactsToRipple(solver: ShallowWaterSolver): void {
+  private applyPendingImpactsToRipple(solver: FloodSurfaceSolverState): void {
     if (this.pendingImpacts.length === 0) return;
     const w = this.raster.width;
     const h = this.raster.height;

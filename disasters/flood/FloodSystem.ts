@@ -132,7 +132,7 @@ export class FloodSystem {
     panel.innerHTML = `
       <div style="font-weight:700; font-size:13px; margin-bottom:8px;">Flood Simulator</div>
       <div style="margin-bottom:8px; color:#9ec3ff;">
-        Source @ highest terrain (non-building)<br/>
+        Source @ mid-elevation terrain (non-building)<br/>
         x=${sourcePos.x.toFixed(1)} z=${sourcePos.z.toFixed(1)} y=${sourcePos.y.toFixed(1)}
       </div>
       <div style="display:flex; gap:8px; margin-bottom:10px;">

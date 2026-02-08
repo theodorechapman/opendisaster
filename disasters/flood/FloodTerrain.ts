@@ -83,10 +83,10 @@ export function buildFloodRaster(
   rasterizeObstacles(buildingMask, buildingPolys, width, height, xMin, zMin, dx, dz);
   const obstacle = buildingMask;
 
-  // Flood source starts at the highest terrain point that is not inside a building.
+  // Flood source starts at a mid-elevation terrain point that is not inside a building.
   const centerI = Math.floor(width * 0.5);
   const centerJ = Math.floor(height * 0.5);
-  const sourceIndex = findHighestOpenCell(terrain, buildingMask, width, height, centerI, centerJ);
+  const sourceIndex = findMidElevationOpenCell(terrain, buildingMask, width, height, centerI, centerJ);
   const sourceY = terrain[sourceIndex]!;
 
   const sourceI = sourceIndex % width;
@@ -273,7 +273,7 @@ function findNearestOpenCell(
   return startIdx;
 }
 
-function findHighestOpenCell(
+function findMidElevationOpenCell(
   terrain: Float32Array,
   obstacle: Uint8Array,
   width: number,
@@ -281,14 +281,40 @@ function findHighestOpenCell(
   fallbackI: number,
   fallbackJ: number
 ): number {
-  let bestIdx = -1;
-  let bestElev = Number.NEGATIVE_INFINITY;
+  let minElev = Number.POSITIVE_INFINITY;
+  let maxElev = Number.NEGATIVE_INFINITY;
 
   for (let idx = 0; idx < terrain.length; idx++) {
     if (obstacle[idx] !== 0) continue;
     const y = terrain[idx]!;
-    if (y > bestElev) {
-      bestElev = y;
+    if (y < minElev) minElev = y;
+    if (y > maxElev) maxElev = y;
+  }
+
+  if (!Number.isFinite(minElev) || !Number.isFinite(maxElev)) {
+    return findNearestOpenCell(obstacle, width, height, fallbackI, fallbackJ);
+  }
+
+  const targetElev = (minElev + maxElev) * 0.5;
+  let bestIdx = -1;
+  let bestElevDelta = Number.POSITIVE_INFINITY;
+  let bestCenterDistSq = Number.POSITIVE_INFINITY;
+
+  for (let idx = 0; idx < terrain.length; idx++) {
+    if (obstacle[idx] !== 0) continue;
+    const y = terrain[idx]!;
+    const elevDelta = Math.abs(y - targetElev);
+    const i = idx % width;
+    const j = Math.floor(idx / width);
+    const di = i - fallbackI;
+    const dj = j - fallbackJ;
+    const centerDistSq = di * di + dj * dj;
+    if (
+      elevDelta < bestElevDelta - 1e-6 ||
+      (Math.abs(elevDelta - bestElevDelta) <= 1e-6 && centerDistSq < bestCenterDistSq)
+    ) {
+      bestElevDelta = elevDelta;
+      bestCenterDistSq = centerDistSq;
       bestIdx = idx;
     }
   }

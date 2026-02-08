@@ -37,10 +37,26 @@ function bbox(lat: number, lon: number, halfSize: number) {
   };
 }
 
-Bun.serve({
-  port: 3000,
-  idleTimeout: 120, // seconds — elevation queries can take a while
-  async fetch(req) {
+const preferredPort = Number(process.env.PORT ?? 3000);
+const candidatePorts = [
+  preferredPort,
+  preferredPort + 1,
+  preferredPort + 2,
+  3000,
+  3001,
+  3002,
+].filter((port, idx, arr) => Number.isFinite(port) && port > 0 && arr.indexOf(port) === idx);
+
+let server: ReturnType<typeof Bun.serve> | null = null;
+let selectedPort = preferredPort;
+let lastError: unknown = null;
+
+for (const port of candidatePorts) {
+  try {
+    server = Bun.serve({
+      port,
+      idleTimeout: 120, // seconds — elevation queries can take a while
+      async fetch(req) {
     const url = new URL(req.url);
 
     // --- API: all layers endpoint ---
@@ -153,7 +169,30 @@ Bun.serve({
     }
 
     return new Response("Not found", { status: 404 });
-  },
-});
+      },
+    });
+    selectedPort = port;
+    break;
+  } catch (error) {
+    lastError = error;
+    const err = error as { code?: string; message?: string; syscall?: string };
+    const message = err?.message ?? (error instanceof Error ? error.message : String(error));
+    const text = String(message).toLowerCase();
+    const isAddrInUse =
+      err?.code === "EADDRINUSE" ||
+      String(error).includes("EADDRINUSE") ||
+      (err?.syscall === "listen" && text.includes("in use")) ||
+      text.includes("port") && text.includes("in use");
+    if (!isAddrInUse) {
+      throw error;
+    }
+  }
+}
 
-console.log("OpenDisaster running at http://localhost:3000");
+if (!server) {
+  throw new Error(
+    `Could not bind to ports: ${candidatePorts.join(", ")}${lastError ? ` (${String(lastError)})` : ""}`
+  );
+}
+
+console.log(`OpenDisaster running at http://localhost:${selectedPort}`);
