@@ -1,6 +1,6 @@
 /**
  * TestFire scenario — multi-source stochastic fire spread with wind,
- * custom InstancedMesh + SpriteNodeMaterial particle visuals (flames, smoke, embers),
+ * custom InstancedMesh particle visuals (flames, smoke, embers),
  * and per-source event emission.
  *
  * Self-contained and easily removable:
@@ -9,19 +9,9 @@
  */
 
 import * as THREE from "three";
-import { SpriteNodeMaterial } from "three/webgpu";
-import {
-  instancedBufferAttribute,
-  texture,
-  mix,
-  float,
-  vec3,
-  vec4,
-  smoothstep,
-  uniform,
-} from "three/tsl";
 import type { EventBus } from "../core/EventBus.ts";
 import type { HeightSampler } from "../layers.ts";
+import { buildingRegistry, treeRegistry, terrainBoundsRef, terrainCanvasRef, terrainTextureRef } from "../layers.ts";
 
 /* ── Procedural Textures ──────────────────────────────────── */
 
@@ -146,7 +136,7 @@ function lerpColorStops(stops: Array<{ color: THREE.Color; t: number }>, t: numb
 }
 
 /**
- * Custom particle emitter backed by InstancedMesh + SpriteNodeMaterial.
+ * Custom particle emitter backed by InstancedMesh.
  * CPU manages particle state; per-instance attributes drive the GPU material.
  */
 class FireParticleEmitter {
@@ -156,15 +146,9 @@ class FireParticleEmitter {
   private spawnAccumulator = 0;
   currentEmissionRate = 0;
   currentEmitterRadius: number;
-
-  // Per-instance attribute buffers
-  private lifeArray: Float32Array;
-  private colorArray: Float32Array;   // RGBA per instance
-  private scaleArray: Float32Array;
-
-  private lifeAttr: THREE.InstancedBufferAttribute;
-  private colorAttr: THREE.InstancedBufferAttribute;
-  private scaleAttr: THREE.InstancedBufferAttribute;
+  currentSizeScale = 1;
+  currentOpacityScale = 1;
+  currentColorScale = 1;
 
   // Wind force override (mutated externally)
   windForce = new THREE.Vector3();
@@ -172,6 +156,7 @@ class FireParticleEmitter {
   private static _tmpColor = new THREE.Color();
   private static _tmpMatrix = new THREE.Matrix4();
   private static _tmpVec = new THREE.Vector3();
+  private static _tmpScale = new THREE.Vector3();
 
   constructor(config: EmitterConfig) {
     this.config = config;
@@ -192,47 +177,16 @@ class FireParticleEmitter {
       });
     }
 
-    // Per-instance buffers
-    this.lifeArray = new Float32Array(max);
-    this.colorArray = new Float32Array(max * 4);
-    this.scaleArray = new Float32Array(max);
-
-    this.lifeAttr = new THREE.InstancedBufferAttribute(this.lifeArray, 1);
-    this.lifeAttr.setUsage(THREE.DynamicDrawUsage);
-    this.colorAttr = new THREE.InstancedBufferAttribute(this.colorArray, 4);
-    this.colorAttr.setUsage(THREE.DynamicDrawUsage);
-    this.scaleAttr = new THREE.InstancedBufferAttribute(this.scaleArray, 1);
-    this.scaleAttr.setUsage(THREE.DynamicDrawUsage);
-
     // Geometry: unit plane
     const geo = new THREE.PlaneGeometry(1, 1);
-    geo.setAttribute("aLife", this.lifeAttr);
-    geo.setAttribute("aColor", this.colorAttr);
-    geo.setAttribute("aScale", this.scaleAttr);
-
-    // SpriteNodeMaterial with TSL nodes
-    const mat = new SpriteNodeMaterial();
-    mat.transparent = true;
-    mat.depthWrite = false;
-    mat.blending = config.blending;
-    if (config.renderOrder !== undefined) {
-      mat.depthTest = true;
-    }
-
-    // TSL: read per-instance attributes
-    const iColor = instancedBufferAttribute(this.colorAttr, "vec4");
-    const iScale = instancedBufferAttribute(this.scaleAttr, "float");
-
-    // Texture map
-    const texNode = texture(config.tex);
-
-    // Color: instance color RGB * texture
-    mat.colorNode = vec4(
-      vec3(iColor.x, iColor.y, iColor.z).mul(texNode.rgb),
-      texNode.a.mul(iColor.w),
-    );
-    mat.opacityNode = texNode.a.mul(iColor.w);
-    mat.scaleNode = iScale;
+    const mat = new THREE.MeshBasicMaterial({
+      map: config.tex,
+      transparent: true,
+      depthWrite: false,
+      blending: config.blending,
+      side: THREE.DoubleSide,
+      vertexColors: true,
+    });
 
     // InstancedMesh
     this.mesh = new THREE.InstancedMesh(geo, mat, max);
@@ -242,12 +196,14 @@ class FireParticleEmitter {
     if (config.renderOrder !== undefined) {
       this.mesh.renderOrder = config.renderOrder;
     }
+    this.mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(max * 3), 3);
   }
 
-  update(dt: number, origin: THREE.Vector3): void {
+  update(dt: number, origin: THREE.Vector3, billboardQuat: THREE.Quaternion): void {
     const cfg = this.config;
     const tmpColor = FireParticleEmitter._tmpColor;
     const tmpMat = FireParticleEmitter._tmpMatrix;
+    const tmpScale = FireParticleEmitter._tmpScale;
 
     // Total force = base + wind
     const forceX = cfg.baseForce.x + this.windForce.x;
@@ -284,29 +240,28 @@ class FireParticleEmitter {
         cfg.sizeStops.map((s) => ({ value: s.scale, t: s.t })),
         t,
       );
-      const finalSize = p.baseSize * sizeScale;
+      const finalSize = p.baseSize * sizeScale * this.currentSizeScale;
 
       // Color over life
       lerpColorStops(cfg.colorStops, t, tmpColor);
 
       // Opacity over life
-      const opacity = lerpStops(
+      let opacity = lerpStops(
         cfg.opacityStops.map((s) => ({ value: s.opacity, t: s.t })),
         t,
       );
+      opacity *= this.currentOpacityScale;
 
-      // Write per-instance data
-      this.scaleArray[visibleCount] = finalSize;
-      const ci = visibleCount * 4;
-      this.colorArray[ci] = tmpColor.r;
-      this.colorArray[ci + 1] = tmpColor.g;
-      this.colorArray[ci + 2] = tmpColor.b;
-      this.colorArray[ci + 3] = opacity;
-      this.lifeArray[visibleCount] = t;
+      // Dim + shrink as opacity falls (MeshBasicMaterial has no per-instance alpha)
+      const alphaScale = Math.max(0, Math.min(1, opacity));
+      tmpColor.multiplyScalar(alphaScale * this.currentColorScale);
+      const scaledSize = Math.max(0.01, finalSize * (0.4 + 0.6 * alphaScale));
 
-      // Instance matrix: translation only (SpriteNodeMaterial handles billboard)
-      tmpMat.makeTranslation(p.position.x, p.position.y, p.position.z);
+      // Instance matrix: billboard towards camera + scale
+      tmpScale.set(scaledSize, scaledSize, scaledSize);
+      tmpMat.compose(p.position, billboardQuat, tmpScale);
       this.mesh.setMatrixAt(visibleCount, tmpMat);
+      this.mesh.setColorAt(visibleCount, tmpColor);
 
       visibleCount++;
     }
@@ -314,9 +269,9 @@ class FireParticleEmitter {
     this.mesh.count = visibleCount;
     if (visibleCount > 0) {
       this.mesh.instanceMatrix.needsUpdate = true;
-      this.lifeAttr.needsUpdate = true;
-      this.colorAttr.needsUpdate = true;
-      this.scaleAttr.needsUpdate = true;
+      if (this.mesh.instanceColor) {
+        this.mesh.instanceColor.needsUpdate = true;
+      }
     }
 
     // Spawn new particles
@@ -511,21 +466,21 @@ class FireParticleGroup {
     this.origin.copy(pos);
   }
 
-  update(dt: number): void {
+  update(dt: number, billboardQuat: THREE.Quaternion): void {
     // Flame origin slightly above ground
     const flameOrigin = FireParticleGroup._tmpVec.copy(this.origin);
     flameOrigin.y += 1;
-    this.flame.update(dt, flameOrigin);
+    this.flame.update(dt, flameOrigin, billboardQuat);
 
     // Smoke origin higher
     const smokeOrigin = FireParticleGroup._tmpVec2.copy(this.origin);
     smokeOrigin.y += 3;
-    this.smoke.update(dt, smokeOrigin);
+    this.smoke.update(dt, smokeOrigin, billboardQuat);
 
     // Ember origin mid
     const emberOrigin = FireParticleGroup._tmpVec3.copy(this.origin);
     emberOrigin.y += 2;
-    this.ember.update(dt, emberOrigin);
+    this.ember.update(dt, emberOrigin, billboardQuat);
   }
 
   setWindForce(wx: number, wz: number): void {
@@ -550,12 +505,33 @@ class FireParticleGroup {
 
 /* ── Constants ─────────────────────────────────────────────── */
 
-const DELAY_SEC = 10;
 const EMIT_INTERVAL = 1.0; // seconds between FIRE_SPREAD events per source
 const MAX_FIRES = 12;
 const SPAWN_CHECK_INTERVAL = 2.0; // seconds between spawn attempts per source
-const MIN_FIRE_SEPARATION = 20; // metres
-const SPAWN_CANDIDATES = 8;
+const MIN_FIRE_SEPARATION = 0; // metres
+const BRANCH_PUSH_SPEED = 3.2;
+const SPAWN_CANDIDATES = 30;
+const HEAT_UPDATE_INTERVAL = 0.5;
+const BUILDING_HEAT_GAIN = 0.9;
+const TREE_HEAT_GAIN = 1.4;
+const HEAT_DECAY = 0.5;
+const BUILDING_IGNITE_THRESHOLD = 1.2;
+const TREE_IGNITE_THRESHOLD = 0.6;
+const BUILDING_BIG_FIRE_THRESHOLD = 1.2;
+const BUILDING_HEAT_RANGE_PAD = 18;
+const TREE_HEAT_RANGE_PAD = 22;
+const FLOOR_HEIGHT = 3;
+const FLOOR_IGNITE_INTERVAL = 1.4;
+const HEAT_DIR_RANGE_BUILDING = 70;
+const HEAT_DIR_RANGE_TREE = 55;
+const HEAT_DIR_SAMPLE_BUILDINGS = 120;
+const HEAT_DIR_SAMPLE_TREES = 80;
+const HEAT_DRIFT_SPEED = 1.2;
+const GROUND_BURN_INTERVAL = 0.25;
+const GROUND_BURN_ALPHA = 0.45;
+const GROUND_BURN_RADIUS_SCALE = 0.32;
+const BRANCH_STALL_SECONDS = 2.0;
+const BRANCH_PAUSE_SECONDS = 1.0;
 
 /* ── Types ─────────────────────────────────────────────────── */
 
@@ -566,6 +542,15 @@ interface FireSource {
   radius: number;
   maxIntensity: number;
   maxRadius: number;
+  baseMaxRadius: number;
+  branchDir: THREE.Vector2;
+  anchor?: { type: "building" | "tree" | "ground"; index: number; yOffset: number };
+  stallUntil: number;
+  lockedDir: boolean;
+  stalled: boolean;
+  pauseUntil: number;
+  paused: boolean;
+  distanceSinceCycle: number;
   growthDuration: number;  // seconds to reach max
   growthRate: number;      // 1/growthDuration
   isDead: boolean;
@@ -588,6 +573,101 @@ interface WindState {
   gustInterval: number;
 }
 
+interface BuildingFireState {
+  heat: number;
+  ignited: boolean;
+  floors: number;
+  litFloors: number;
+  floorTimer: number;
+  bigFireSpawned: boolean;
+}
+
+interface TreeFireState {
+  heat: number;
+  ignited: boolean;
+}
+
+function applyEmissive(mesh: THREE.Mesh, color: THREE.Color, intensity: number): void {
+  const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+  for (const mat of mats) {
+    if ("emissive" in mat) {
+      const m = mat as THREE.MeshPhongMaterial | THREE.MeshStandardMaterial;
+      m.emissive.copy(color);
+      m.emissiveIntensity = intensity;
+      m.needsUpdate = true;
+    }
+  }
+}
+
+let cachedWaterCtx: CanvasRenderingContext2D | null = null;
+function isWaterAt(x: number, z: number): boolean {
+  if (!terrainCanvasRef || !terrainBoundsRef) return false;
+  const b = terrainBoundsRef;
+  const u = (x - b.xMin) / b.width;
+  const v = (z - b.zMin) / b.depth;
+  if (u < 0 || u > 1 || v < 0 || v > 1) return false;
+  const tex = terrainCanvasRef.width;
+  const px = Math.min(tex - 1, Math.max(0, Math.floor(u * tex)));
+  const py = Math.min(tex - 1, Math.max(0, Math.floor(v * tex)));
+  if (!cachedWaterCtx) {
+    cachedWaterCtx = terrainCanvasRef.getContext("2d", { willReadFrequently: true } as any);
+  }
+  const ctx = cachedWaterCtx;
+  if (!ctx) return false;
+  const data = ctx.getImageData(px, py, 1, 1).data;
+  const r = data[0] ?? 0;
+  const g = data[1] ?? 0;
+  const bcol = data[2] ?? 0;
+  // Water color is painted around #3388cc
+  return bcol > 140 && g > 90 && r < 90;
+}
+
+function getBuildingIndexAt(x: number, z: number): number {
+  for (let i = 0; i < buildingRegistry.length; i++) {
+    const b = buildingRegistry[i]!;
+    const half = Math.max(3, b.width * 0.5);
+    if (Math.abs(x - b.centerX) <= half && Math.abs(z - b.centerZ) <= half) return i;
+  }
+  return -1;
+}
+
+function isInsideBuilding(x: number, z: number): boolean {
+  return getBuildingIndexAt(x, z) >= 0;
+}
+
+function clampToBuildingEdge(x: number, z: number, b: { centerX: number; centerZ: number; width: number }): { x: number; z: number } {
+  const half = Math.max(3, b.width * 0.5);
+  const dx = x - b.centerX;
+  const dz = z - b.centerZ;
+  const absDx = Math.abs(dx);
+  const absDz = Math.abs(dz);
+  if (absDx <= half && absDz <= half) {
+    if (absDx >= absDz) {
+      const nx = b.centerX + Math.sign(dx || 1) * (half + 1.5);
+      return { x: nx, z };
+    }
+    const nz = b.centerZ + Math.sign(dz || 1) * (half + 1.5);
+    return { x, z: nz };
+  }
+  return { x, z };
+}
+
+function isBlocked(x: number, z: number): boolean {
+  return isWaterAt(x, z) || isInsideBuilding(x, z);
+}
+
+function nudgeOffWater(x: number, z: number): { x: number; z: number } {
+  if (!isWaterAt(x, z)) return { x, z };
+  const step = 4;
+  for (let i = 0; i < 12; i++) {
+    const ang = (i / 12) * Math.PI * 2;
+    const nx = x + Math.cos(ang) * step;
+    const nz = z + Math.sin(ang) * step;
+    if (!isWaterAt(nx, nz)) return { x: nx, z: nz };
+  }
+  return { x, z };
+}
+
 /* ── FireSourceManager ────────────────────────────────────── */
 
 class FireSourceManager {
@@ -598,6 +678,14 @@ class FireSourceManager {
   private wind: WindState;
   private systemElapsed = 0;
   private maxFires: number;
+  private billboardQuat = new THREE.Quaternion();
+  private heatTimer = 0;
+  private burnTimer = 0;
+  private buildingStates: BuildingFireState[] = [];
+  private treeStates: TreeFireState[] = [];
+  private heatDir = new THREE.Vector2(0, 0);
+  private heatVec = new THREE.Vector2(0, 0);
+  private static _tmpVec = new THREE.Vector3();
 
   // Shared textures (created once, reused across all fire sources)
   private flameTex: THREE.Texture;
@@ -623,15 +711,68 @@ class FireSourceManager {
       gustTimer: 0,
       gustInterval: 6 + Math.random() * 6,
     };
+
+    this.buildingStates = buildingRegistry.map((b) => ({
+      heat: 0,
+      ignited: false,
+      floors: Math.max(1, Math.round(b.height / FLOOR_HEIGHT)),
+      litFloors: 0,
+      floorTimer: 0,
+      bigFireSpawned: false,
+    }));
+    this.treeStates = treeRegistry.map(() => ({ heat: 0, ignited: false }));
   }
 
   spawnPrimary(offsetX = 0, offsetZ = 0, maxRadius = 35): void {
     const y = this.sampler ? this.sampler.sample(offsetX, offsetZ) : 0;
-    this.spawnFire(new THREE.Vector3(offsetX, y, offsetZ), maxRadius, 0.8, 30);
+    const bIdx = getBuildingIndexAt(offsetX, offsetZ);
+    let sx = offsetX;
+    let sz = offsetZ;
+    if (bIdx >= 0) {
+      const b = buildingRegistry[bIdx]!;
+      const clamped = clampToBuildingEdge(offsetX, offsetZ, b);
+      sx = clamped.x;
+      sz = clamped.z;
+    }
+    const nudged = nudgeOffWater(sx, sz);
+    sx = nudged.x;
+    sz = nudged.z;
+    const anchor = { type: "ground" as const, index: -1, yOffset: 0 };
+    const spawnY = this.sampler ? this.sampler.sample(sx, sz) : y;
+    this.spawnFire(
+      new THREE.Vector3(sx, spawnY, sz),
+      maxRadius,
+      0.8,
+      30,
+      anchor,
+    );
     console.log(`[TestFire] Primary fire started at (${offsetX.toFixed(1)}, ${offsetZ.toFixed(1)}) radius=${maxRadius}`);
   }
 
-  private spawnFire(pos: THREE.Vector3, maxRadius: number, maxIntensity: number, growthDuration: number): FireSource {
+  spawnAt(pos: THREE.Vector3, maxRadius: number, maxIntensity = 0.8, growthDuration = 30): FireSource {
+    let sx = pos.x;
+    let sz = pos.z;
+    const bIdx = getBuildingIndexAt(sx, sz);
+    if (bIdx >= 0) {
+      const b = buildingRegistry[bIdx]!;
+      const clamped = clampToBuildingEdge(sx, sz, b);
+      sx = clamped.x;
+      sz = clamped.z;
+    }
+    const nudged = nudgeOffWater(sx, sz);
+    sx = nudged.x;
+    sz = nudged.z;
+    const y = this.sampler ? this.sampler.sample(sx, sz) : pos.y;
+    return this.spawnFire(new THREE.Vector3(sx, y, sz), maxRadius, maxIntensity, growthDuration, { type: "ground", index: -1, yOffset: 0 });
+  }
+
+  private spawnFire(
+    pos: THREE.Vector3,
+    maxRadius: number,
+    maxIntensity: number,
+    growthDuration: number,
+    anchor?: { type: "building" | "tree" | "ground"; index: number; yOffset: number },
+  ): FireSource {
     const group = new THREE.Group();
     group.position.copy(pos);
 
@@ -665,6 +806,15 @@ class FireSourceManager {
       radius: 5,
       maxIntensity,
       maxRadius,
+      baseMaxRadius: maxRadius,
+      branchDir: new THREE.Vector2((Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2).normalize(),
+      anchor,
+      stallUntil: this.systemElapsed + BRANCH_STALL_SECONDS,
+      lockedDir: false,
+      stalled: false,
+      pauseUntil: this.systemElapsed + BRANCH_STALL_SECONDS + BRANCH_PAUSE_SECONDS,
+      paused: false,
+      distanceSinceCycle: 0,
       growthDuration,
       growthRate: 1 / growthDuration,
       isDead: false,
@@ -680,21 +830,106 @@ class FireSourceManager {
     return source;
   }
 
+  private spawnFireAt(
+    pos: THREE.Vector3,
+    maxRadius: number,
+    maxIntensity: number,
+    growthDuration: number,
+    anchor?: { type: "building" | "tree" | "ground"; index: number; yOffset: number },
+  ): FireSource {
+    return this.spawnFire(pos, maxRadius, maxIntensity, growthDuration, anchor);
+  }
+
+  setBillboardQuaternion(q: THREE.Quaternion): void {
+    this.billboardQuat.copy(q);
+  }
+
   update(dt: number): void {
     this.systemElapsed += dt;
     this.updateWind(dt);
 
+    const toRemove: FireSource[] = [];
     for (const src of this.sources) {
       if (src.isDead) continue;
+      const isAnchored = !!(src.anchor && src.anchor.type !== "ground");
+      if (terrainBoundsRef) {
+        const b = terrainBoundsRef;
+        if (src.position.x < b.xMin || src.position.x > b.xMax || src.position.z < b.zMin || src.position.z > b.zMax) {
+          src.isDead = true;
+          toRemove.push(src);
+          continue;
+        }
+      }
+      // Anchor fires to flammable objects (no drifting through them)
+      if (src.anchor) {
+        if (src.anchor.type === "ground") {
+          // Keep the fire pinned to its initial ground position
+          // (position is already set at spawn; no updates needed)
+        } else if (src.anchor.type === "building") {
+          const b = buildingRegistry[src.anchor.index];
+          if (b) {
+            src.position.x = b.centerX;
+            src.position.z = b.centerZ;
+            src.position.y = b.baseY + src.anchor.yOffset;
+          }
+        } else {
+          const t = treeRegistry[src.anchor.index];
+          if (t) {
+            src.position.x = t.x;
+            src.position.z = t.z;
+            src.position.y = t.canopyMesh.position.y + src.anchor.yOffset;
+          }
+        }
+      }
+
       this.updateGrowth(src, dt);
       this.updateVisuals(src, dt);
       this.trySpawnChildren(src, dt);
+      // Push branches outward (only for drifting fires; pause during the branch window)
+      if (!isAnchored && !src.stalled && (this.systemElapsed < src.stallUntil || this.systemElapsed >= src.pauseUntil)) {
+        const push = BRANCH_PUSH_SPEED * (0.3 + (src.intensity / src.maxIntensity) * 0.7);
+        const nx = src.position.x + src.branchDir.x * push * dt;
+        const nz = src.position.z + src.branchDir.y * push * dt;
+        if (!isBlocked(nx, nz)) {
+          const dx = nx - src.position.x;
+          const dz = nz - src.position.z;
+          src.distanceSinceCycle += Math.hypot(dx, dz);
+          src.position.x = nx;
+          src.position.z = nz;
+        }
+        const idx = getBuildingIndexAt(src.position.x, src.position.z);
+        if (idx >= 0) {
+          const b = buildingRegistry[idx]!;
+          const clamped = clampToBuildingEdge(src.position.x, src.position.z, b);
+          src.position.x = clamped.x;
+          src.position.z = clamped.z;
+          src.stalled = true;
+        }
+        if (isBlocked(nx, nz) && !isAnchored) {
+          src.stalled = true;
+        }
+      }
     }
+
+    if (toRemove.length > 0) {
+      for (const src of toRemove) {
+        this.scene.remove(src.group);
+        this.scene.remove(src.particles.group);
+        src.particles.dispose();
+      }
+      for (const src of toRemove) {
+        const idx = this.sources.indexOf(src);
+        if (idx >= 0) this.sources.splice(idx, 1);
+      }
+    }
+
+    this.updateHeat(dt);
+    this.paintGroundBurn(dt);
 
     // Update all particle groups
     for (const src of this.sources) {
       if (src.isDead) continue;
-      src.particles.update(dt);
+      src.particles.update(dt, this.billboardQuat);
     }
   }
 
@@ -742,30 +977,125 @@ class FireSourceManager {
     src.radius = 5 + t * (src.maxRadius - 5);
   }
 
+  private computeHeatVector(src: FireSource): THREE.Vector2 {
+    this.heatVec.set(0, 0);
+    let total = 0;
+
+    const maxB = Math.min(buildingRegistry.length, HEAT_DIR_SAMPLE_BUILDINGS);
+    for (let i = 0; i < maxB; i++) {
+      const idx = Math.floor(Math.random() * buildingRegistry.length);
+      const b = buildingRegistry[idx]!;
+      const dx = b.centerX - src.position.x;
+      const dz = b.centerZ - src.position.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist > HEAT_DIR_RANGE_BUILDING || dist < 0.001) continue;
+      const w = 1 - dist / HEAT_DIR_RANGE_BUILDING;
+      this.heatVec.x += (dx / dist) * w;
+      this.heatVec.y += (dz / dist) * w;
+      total += w;
+    }
+
+    const maxT = Math.min(treeRegistry.length, HEAT_DIR_SAMPLE_TREES);
+    for (let i = 0; i < maxT; i++) {
+      const idx = Math.floor(Math.random() * treeRegistry.length);
+      const t = treeRegistry[idx]!;
+      const dx = t.x - src.position.x;
+      const dz = t.z - src.position.z;
+      const dist = Math.hypot(dx, dz);
+      if (dist > HEAT_DIR_RANGE_TREE || dist < 0.001) continue;
+      const w = 1 - dist / HEAT_DIR_RANGE_TREE;
+      this.heatVec.x += (dx / dist) * w * 1.3;
+      this.heatVec.y += (dz / dist) * w * 1.3;
+      total += w;
+    }
+
+    if (total > 0.0001) {
+      this.heatVec.multiplyScalar(1 / total);
+      return this.heatVec.normalize();
+    }
+
+    // fallback to wind direction if no nearby heat targets
+    this.heatVec.set(this.wind.direction.x, this.wind.direction.y).normalize();
+    return this.heatVec;
+  }
+
   private trySpawnChildren(src: FireSource, dt: number): void {
     if (this.sources.length >= this.maxFires) return;
     if (src.intensity < 0.3 * src.maxIntensity) return;
+    if (this.systemElapsed < src.stallUntil) return;
+    if (!src.paused && this.systemElapsed >= src.pauseUntil) {
+      if (src.distanceSinceCycle < 3) {
+        // Not enough movement to spawn new primaries; restart cycle
+        src.stallUntil = this.systemElapsed + BRANCH_STALL_SECONDS;
+        src.pauseUntil = src.stallUntil + BRANCH_PAUSE_SECONDS;
+        return;
+      }
+      src.paused = true;
+      // Spawn a burst of new primaries (branch copies)
+      const burst = 3 + Math.floor(Math.random() * 2);
+      for (let i = 0; i < burst && this.sources.length < this.maxFires; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const jitterR = Math.max(1.5, src.radius * 0.35) + Math.random() * 2.5;
+        let cx = src.position.x + Math.cos(angle) * jitterR;
+        let cz = src.position.z + Math.sin(angle) * jitterR;
+        const bIdx = getBuildingIndexAt(cx, cz);
+        if (bIdx >= 0) {
+          const b = buildingRegistry[bIdx]!;
+          const clamped = clampToBuildingEdge(cx, cz, b);
+          cx = clamped.x;
+          cz = clamped.z;
+        }
+        const nudged = nudgeOffWater(cx, cz);
+        cx = nudged.x;
+        cz = nudged.z;
+        if (isBlocked(cx, cz)) continue;
+        const y = this.sampler ? this.sampler.sample(cx, cz) : src.position.y;
+        const branch = this.spawnFireAt(new THREE.Vector3(cx, y, cz), src.maxRadius * 0.9, 0.7, 20);
+        branch.branchDir.set(Math.cos(angle), Math.sin(angle)).normalize();
+      }
+      // Reset for next cycle
+      src.stallUntil = this.systemElapsed + BRANCH_STALL_SECONDS;
+      src.pauseUntil = src.stallUntil + BRANCH_PAUSE_SECONDS;
+      src.paused = false;
+      src.distanceSinceCycle = 0;
+    }
 
     src.spawnTimer += dt;
     if (src.spawnTimer < SPAWN_CHECK_INTERVAL) return;
     src.spawnTimer = 0;
 
-    // Sample candidate positions around perimeter
+    // Sample candidate positions around perimeter (all directions)
     const windAngle = Math.atan2(this.wind.direction.y, this.wind.direction.x);
+    const heatDir = this.computeHeatVector(src);
+    if (!src.lockedDir) {
+      src.branchDir.copy(heatDir).normalize();
+      src.lockedDir = true;
+    }
 
     for (let i = 0; i < SPAWN_CANDIDATES; i++) {
       if (this.sources.length >= this.maxFires) break;
 
-      const candidateAngle = (i / SPAWN_CANDIDATES) * Math.PI * 2;
-      const offset = src.radius + 5 + Math.random() * 10;
-      const cx = src.position.x + Math.cos(candidateAngle) * offset;
-      const cz = src.position.z + Math.sin(candidateAngle) * offset;
+      const baseAngle = Math.atan2(heatDir.y, heatDir.x);
+      const jitter = (Math.random() - 0.5) * Math.PI;
+      const candidateAngle = baseAngle + jitter;
+      // Spawn at origin, then branch outward over time
+      const jitterR = 0.5 + Math.random() * 1.0;
+      let cx = src.position.x + Math.cos(candidateAngle) * jitterR;
+      let cz = src.position.z + Math.sin(candidateAngle) * jitterR;
+      const bIdx = getBuildingIndexAt(cx, cz);
+      if (bIdx >= 0) {
+        const b = buildingRegistry[bIdx]!;
+        const clamped = clampToBuildingEdge(cx, cz, b);
+        cx = clamped.x;
+        cz = clamped.z;
+      }
+      if (isBlocked(cx, cz)) continue;
 
       // Wind bias: candidates downwind get +0.3 probability
       const angleDiff = Math.abs(((candidateAngle - windAngle + Math.PI) % (Math.PI * 2)) - Math.PI);
       const windBonus = angleDiff < Math.PI / 2 ? 0.3 : 0;
 
-      const spawnProb = (src.intensity / src.maxIntensity) * 0.15 + windBonus;
+      const spawnProb = (src.intensity / src.maxIntensity) * 0.28 + windBonus + 0.1;
       if (Math.random() > spawnProb) continue;
 
       // Check separation from all existing fires
@@ -782,11 +1112,49 @@ class FireSourceManager {
       if (tooClose) continue;
 
       const y = this.sampler ? this.sampler.sample(cx, cz) : 0;
-      const newMaxRadius = 15 + Math.random() * 10;
-      const newMaxIntensity = 0.5 + Math.random() * 0.2;
-      const newGrowthDuration = 20 + Math.random() * 10;
+      // Heat score to decide branching and size
+      let heatScore = 0;
+      const rangeB = HEAT_DIR_RANGE_BUILDING * 0.7;
+      const rangeT = HEAT_DIR_RANGE_TREE * 0.7;
+      for (let j = 0; j < 20 && buildingRegistry.length > 0; j++) {
+        const b = buildingRegistry[Math.floor(Math.random() * buildingRegistry.length)]!;
+        const dx = b.centerX - cx;
+        const dz = b.centerZ - cz;
+        const dist = Math.hypot(dx, dz);
+        if (dist < rangeB) heatScore += 1 - dist / rangeB;
+      }
+      for (let j = 0; j < 16 && treeRegistry.length > 0; j++) {
+        const t = treeRegistry[Math.floor(Math.random() * treeRegistry.length)]!;
+        const dx = t.x - cx;
+        const dz = t.z - cz;
+        const dist = Math.hypot(dx, dz);
+        if (dist < rangeT) heatScore += (1 - dist / rangeT) * 1.3;
+      }
+      heatScore = Math.min(1.5, heatScore / 6);
 
-      this.spawnFire(new THREE.Vector3(cx, y, cz), newMaxRadius, newMaxIntensity, newGrowthDuration);
+      const newMaxRadius = 12 + heatScore * 18 + Math.random() * 6;
+      const newMaxIntensity = 0.5 + heatScore * 0.35;
+      const newGrowthDuration = 14 + Math.random() * 10;
+
+      const newSource = this.spawnFire(new THREE.Vector3(cx, y, cz), newMaxRadius, newMaxIntensity, newGrowthDuration);
+      newSource.branchDir.set(Math.cos(candidateAngle), Math.sin(candidateAngle)).normalize();
+      // Branching: creep the parent toward the new hotspot and let it grow larger
+      if (!isBlocked(cx, cz)) {
+        src.position.lerp(new THREE.Vector3(cx, src.position.y, cz), 0.12);
+      }
+      src.maxRadius = Math.min(src.baseMaxRadius * 2.0, src.maxRadius * (1.04 + heatScore * 0.08));
+
+      if (heatScore > 0.9 && this.sources.length < this.maxFires) {
+        const extraAngle = candidateAngle + (Math.random() - 0.5) * 0.8;
+        const ex = src.position.x + Math.cos(extraAngle) * (offset * 0.6);
+        const ez = src.position.z + Math.sin(extraAngle) * (offset * 0.6);
+        if (isBlocked(ex, ez)) {
+          continue;
+        }
+        const ey = this.sampler ? this.sampler.sample(ex, ez) : 0;
+        const extra = this.spawnFire(new THREE.Vector3(ex, ey, ez), newMaxRadius * 0.9, newMaxIntensity * 0.95, newGrowthDuration);
+        extra.branchDir.set(Math.cos(extraAngle), Math.sin(extraAngle)).normalize();
+      }
       console.log(`[TestFire] Secondary fire spawned at (${cx.toFixed(1)}, ${cz.toFixed(1)}) — total fires: ${this.sources.length}`);
     }
   }
@@ -798,13 +1166,18 @@ class FireSourceManager {
 
     // Scale emission rates with intensity
     src.particles.flame.currentEmissionRate = t * 60;
-    src.particles.smoke.currentEmissionRate = t * 15;
+    src.particles.smoke.currentEmissionRate = t * 18;
     src.particles.ember.currentEmissionRate = t * 12;
 
     // Scale emitter radius with fire spread
     src.particles.flame.currentEmitterRadius = Math.max(1, src.radius * 0.3);
     src.particles.smoke.currentEmitterRadius = Math.max(1, src.radius * 0.3);
     src.particles.ember.currentEmitterRadius = Math.max(0.5, src.radius * 0.15);
+
+    // Smoke size + darkness scale with intensity
+    src.particles.smoke.currentSizeScale = 0.9 + t * 1.6;
+    src.particles.smoke.currentOpacityScale = 0.5 + t * 0.9;
+    src.particles.smoke.currentColorScale = Math.max(0.35, 0.9 - t * 0.45);
 
     // Update wind force directions
     const wx = this.wind.direction.x * this.wind.speed;
@@ -820,60 +1193,236 @@ class FireSourceManager {
 
     // Ground scorch disabled
   }
+
+  private paintGroundBurn(dt: number): void {
+    if (!terrainCanvasRef || !terrainBoundsRef || !terrainTextureRef) return;
+    this.burnTimer += dt;
+    if (this.burnTimer < GROUND_BURN_INTERVAL) return;
+    this.burnTimer = 0;
+
+    const b = terrainBoundsRef;
+    const tex = terrainCanvasRef.width;
+    const ctx = cachedWaterCtx ?? terrainCanvasRef.getContext("2d", { willReadFrequently: true } as any);
+    if (!cachedWaterCtx && ctx) cachedWaterCtx = ctx;
+    if (!ctx) return;
+
+    for (const src of this.sources) {
+      if (src.isDead || src.intensity <= 0.2) continue;
+      const u = (src.position.x - b.xMin) / b.width;
+      const v = (src.position.z - b.zMin) / b.depth;
+      if (u < 0 || u > 1 || v < 0 || v > 1) continue;
+      const cx = u * tex;
+      const cy = v * tex;
+      const r = Math.max(2, (src.radius / b.width) * tex * GROUND_BURN_RADIUS_SCALE);
+      ctx.save();
+      ctx.globalAlpha = GROUND_BURN_ALPHA * Math.min(1, src.intensity / src.maxIntensity);
+      ctx.fillStyle = "#000000";
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+    terrainTextureRef.needsUpdate = true;
+  }
+
+  private updateHeat(dt: number): void {
+    this.heatTimer += dt;
+    if (this.heatTimer < HEAT_UPDATE_INTERVAL) return;
+    const step = this.heatTimer;
+    this.heatTimer = 0;
+
+    const activeSources = this.sources.filter((s) => !s.isDead && s.intensity > 0.2);
+
+    // Buildings: accumulate heat from nearby fires
+    for (let i = 0; i < buildingRegistry.length; i++) {
+      const b = buildingRegistry[i]!;
+      const state = this.buildingStates[i]!;
+
+      let heatAdd = 0;
+      for (const src of activeSources) {
+        const dx = b.centerX - src.position.x;
+        const dz = b.centerZ - src.position.z;
+        const dist = Math.hypot(dx, dz);
+        const range = src.radius + BUILDING_HEAT_RANGE_PAD;
+        if (dist <= Math.max(3, b.width * 0.5)) {
+          // Fire is inside/against the footprint — immediate heating
+          heatAdd += 1.8 * src.intensity;
+          continue;
+        }
+        if (dist > range) continue;
+        const falloff = 1 - dist / range;
+        heatAdd += falloff * src.intensity;
+      }
+
+      state.heat = Math.max(0, state.heat - HEAT_DECAY * step * 0.6);
+      if (heatAdd > 0) {
+        state.heat += heatAdd * BUILDING_HEAT_GAIN * step * 1.4;
+      }
+
+      if (!state.ignited && state.heat >= BUILDING_IGNITE_THRESHOLD) {
+        state.ignited = true;
+        state.floorTimer = 0;
+        state.litFloors = 0;
+        applyEmissive(b.mesh, new THREE.Color(0x552200), 0.2);
+      }
+
+      if (state.ignited) {
+        state.floorTimer += step;
+        while (state.litFloors < state.floors && state.floorTimer >= FLOOR_IGNITE_INTERVAL) {
+          state.floorTimer -= FLOOR_IGNITE_INTERVAL;
+          state.litFloors++;
+
+          const y = b.baseY + Math.min(b.height - 1, state.litFloors * FLOOR_HEIGHT - 0.5);
+          if (this.sources.length < this.maxFires) {
+            this.spawnFireAt(
+              new THREE.Vector3(b.centerX, y, b.centerZ),
+              10,
+              0.55,
+              18,
+              { type: "building", index: i, yOffset: y - b.baseY },
+            );
+            // drifting copy
+            const drift = this.spawnFireAt(
+              new THREE.Vector3(b.centerX, y, b.centerZ),
+              8,
+              0.45,
+              16,
+            );
+            drift.branchDir.set(Math.random() - 0.5, Math.random() - 0.5).normalize();
+          }
+          state.ignited = true;
+        }
+        const ratio = Math.min(1, state.litFloors / Math.max(1, state.floors));
+        applyEmissive(b.mesh, new THREE.Color(0x662200), 0.15 + 0.35 * ratio);
+      }
+
+      if (!state.bigFireSpawned && state.heat >= BUILDING_BIG_FIRE_THRESHOLD) {
+        state.bigFireSpawned = true;
+        const base = Math.max(12, b.width * 0.8);
+        const bigRadius = Math.min(80, base + b.height * 0.08);
+        const y = b.baseY + Math.min(b.height - 1, b.height * 0.5);
+        if (this.sources.length < this.maxFires) {
+          this.spawnFireAt(
+            new THREE.Vector3(b.centerX, y, b.centerZ),
+            bigRadius,
+            0.95,
+            22,
+            { type: "building", index: i, yOffset: y - b.baseY },
+          );
+          const drift = this.spawnFireAt(
+            new THREE.Vector3(b.centerX, y, b.centerZ),
+            bigRadius * 0.6,
+            0.7,
+            18,
+          );
+          drift.branchDir.set(Math.random() - 0.5, Math.random() - 0.5).normalize();
+        }
+      }
+    }
+
+    // Trees: heat up faster, ignite quickly
+    for (let i = 0; i < treeRegistry.length; i++) {
+      const t = treeRegistry[i]!;
+      const state = this.treeStates[i]!;
+
+      let heatAdd = 0;
+      for (const src of activeSources) {
+        const dx = t.x - src.position.x;
+        const dz = t.z - src.position.z;
+        const range = src.radius + TREE_HEAT_RANGE_PAD;
+        const dist = Math.hypot(dx, dz);
+        if (dist > range) continue;
+        const falloff = 1 - dist / range;
+        heatAdd += falloff * src.intensity;
+      }
+
+      state.heat = Math.max(0, state.heat - HEAT_DECAY * step);
+      if (heatAdd > 0) {
+        state.heat += heatAdd * TREE_HEAT_GAIN * step;
+      }
+
+      if (!state.ignited && state.heat >= TREE_IGNITE_THRESHOLD) {
+        state.ignited = true;
+        t.canopyMesh.material = (t.canopyMesh.material as THREE.MeshPhongMaterial).clone();
+        (t.canopyMesh.material as THREE.MeshPhongMaterial).color.set(0x2b2b2b);
+        if (this.sources.length < this.maxFires) {
+          const y = t.canopyMesh.position.y - 1.5;
+          this.spawnFireAt(new THREE.Vector3(t.x, y, t.z), 7, 0.45, 14, { type: "tree", index: i, yOffset: -1.5 });
+          const drift = this.spawnFireAt(new THREE.Vector3(t.x, y, t.z), 6, 0.4, 12);
+          drift.branchDir.set(Math.random() - 0.5, Math.random() - 0.5).normalize();
+        }
+      }
+    }
+  }
 }
 
 /* ── Public entry point ──────────────────────────────────── */
 
-export interface FireConfig {
-  offsetX: number;      // meters offset from center
-  offsetZ: number;      // meters offset from center
-  maxRadius: number;    // initial fire max radius (default 35)
-  maxFires: number;     // max secondary fires (default 12)
-}
+const DEFAULT_FIRE_MAX_RADIUS = 35;
+const DEFAULT_FIRE_MAX_FIRES = 12;
 
-export const DEFAULT_FIRE_CONFIG: FireConfig = {
-  offsetX: 0,
-  offsetZ: 0,
-  maxRadius: 35,
-  maxFires: 12,
-};
+export class FireSimulator {
+  active = false;
+  maxRadius = DEFAULT_FIRE_MAX_RADIUS;
+  maxFires = DEFAULT_FIRE_MAX_FIRES;
 
-export function startTestFire(scene: THREE.Scene, eventBus: EventBus, sampler?: HeightSampler, config?: FireConfig): void {
-  const cfg = config ?? DEFAULT_FIRE_CONFIG;
-  const manager = new FireSourceManager(scene, eventBus, sampler, cfg.maxFires);
+  private scene: THREE.Scene;
+  private eventBus: EventBus | null = null;
+  private sampler?: HeightSampler;
+  private manager: FireSourceManager | null = null;
+  private emitTimer = 0;
+  private billboardQuat = new THREE.Quaternion();
 
-  let started = false;
-  let delayElapsed = 0;
-  let emitTimer = 0;
-
-  let prev = performance.now();
-
-  function tick() {
-    const now = performance.now();
-    const dt = (now - prev) / 1000;
-    prev = now;
-
-    if (!started) {
-      delayElapsed += dt;
-      if (delayElapsed >= DELAY_SEC) {
-        started = true;
-        manager.spawnPrimary(cfg.offsetX, cfg.offsetZ, cfg.maxRadius);
-      }
-      requestAnimationFrame(tick);
-      return;
-    }
-
-    manager.update(dt);
-
-    // Emit FIRE_SPREAD events periodically
-    emitTimer += dt;
-    if (emitTimer >= EMIT_INTERVAL) {
-      emitTimer -= EMIT_INTERVAL;
-      manager.emitEvents();
-    }
-
-    requestAnimationFrame(tick);
+  constructor(scene: THREE.Scene) {
+    this.scene = scene;
   }
 
-  requestAnimationFrame(tick);
+  setContext(eventBus: EventBus | null, sampler?: HeightSampler): void {
+    this.eventBus = eventBus;
+    this.sampler = sampler;
+  }
+
+  setBillboardQuaternion(q: THREE.Quaternion): void {
+    this.billboardQuat.copy(q);
+    if (this.manager) this.manager.setBillboardQuaternion(this.billboardQuat);
+  }
+
+  setMaxRadius(radius: number): void {
+    this.maxRadius = Math.max(5, radius);
+  }
+
+  setMaxFires(count: number): void {
+    this.maxFires = Math.max(1, count);
+  }
+
+  spawn(position: THREE.Vector3): void {
+    if (!this.eventBus) return;
+    if (!this.manager) {
+      this.manager = new FireSourceManager(this.scene, this.eventBus, this.sampler, this.maxFires);
+      this.manager.spawnPrimary(position.x, position.z, this.maxRadius);
+      this.active = true;
+      this.emitTimer = 0;
+      return;
+    }
+    // Add a new primary without freezing existing fires
+    this.manager.spawnAt(position, this.maxRadius, 0.8, 30);
+    this.active = true;
+  }
+
+  stop(): void {
+    this.active = false;
+    this.emitTimer = 0;
+    this.manager = null;
+  }
+
+  update(dt: number): void {
+    if (!this.active || !this.manager) return;
+    this.manager.setBillboardQuaternion(this.billboardQuat);
+    this.manager.update(dt);
+    this.emitTimer += dt;
+    if (this.emitTimer >= EMIT_INTERVAL) {
+      this.emitTimer -= EMIT_INTERVAL;
+      this.manager.emitEvents();
+    }
+  }
 }
