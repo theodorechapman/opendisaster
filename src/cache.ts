@@ -1,7 +1,7 @@
 /** Server-side: SQLite cache for all GeoJSON layer data. */
 
 import { Database } from "bun:sqlite";
-import type { LayerData } from "./overpass.ts";
+import type { LayerData } from "./tiles.ts";
 
 const db = new Database("buildings.db", { create: true });
 

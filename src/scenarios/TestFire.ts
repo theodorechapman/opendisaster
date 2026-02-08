@@ -610,7 +610,7 @@ function isWaterAt(x: number, z: number): boolean {
   const px = Math.min(tex - 1, Math.max(0, Math.floor(u * tex)));
   const py = Math.min(tex - 1, Math.max(0, Math.floor(v * tex)));
   if (!cachedWaterCtx) {
-    cachedWaterCtx = terrainCanvasRef.getContext("2d", { willReadFrequently: true } as any);
+    cachedWaterCtx = terrainCanvasRef.getContext("2d", { willReadFrequently: true }) as CanvasRenderingContext2D | null;
   }
   const ctx = cachedWaterCtx;
   if (!ctx) return false;
@@ -1146,8 +1146,8 @@ class FireSourceManager {
 
       if (heatScore > 0.9 && this.sources.length < this.maxFires) {
         const extraAngle = candidateAngle + (Math.random() - 0.5) * 0.8;
-        const ex = src.position.x + Math.cos(extraAngle) * (offset * 0.6);
-        const ez = src.position.z + Math.sin(extraAngle) * (offset * 0.6);
+        const ex = src.position.x + Math.cos(extraAngle) * (jitterR * 0.6);
+        const ez = src.position.z + Math.sin(extraAngle) * (jitterR * 0.6);
         if (isBlocked(ex, ez)) {
           continue;
         }
@@ -1202,7 +1202,7 @@ class FireSourceManager {
 
     const b = terrainBoundsRef;
     const tex = terrainCanvasRef.width;
-    const ctx = cachedWaterCtx ?? terrainCanvasRef.getContext("2d", { willReadFrequently: true } as any);
+    const ctx = cachedWaterCtx ?? terrainCanvasRef.getContext("2d", { willReadFrequently: true }) as CanvasRenderingContext2D | null;
     if (!cachedWaterCtx && ctx) cachedWaterCtx = ctx;
     if (!ctx) return;
 

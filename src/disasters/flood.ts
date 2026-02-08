@@ -1195,7 +1195,8 @@ class FloodWaterSurface {
         const dist = Math.sqrt(dx * dx + dz * dz);
         if (dist > radiusMeters) continue;
         const w = Math.exp(-dist * dist / (radiusMeters * radiusMeters * 0.25));
-        this.waveVelocity[j * r.width + i] += strength * w;
+        const idx = j * r.width + i;
+        this.waveVelocity[idx] = (this.waveVelocity[idx] ?? 0) + strength * w;
       }
     }
   }

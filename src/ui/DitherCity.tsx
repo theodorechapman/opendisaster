@@ -530,7 +530,7 @@ export function DitherCityBackground() {
 
     // ── Init ──
     async function start() {
-      const gpu = await initWebGPU(canvas, cw, ch);
+      const gpu = await initWebGPU(canvas!, cw, ch);
 
       if (gpu) {
         // WebGPU path
@@ -574,7 +574,7 @@ export function DitherCityBackground() {
         window.addEventListener("resize", handleResize);
 
         // For CPU fallback, draw directly to the visible canvas
-        const fallbackCtx = canvas.getContext("2d")!;
+        const fallbackCtx = canvas!.getContext("2d")!;
 
         function draw(time: number) {
           if (destroyed) return;
