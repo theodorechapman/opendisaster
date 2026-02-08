@@ -13,7 +13,7 @@ import { SteppedSimulation } from "./agents/SteppedSimulation.ts";
 import { ReplayRecorder } from "./replay/ReplayRecorder.ts";
 import { createAgentActionSystem, type Obstacle } from "./agents/AgentActionSystem.ts";
 import { createAgentDamageSystem } from "./agents/AgentDamageSystem.ts";
-import { startTestFire } from "./scenarios/TestFire.ts";
+import { startTestFire, type FireConfig } from "./scenarios/TestFire.ts";
 import type { AgentConfig } from "./agents/types.ts";
 import { Position } from "./core/Components.ts";
 import { ReplayCaptureSystem } from "./replay/ReplayCaptureSystem.ts";
@@ -33,6 +33,25 @@ const loading = document.getElementById("loading")!;
 const hud = document.getElementById("hud")!;
 const info = document.getElementById("info")!;
 const stopSimBtn = document.getElementById("stop-sim-btn") as HTMLButtonElement;
+
+// Fire config panel elements
+const fireConfigPanel = document.getElementById("fire-config-panel")!;
+const fireXInput = document.getElementById("fire-x") as HTMLInputElement;
+const fireZInput = document.getElementById("fire-z") as HTMLInputElement;
+const fireSizeInput = document.getElementById("fire-size") as HTMLInputElement;
+const fireSpreadInput = document.getElementById("fire-spread") as HTMLInputElement;
+const fireXVal = document.getElementById("fire-x-val")!;
+const fireZVal = document.getElementById("fire-z-val")!;
+const fireSizeVal = document.getElementById("fire-size-val")!;
+const fireSpreadVal = document.getElementById("fire-spread-val")!;
+const fireStartBtn = document.getElementById("fire-start-btn") as HTMLButtonElement;
+const fireBackBtn = document.getElementById("fire-back-btn") as HTMLButtonElement;
+
+// Live value updates for fire sliders
+fireXInput.addEventListener("input", () => { fireXVal.textContent = fireXInput.value; });
+fireZInput.addEventListener("input", () => { fireZVal.textContent = fireZInput.value; });
+fireSizeInput.addEventListener("input", () => { fireSizeVal.textContent = fireSizeInput.value; });
+fireSpreadInput.addEventListener("input", () => { fireSpreadVal.textContent = fireSpreadInput.value; });
 
 sizeInput.addEventListener("input", () => {
   sizeVal.textContent = sizeInput.value;
@@ -129,7 +148,7 @@ interface ScenarioDefinition {
   description: string;
   icon: string;
   available: boolean;
-  launch: (scene: THREE.Scene, eventBus: EventBus, sampler: HeightSampler) => void;
+  launch: (scene: THREE.Scene, eventBus: EventBus, sampler: HeightSampler, fireConfig?: FireConfig) => void;
 }
 
 const scenarios: ScenarioDefinition[] = [
@@ -139,7 +158,7 @@ const scenarios: ScenarioDefinition[] = [
     description: "Building fire with smoke and flames",
     icon: "\uD83D\uDD25",
     available: true,
-    launch: (sc, eb, s) => startTestFire(sc, eb, s),
+    launch: (sc, eb, s, fireConfig?: FireConfig) => startTestFire(sc, eb, s, fireConfig),
   },
   {
     id: "earthquake",
@@ -339,7 +358,7 @@ async function initExploration(sceneGrp: THREE.Group, sceneSize: number, sampler
  * Phase B: Spawn agents, register systems, start simulation,
  * then trigger the chosen scenario.
  */
-function launchScenario(scenarioId: string) {
+function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
   if (!explorationReady || !world || !agentManager || !heightSampler || !sharedEventBus) {
     console.error("[Agents] Cannot launch scenario — exploration not ready");
     return;
@@ -401,7 +420,7 @@ function launchScenario(scenarioId: string) {
   steppedSim.start();
 
   // 5. Launch the chosen scenario
-  scenario.launch(scene, sharedEventBus, sampler);
+  scenario.launch(scene, sharedEventBus, sampler, fireConfig);
 
   // 6. Hide scenario panel, show stop button
   scenarioPanel.classList.remove("visible");
@@ -428,11 +447,36 @@ function buildScenarioPanel() {
       </div>
     `;
     if (s.available) {
-      card.addEventListener("click", () => launchScenario(s.id));
+      card.addEventListener("click", () => {
+        if (s.id === "fire") {
+          // Show fire config panel instead of launching directly
+          scenarioPanel.classList.remove("visible");
+          fireConfigPanel.classList.add("visible");
+        } else {
+          launchScenario(s.id);
+        }
+      });
     }
     scenarioPanel.appendChild(card);
   }
 }
+
+// --- Fire config panel buttons ---
+fireStartBtn.addEventListener("click", () => {
+  const config: FireConfig = {
+    offsetX: parseInt(fireXInput.value),
+    offsetZ: parseInt(fireZInput.value),
+    maxRadius: parseInt(fireSizeInput.value),
+    maxFires: parseInt(fireSpreadInput.value),
+  };
+  fireConfigPanel.classList.remove("visible");
+  launchScenario("fire", config);
+});
+
+fireBackBtn.addEventListener("click", () => {
+  fireConfigPanel.classList.remove("visible");
+  scenarioPanel.classList.add("visible");
+});
 
 // --- Stop simulation button ---
 stopSimBtn.addEventListener("click", async () => {
@@ -482,6 +526,7 @@ goBtn.addEventListener("click", async () => {
   sharedSceneGroup = null;
   sharedSceneSize = 0;
   scenarioPanel.classList.remove("visible");
+  fireConfigPanel.classList.remove("visible");
 
   try {
     const size = parseInt(sizeInput.value);

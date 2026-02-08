@@ -137,6 +137,53 @@
     .scenario-card .sc-name { font-size: 13px; font-weight: 600; color: #eee; }
     .scenario-card .sc-desc { font-size: 11px; color: #888; margin-top: 2px; }
 
+    /* Fire config panel */
+    #fire-config-panel {
+      position: fixed; top: 16px; left: 16px;
+      background: rgba(26,26,46,0.92); border: 1px solid #333;
+      border-radius: 10px; padding: 16px 18px;
+      z-index: 7; width: 260px;
+      display: none;
+      backdrop-filter: blur(8px);
+    }
+    #fire-config-panel.visible { display: block; }
+    #fire-config-panel h2 {
+      font-size: 14px; color: #ff8844; margin-bottom: 14px;
+      font-family: monospace; letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+    .fire-slider-group {
+      margin-bottom: 12px;
+    }
+    .fire-slider-group label {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 12px; color: #aaa; margin-bottom: 4px;
+      font-family: monospace;
+    }
+    .fire-slider-group label .val {
+      color: #ff8844; font-weight: bold;
+    }
+    .fire-slider-group input[type="range"] {
+      width: 100%; cursor: pointer;
+      accent-color: #ff6600;
+    }
+    #fire-start-btn {
+      width: 100%; padding: 8px;
+      background: #cc4400; border: none; border-radius: 6px;
+      color: #fff; font-size: 13px; font-family: monospace;
+      cursor: pointer; margin-top: 4px;
+      transition: background 0.15s;
+    }
+    #fire-start-btn:hover { background: #e55500; }
+    #fire-back-btn {
+      width: 100%; padding: 6px;
+      background: transparent; border: 1px solid #444; border-radius: 6px;
+      color: #888; font-size: 11px; font-family: monospace;
+      cursor: pointer; margin-top: 6px;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    #fire-back-btn:hover { border-color: #888; color: #ccc; }
+
     #stop-sim-btn {
       position: fixed; top: 12px; right: 330px;
       padding: 6px 14px;
@@ -190,6 +237,27 @@
   </div>
   <div id="scenario-panel">
     <h2>Scenarios</h2>
+  </div>
+  <div id="fire-config-panel">
+    <h2>Fire Settings</h2>
+    <div class="fire-slider-group">
+      <label>Position X <span class="val" id="fire-x-val">0</span>m</label>
+      <input id="fire-x" type="range" min="-200" max="200" step="5" value="0" />
+    </div>
+    <div class="fire-slider-group">
+      <label>Position Z <span class="val" id="fire-z-val">0</span>m</label>
+      <input id="fire-z" type="range" min="-200" max="200" step="5" value="0" />
+    </div>
+    <div class="fire-slider-group">
+      <label>Fire Size <span class="val" id="fire-size-val">35</span>m</label>
+      <input id="fire-size" type="range" min="10" max="80" step="5" value="35" />
+    </div>
+    <div class="fire-slider-group">
+      <label>Max Spread <span class="val" id="fire-spread-val">12</span></label>
+      <input id="fire-spread" type="range" min="1" max="30" step="1" value="12" />
+    </div>
+    <button id="fire-start-btn">Start Fire</button>
+    <button id="fire-back-btn">Back</button>
   </div>
   <button id="stop-sim-btn">Stop Simulation</button>
   <a id="replay-btn" href="/replay" target="_blank">View Replays</a>

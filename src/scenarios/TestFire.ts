@@ -142,16 +142,18 @@ class FireSourceManager {
   private wind: WindState;
   private systemElapsed = 0;
   private batchedRenderer: BatchedRenderer;
+  private maxFires: number;
 
   // Shared textures (created once, reused across all fire sources)
   private flameTex: THREE.Texture;
   private smokeTex: THREE.Texture;
   private emberTex: THREE.Texture;
 
-  constructor(scene: THREE.Scene, eventBus: EventBus, sampler?: HeightSampler) {
+  constructor(scene: THREE.Scene, eventBus: EventBus, sampler?: HeightSampler, maxFires?: number) {
     this.scene = scene;
     this.eventBus = eventBus;
     this.sampler = sampler;
+    this.maxFires = maxFires ?? MAX_FIRES;
 
     // BatchedRenderer manages GPU-instanced particle rendering
     this.batchedRenderer = new BatchedRenderer();
@@ -172,10 +174,10 @@ class FireSourceManager {
     };
   }
 
-  spawnPrimary(): void {
-    const y = this.sampler ? this.sampler.sample(0, 0) : 0;
-    this.spawnFire(new THREE.Vector3(0, y, 0), 35, 0.8, 30);
-    console.log("[TestFire] Primary fire started at scene center!");
+  spawnPrimary(offsetX = 0, offsetZ = 0, maxRadius = 35): void {
+    const y = this.sampler ? this.sampler.sample(offsetX, offsetZ) : 0;
+    this.spawnFire(new THREE.Vector3(offsetX, y, offsetZ), maxRadius, 0.8, 30);
+    console.log(`[TestFire] Primary fire started at (${offsetX.toFixed(1)}, ${offsetZ.toFixed(1)}) radius=${maxRadius}`);
   }
 
   private spawnFire(pos: THREE.Vector3, maxRadius: number, maxIntensity: number, growthDuration: number): FireSource {
@@ -442,7 +444,7 @@ class FireSourceManager {
   }
 
   private trySpawnChildren(src: FireSource, dt: number): void {
-    if (this.sources.length >= MAX_FIRES) return;
+    if (this.sources.length >= this.maxFires) return;
     if (src.intensity < 0.3 * src.maxIntensity) return;
 
     src.spawnTimer += dt;
@@ -453,7 +455,7 @@ class FireSourceManager {
     const windAngle = Math.atan2(this.wind.direction.y, this.wind.direction.x);
 
     for (let i = 0; i < SPAWN_CANDIDATES; i++) {
-      if (this.sources.length >= MAX_FIRES) break;
+      if (this.sources.length >= this.maxFires) break;
 
       const candidateAngle = (i / SPAWN_CANDIDATES) * Math.PI * 2;
       const offset = src.radius + 5 + Math.random() * 10;
@@ -531,8 +533,23 @@ class FireSourceManager {
 
 /* ── Public entry point ──────────────────────────────────── */
 
-export function startTestFire(scene: THREE.Scene, eventBus: EventBus, sampler?: HeightSampler): void {
-  const manager = new FireSourceManager(scene, eventBus, sampler);
+export interface FireConfig {
+  offsetX: number;      // meters offset from center
+  offsetZ: number;      // meters offset from center
+  maxRadius: number;    // initial fire max radius (default 35)
+  maxFires: number;     // max secondary fires (default 12)
+}
+
+export const DEFAULT_FIRE_CONFIG: FireConfig = {
+  offsetX: 0,
+  offsetZ: 0,
+  maxRadius: 35,
+  maxFires: 12,
+};
+
+export function startTestFire(scene: THREE.Scene, eventBus: EventBus, sampler?: HeightSampler, config?: FireConfig): void {
+  const cfg = config ?? DEFAULT_FIRE_CONFIG;
+  const manager = new FireSourceManager(scene, eventBus, sampler, cfg.maxFires);
 
   let started = false;
   let delayElapsed = 0;
@@ -549,7 +566,7 @@ export function startTestFire(scene: THREE.Scene, eventBus: EventBus, sampler?: 
       delayElapsed += dt;
       if (delayElapsed >= DELAY_SEC) {
         started = true;
-        manager.spawnPrimary();
+        manager.spawnPrimary(cfg.offsetX, cfg.offsetZ, cfg.maxRadius);
       }
       requestAnimationFrame(tick);
       return;
