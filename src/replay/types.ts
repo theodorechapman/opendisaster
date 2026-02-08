@@ -23,6 +23,13 @@ export interface ReplayVLMEntry {
   action: string;
 }
 
+/** An audio clip generated from a VLM entry via LLM + TTS. */
+export interface ReplayAudioClip {
+  simTime: number;       // when this clip should play (matches VLM entry simTime)
+  dialogue: string;      // the generated spoken line
+  audioBase64: string;   // mp3 audio as base64
+}
+
 /** Session metadata (small — no frame data). */
 export interface ReplaySession {
   sessionId: string;

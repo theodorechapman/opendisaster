@@ -84,6 +84,7 @@ export interface PerceiveMessage {
   type: "perceive";
   step: number;
   payloads: PerceptionPayload[];
+  disasterType?: string;
 }
 
 /** WebSocket messages server -> client */

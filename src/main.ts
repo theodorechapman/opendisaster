@@ -683,6 +683,7 @@ function launchScenario(scenarioId: string, fireConfig?: FireConfig) {
   steppedSim = new SteppedSimulation(world, agentManager, perception, recorder, sharedEventBus, replayRecorder, {
     stepDurationSec: 1,
     enabled: true,
+    disasterType: activeDisasterType ?? "fire",
   });
 
   // 3b. Create replay capture system

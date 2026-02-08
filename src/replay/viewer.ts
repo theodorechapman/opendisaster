@@ -1,5 +1,5 @@
 import { listSessions, getSession, getFramesForAgent, deleteSession } from "./storage.ts";
-import type { ReplaySession, ReplayVideoFrame, ReplayVLMEntry } from "./types.ts";
+import type { ReplaySession, ReplayVideoFrame, ReplayVLMEntry, ReplayAudioClip } from "./types.ts";
 
 class ReplayViewer {
   private session: ReplaySession | null = null;
@@ -23,10 +23,18 @@ class ReplayViewer {
   private timeline: HTMLInputElement;
   private statePanel: HTMLElement;
   private deleteBtn: HTMLButtonElement;
+  private audioBtn: HTMLButtonElement;
 
   // Preloaded images for smooth playback
   private preloadedImages = new Map<number, HTMLImageElement>();
   private loadingFrames = false;
+
+  // Audio narration state
+  private audioGenerationId = 0; // to discard stale results
+  private audioCtx: AudioContext | null = null;
+  private decodedClips: { simTime: number; dialogue: string; buffer: AudioBuffer }[] = [];
+  private scheduledTimeouts: number[] = [];
+  private activeSource: AudioBufferSourceNode | null = null;
 
   constructor() {
     this.canvas = document.getElementById("pov-canvas") as HTMLCanvasElement;
@@ -40,6 +48,7 @@ class ReplayViewer {
     this.timeline = document.getElementById("timeline") as HTMLInputElement;
     this.statePanel = document.getElementById("state-panel")!;
     this.deleteBtn = document.getElementById("delete-btn") as HTMLButtonElement;
+    this.audioBtn = document.getElementById("audio-btn") as HTMLButtonElement;
 
     this.bindEvents();
     this.loadSessionList();
@@ -49,12 +58,16 @@ class ReplayViewer {
     this.sessionSelect.addEventListener("change", () => this.onSessionChange());
     this.agentSelect.addEventListener("change", () => {
       this.currentAgent = parseInt(this.agentSelect.value);
+      this.clearAudio();
       this.loadAgentFrames();
     });
     this.playBtn.addEventListener("click", () => this.togglePlay());
     this.speedBtn.addEventListener("click", () => this.cycleSpeed());
+    this.audioBtn.addEventListener("click", () => this.generateAudio());
     this.timeline.addEventListener("input", () => {
       this.playbackTime = parseFloat(this.timeline.value);
+      if (this.playing) this.scheduleAudio();
+      else this.cancelScheduledAudio();
       this.renderFrame();
     });
     this.deleteBtn.addEventListener("click", () => this.onDelete());
@@ -114,6 +127,7 @@ class ReplayViewer {
 
   private async onSessionChange(): Promise<void> {
     this.stopPlay();
+    this.clearAudio();
     const id = this.sessionSelect.value;
     if (!id) return;
 
@@ -335,6 +349,7 @@ class ReplayViewer {
     this.playing = true;
     this.playBtn.textContent = "Pause";
     this.lastRafTime = performance.now();
+    this.scheduleAudio();
 
     const loop = (now: number) => {
       if (!this.playing || !this.session) return;
@@ -365,6 +380,7 @@ class ReplayViewer {
       cancelAnimationFrame(this.rafId);
       this.rafId = null;
     }
+    this.cancelScheduledAudio();
   }
 
   private cycleSpeed(): void {
@@ -372,17 +388,179 @@ class ReplayViewer {
     const idx = speeds.indexOf(this.speed);
     this.speed = speeds[(idx + 1) % speeds.length]!;
     this.speedBtn.textContent = `${this.speed}x`;
+    if (this.playing) this.scheduleAudio();
   }
 
   private setSpeed(s: number): void {
     this.speed = s;
     this.speedBtn.textContent = `${s}x`;
+    if (this.playing) this.scheduleAudio();
   }
 
   private seekRelative(deltaSec: number): void {
     if (!this.session) return;
     this.playbackTime = Math.max(0, Math.min(this.session.durationSec, this.playbackTime + deltaSec));
+    if (this.playing) this.scheduleAudio();
+    else this.cancelScheduledAudio();
     this.renderFrame();
+  }
+
+  /** Decode base64 mp3 clips into AudioBuffers for reliable playback. */
+  private async decodeAudioClips(clips: ReplayAudioClip[]): Promise<void> {
+    if (!this.audioCtx) {
+      this.audioCtx = new AudioContext();
+    }
+    this.decodedClips = [];
+    for (const clip of clips) {
+      const binary = atob(clip.audioBase64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      try {
+        const buffer = await this.audioCtx.decodeAudioData(bytes.buffer.slice(0) as ArrayBuffer);
+        this.decodedClips.push({ simTime: clip.simTime, dialogue: clip.dialogue, buffer });
+      } catch (e) {
+        console.error(`[Audio] Failed to decode clip at t=${clip.simTime}`, e);
+      }
+    }
+    this.decodedClips.sort((a, b) => a.simTime - b.simTime);
+    console.log(`[Audio] Decoded ${this.decodedClips.length} clips`);
+  }
+
+  /** Schedule all future clips as setTimeout calls relative to current playback position. */
+  private scheduleAudio(): void {
+    this.cancelScheduledAudio();
+    if (!this.audioCtx || this.decodedClips.length === 0 || !this.playing) return;
+
+    // Resume AudioContext if suspended (browser autoplay policy)
+    if (this.audioCtx.state === "suspended") {
+      this.audioCtx.resume();
+    }
+
+    for (const clip of this.decodedClips) {
+      const delaySec = (clip.simTime - this.playbackTime) / this.speed;
+      if (delaySec < -0.5) continue; // already past
+
+      const delayMs = Math.max(0, delaySec * 1000);
+      const tid = window.setTimeout(() => {
+        if (!this.playing) return;
+        this.playClipBuffer(clip);
+      }, delayMs);
+      this.scheduledTimeouts.push(tid);
+    }
+    console.log(`[Audio] Scheduled ${this.scheduledTimeouts.length} clips from t=${this.playbackTime.toFixed(1)}s at ${this.speed}x`);
+  }
+
+  private playClipBuffer(clip: { buffer: AudioBuffer; dialogue: string; simTime: number }): void {
+    if (!this.audioCtx) return;
+    // Stop previous clip
+    if (this.activeSource) {
+      try { this.activeSource.stop(); } catch {}
+    }
+    const source = this.audioCtx.createBufferSource();
+    source.buffer = clip.buffer;
+    source.connect(this.audioCtx.destination);
+    source.start();
+    this.activeSource = source;
+    console.log(`[Audio] Playing clip at t=${clip.simTime.toFixed(1)}s: "${clip.dialogue}"`);
+  }
+
+  private cancelScheduledAudio(): void {
+    for (const tid of this.scheduledTimeouts) {
+      window.clearTimeout(tid);
+    }
+    this.scheduledTimeouts = [];
+    if (this.activeSource) {
+      try { this.activeSource.stop(); } catch {}
+      this.activeSource = null;
+    }
+  }
+
+  private clearAudio(): void {
+    this.cancelScheduledAudio();
+    this.decodedClips = [];
+    this.audioGenerationId++;
+    this.audioBtn.textContent = "Generate Audio";
+    this.audioBtn.classList.remove("generating", "ready");
+  }
+
+  private async generateAudio(): Promise<void> {
+    if (!this.session) return;
+    if (this.audioBtn.classList.contains("generating")) return;
+
+    // Select VLM entries for current agent
+    const entries = this.session.vlmEntries
+      .filter((e) => e.agentIndex === this.currentAgent && e.observation && e.observation !== "No VLM configured.")
+      .sort((a, b) => a.simTime - b.simTime);
+
+    if (entries.length === 0) {
+      this.audioBtn.textContent = "No VLM Data";
+      setTimeout(() => { this.audioBtn.textContent = "Generate Audio"; }, 2000);
+      return;
+    }
+
+    // Send ALL valid VLM entries — they're already ~5s apart
+    const agentName = this.session.agents[this.currentAgent]?.name ?? "Agent";
+    const genId = ++this.audioGenerationId;
+
+    console.log(`[Audio] Generating for "${agentName}" — sending ${entries.length} VLM entries`);
+
+    this.audioBtn.textContent = "Generating...";
+    this.audioBtn.classList.add("generating");
+
+    try {
+      const res = await fetch("/api/generate-audio", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          agentName,
+          vlmEntries: entries.map((e) => ({
+            simTime: e.simTime,
+            observation: e.observation,
+            action: e.action,
+          })),
+        }),
+      });
+
+      // Discard if agent/session changed while generating
+      if (genId !== this.audioGenerationId) return;
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "Unknown error" })) as { error?: string };
+        console.error("[Audio] Generation failed:", err.error);
+        this.audioBtn.textContent = "Error";
+        this.audioBtn.classList.remove("generating");
+        setTimeout(() => { this.audioBtn.textContent = "Generate Audio"; }, 3000);
+        return;
+      }
+
+      const data = await res.json() as { clips: ReplayAudioClip[] };
+
+      // Discard if stale
+      if (genId !== this.audioGenerationId) return;
+
+      console.log(`[Audio] Received ${data.clips.length} clips, decoding...`);
+      for (const c of data.clips) {
+        console.log(`[Audio]   t=${c.simTime.toFixed(1)}s dialogue="${c.dialogue}" audio=${c.audioBase64.length} b64 chars`);
+      }
+
+      await this.decodeAudioClips(data.clips);
+
+      // Discard if stale after async decode
+      if (genId !== this.audioGenerationId) return;
+
+      this.audioBtn.textContent = `Audio Ready (${this.decodedClips.length})`;
+      this.audioBtn.classList.remove("generating");
+      this.audioBtn.classList.add("ready");
+
+      // If already playing, schedule immediately
+      if (this.playing) this.scheduleAudio();
+    } catch (err) {
+      if (genId !== this.audioGenerationId) return;
+      console.error("[Audio] Fetch error:", err);
+      this.audioBtn.textContent = "Error";
+      this.audioBtn.classList.remove("generating");
+      setTimeout(() => { this.audioBtn.textContent = "Generate Audio"; }, 3000);
+    }
   }
 }
 

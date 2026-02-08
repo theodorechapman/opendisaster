@@ -18,6 +18,7 @@ const ACTION_NAMES: Record<number, string> = {
 export interface SteppedSimConfig {
   stepDurationSec: number;  // seconds of sim time per step
   enabled: boolean;
+  disasterType?: string;
 }
 
 interface Snapshot {
@@ -346,6 +347,7 @@ export class SteppedSimulation {
           type: "perceive",
           step: this.step,
           payloads: payloads,
+          disasterType: this.config.disasterType,
         };
         this.ws.send(JSON.stringify(msg));
       }
