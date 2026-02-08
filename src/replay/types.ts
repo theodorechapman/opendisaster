@@ -20,7 +20,6 @@ export interface ReplayVLMEntry {
   step: number;
   simTime: number;
   observation: string;
-  reasoning: string;
   action: string;
 }
 

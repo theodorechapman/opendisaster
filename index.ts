@@ -140,7 +140,6 @@ async function processPayloads(payloads: any[], step: number): Promise<any[]> {
     return payloads.map((payload: any) => ({
       agentIndex: payload.agentIndex,
       observation: "No VLM configured.",
-      reasoning: "",
       action: "WANDER",
       targetX: 0,
       targetZ: 0,
@@ -191,30 +190,19 @@ async function processPayloads(payloads: any[], step: number): Promise<any[]> {
     const cleanObs = observation.replace(/\s*DANGER\s*$/i, "").trim();
 
     if (danger) {
-      const s = payload.state;
-      const yaw = s.facingYaw ?? 0;
-      const fleeDistance = 60;
-      const targetX = s.positionX + Math.sin(yaw + Math.PI) * fleeDistance;
-      const targetZ = s.positionZ + Math.cos(yaw + Math.PI) * fleeDistance;
-
-      logEntry("danger_flee", payload.name, {
+      logEntry("danger_detected", payload.name, {
         step,
         observation: cleanObs,
-        positionX: s.positionX,
-        positionZ: s.positionZ,
-        facingYaw: yaw,
-        targetX,
-        targetZ,
-        fleeDistance,
+        positionX: payload.state.positionX,
+        positionZ: payload.state.positionZ,
       });
 
       return {
         agentIndex: payload.agentIndex,
         observation: cleanObs,
-        reasoning: "DANGER detected — turning 180° and fleeing.",
         action: "RUN_TO",
-        targetX,
-        targetZ,
+        targetX: 0,
+        targetZ: 0,
         targetEntity: 0,
       };
     }
@@ -222,7 +210,6 @@ async function processPayloads(payloads: any[], step: number): Promise<any[]> {
     return {
       agentIndex: payload.agentIndex,
       observation: cleanObs,
-      reasoning: "",
       action: "WANDER",
       targetX: 0,
       targetZ: 0,

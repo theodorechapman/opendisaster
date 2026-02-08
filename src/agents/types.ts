@@ -42,7 +42,6 @@ export interface PerceptionPayload {
 export interface DecisionResponse {
   agentIndex: number;
   observation: string; // VLM output
-  reasoning: string;   // K2 Think reasoning
   action: string;      // action name
   targetX: number;
   targetZ: number;
@@ -69,7 +68,6 @@ export interface AgentStepData {
   panicLevel: number;
   alive: boolean;
   observation: string;
-  reasoning: string;
   action: string;
 }
 

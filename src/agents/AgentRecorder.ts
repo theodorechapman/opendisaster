@@ -33,7 +33,7 @@ export class AgentRecorder {
     step: number,
     simTime: number,
     observations: Map<number, string>,
-    decisions: Map<number, { reasoning: string; action: string }>,
+    decisions: Map<number, { action: string }>,
   ): void {
     const agents: AgentStepData[] = this.manager.agents.map((agent) => {
       const eid = agent.eid;
@@ -50,7 +50,6 @@ export class AgentRecorder {
         panicLevel: AgentState.panicLevel[eid]!,
         alive: AgentState.alive[eid]! === 1,
         observation: obs,
-        reasoning: dec?.reasoning ?? "",
         action: dec?.action ?? "",
       };
     });

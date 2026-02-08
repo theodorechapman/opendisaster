@@ -294,7 +294,6 @@ class ReplayViewer {
       `<div class="vlm-entry" data-time="${e.simTime.toFixed(1)}">` +
       `<div class="vlm-header">${e.simTime.toFixed(1)}s (step ${e.step})</div>` +
       `<div class="vlm-obs">${e.observation}</div>` +
-      (e.reasoning ? `<div class="vlm-reason">${e.reasoning}</div>` : "") +
       `<div class="vlm-action">Action: ${e.action}</div>` +
       `</div>`
     );

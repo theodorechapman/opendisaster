@@ -54,13 +54,8 @@ export enum ClassificationType {
 
 export enum ActionType {
   IDLE = 0,
-  MOVE_TO = 1,
+  WALK_TO = 1,
   RUN_TO = 2,
-  HELP_PERSON = 4,
-  EVACUATE = 5,
-  WAIT = 6,
-  ENTER_BUILDING = 7,
-  EXIT_BUILDING = 8,
 }
 
 export const Agent = {
