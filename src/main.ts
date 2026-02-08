@@ -119,11 +119,57 @@ addressInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") { e.preventDefault(); doLookup(); }
 });
 
+// --- Scenario registry ---
+interface ScenarioDefinition {
+  id: string;
+  name: string;
+  description: string;
+  icon: string;
+  available: boolean;
+  launch: (scene: THREE.Scene, eventBus: EventBus, sampler: HeightSampler) => void;
+}
+
+const scenarios: ScenarioDefinition[] = [
+  {
+    id: "fire",
+    name: "Fire",
+    description: "Building fire with smoke and flames",
+    icon: "\uD83D\uDD25",
+    available: true,
+    launch: (sc, eb, s) => startTestFire(sc, eb, s),
+  },
+  {
+    id: "earthquake",
+    name: "Earthquake",
+    description: "Seismic event with structural damage",
+    icon: "\uD83C\uDF0B",
+    available: false,
+    launch: () => {},
+  },
+  {
+    id: "flood",
+    name: "Flood",
+    description: "Rising water levels and evacuation",
+    icon: "\uD83C\uDF0A",
+    available: false,
+    launch: () => {},
+  },
+];
+
+const scenarioPanel = document.getElementById("scenario-panel")!;
+
 // --- Agent system state ---
 let world: SimWorld | null = null;
 let agentManager: AgentManager | null = null;
 let steppedSim: SteppedSimulation | null = null;
 let heightSampler: HeightSampler | null = null;
+
+// Exploration phase shared state
+let explorationReady = false;
+let sharedEventBus: EventBus | null = null;
+let sharedObstacles: Obstacle[] = [];
+let sharedSceneGroup: THREE.Group | null = null;
+let sharedSceneSize = 0;
 
 // --- Obstacle collection from generated scene ---
 const OBSTACLE_PADDING = 3; // meters padding around buildings
@@ -208,7 +254,7 @@ function collidesAny(x: number, z: number, obstacles: Obstacle[], radius: number
   return false;
 }
 
-// Agent configs — 4 unique personalities with distinct colors
+// Agent configs — 8 unique personalities with distinct colors
 const AGENT_CONFIGS: Omit<AgentConfig, "spawnPosition">[] = [
   {
     name: "Alice",
@@ -230,17 +276,43 @@ const AGENT_CONFIGS: Omit<AgentConfig, "spawnPosition">[] = [
     color: 0xffaa00,
     personality: { bravery: 0.6, altruism: 0.4, awareness: 0.5, description: "a practical delivery worker" },
   },
+  {
+    name: "Eve",
+    color: 0xff44ff,
+    personality: { bravery: 0.9, altruism: 0.8, awareness: 0.9, description: "an experienced firefighter" },
+  },
+  {
+    name: "Frank",
+    color: 0x44ffff,
+    personality: { bravery: 0.2, altruism: 0.3, awareness: 0.6, description: "a panicky tourist" },
+  },
+  {
+    name: "Grace",
+    color: 0xffff44,
+    personality: { bravery: 0.7, altruism: 0.7, awareness: 0.5, description: "a resourceful paramedic" },
+  },
+  {
+    name: "Hank",
+    color: 0x88ff88,
+    personality: { bravery: 0.4, altruism: 0.6, awareness: 0.4, description: "a distracted jogger" },
+  },
 ];
 
-async function initAgentSystem(sceneGroup: THREE.Group, sceneSize: number, sampler: HeightSampler) {
+/**
+ * Phase A: Set up ECS world, event bus, obstacles, load agent model.
+ * Does NOT spawn agents or start simulation.
+ */
+async function initExploration(sceneGrp: THREE.Group, sceneSize: number, sampler: HeightSampler) {
   const sceneHalfSize = sceneSize / 2;
 
   // 1. Create ECS world and event bus
   world = new SimWorld();
-  const eventBus = new EventBus();
+  sharedEventBus = new EventBus();
 
   // 2. Collect obstacles from the generated scene
-  const obstacles = collectObstacles(sceneGroup, sceneHalfSize);
+  sharedObstacles = collectObstacles(sceneGrp, sceneHalfSize);
+  sharedSceneGroup = sceneGrp;
+  sharedSceneSize = sceneSize;
 
   // 3. Create agent manager and load model
   agentManager = new AgentManager(world, scene);
@@ -254,20 +326,41 @@ async function initAgentSystem(sceneGroup: THREE.Group, sceneSize: number, sampl
     return;
   }
 
-  // 4. Spawn 4 agents near the fire (center) but not too close
-  // Place them ~25-35m from origin in 4 quadrants
+  explorationReady = true;
+  info.textContent = "Explore the area. Select a scenario to begin simulation.";
+  console.log("[Agents] Exploration phase ready — awaiting scenario selection");
+}
+
+/**
+ * Phase B: Spawn agents, register systems, start simulation,
+ * then trigger the chosen scenario.
+ */
+function launchScenario(scenarioId: string) {
+  if (!explorationReady || !world || !agentManager || !heightSampler || !sharedEventBus) {
+    console.error("[Agents] Cannot launch scenario — exploration not ready");
+    return;
+  }
+
+  const scenario = scenarios.find((s) => s.id === scenarioId);
+  if (!scenario || !scenario.available) return;
+
+  const sampler = heightSampler;
+  const sceneHalfSize = sharedSceneSize / 2;
+
+  // 1. Spawn 8 agents in a ring around the center
   const spawnDist = 30;
-  const offsets = [
-    { x: -spawnDist, z: -spawnDist },
-    { x:  spawnDist, z: -spawnDist },
-    { x: -spawnDist, z:  spawnDist },
-    { x:  spawnDist, z:  spawnDist },
-  ];
+  const offsets = AGENT_CONFIGS.map((_, i) => {
+    const angle = (i / AGENT_CONFIGS.length) * Math.PI * 2;
+    return {
+      x: Math.cos(angle) * spawnDist,
+      z: Math.sin(angle) * spawnDist,
+    };
+  });
 
   for (let i = 0; i < AGENT_CONFIGS.length; i++) {
     const cfg = AGENT_CONFIGS[i]!;
     const offset = offsets[i]!;
-    const pos = findOpenPosition(offset.x, offset.z, obstacles, 3);
+    const pos = findOpenPosition(offset.x, offset.z, sharedObstacles, 3);
     const y = sampler.sample(pos.x, pos.z);
     agentManager.spawn({
       ...cfg,
@@ -275,13 +368,13 @@ async function initAgentSystem(sceneGroup: THREE.Group, sceneSize: number, sampl
     });
   }
 
-  // 5. Register ECS systems
-  const agentActionSystem = createAgentActionSystem(agentManager, obstacles, sceneHalfSize);
-  const agentDamageSystem = createAgentDamageSystem(agentManager, eventBus);
+  // 2. Register ECS systems
+  const agentActionSystem = createAgentActionSystem(agentManager, sharedObstacles, sceneHalfSize);
+  const agentDamageSystem = createAgentDamageSystem(agentManager, sharedEventBus);
   world.addSystem("agentAction", agentActionSystem);
   world.addSystem("agentDamage", agentDamageSystem);
 
-  // 6. Create perception, recorder, stepped simulation
+  // 3. Create perception, recorder, stepped simulation
   const perception = new AgentPerceptionSystem(renderer, scene, agentManager);
   const recorder = new AgentRecorder(agentManager);
   steppedSim = new SteppedSimulation(world, agentManager, perception, recorder, {
@@ -289,14 +382,40 @@ async function initAgentSystem(sceneGroup: THREE.Group, sceneSize: number, sampl
     enabled: true,
   });
 
-  // 7. Start stepped simulation (connects WebSocket)
+  // 4. Start stepped simulation (connects WebSocket)
   steppedSim.start();
 
-  // 8. Start test fire at scene center after 10s
-  startTestFire(scene, eventBus, sampler);
+  // 5. Launch the chosen scenario
+  scenario.launch(scene, sharedEventBus, sampler);
 
-  info.textContent = `4 agents spawned | Fire in 10s | Ctrl+P snapshots | Ctrl+R recording`;
-  console.log("[Agents] Agent system initialized");
+  // 6. Hide scenario panel
+  scenarioPanel.classList.remove("visible");
+  explorationReady = false;
+
+  info.textContent = `${AGENT_CONFIGS.length} agents spawned | ${scenario.name} scenario active | Ctrl+P snapshots | Ctrl+R recording`;
+  console.log(`[Agents] Scenario "${scenario.name}" launched`);
+}
+
+/** Build scenario panel UI from the registry */
+function buildScenarioPanel() {
+  // Clear existing cards
+  scenarioPanel.querySelectorAll(".scenario-card").forEach((el) => el.remove());
+
+  for (const s of scenarios) {
+    const card = document.createElement("div");
+    card.className = "scenario-card" + (s.available ? "" : " disabled");
+    card.innerHTML = `
+      <div class="sc-icon">${s.icon}</div>
+      <div class="sc-text">
+        <div class="sc-name">${s.name}</div>
+        <div class="sc-desc">${s.description}${s.available ? "" : " (coming soon)"}</div>
+      </div>
+    `;
+    if (s.available) {
+      card.addEventListener("click", () => launchScenario(s.id));
+    }
+    scenarioPanel.appendChild(card);
+  }
 }
 
 // --- Load all layers ---
@@ -319,6 +438,12 @@ goBtn.addEventListener("click", async () => {
   world = null;
   agentManager = null;
   heightSampler = null;
+  explorationReady = false;
+  sharedEventBus = null;
+  sharedObstacles = [];
+  sharedSceneGroup = null;
+  sharedSceneSize = 0;
+  scenarioPanel.classList.remove("visible");
 
   try {
     const size = parseInt(sizeInput.value);
@@ -350,8 +475,12 @@ goBtn.addEventListener("click", async () => {
 
     overlay.classList.add("hidden");
 
-    // Initialize agent system after scene is built
-    await initAgentSystem(sceneGroup, size, heightSampler);
+    // Initialize exploration phase (no agents yet)
+    await initExploration(sceneGroup, size, heightSampler);
+
+    // Show scenario selection panel
+    buildScenarioPanel();
+    scenarioPanel.classList.add("visible");
   } catch (err) {
     console.error("Failed to load:", err);
     alert("Failed to load data. Check console for details.");

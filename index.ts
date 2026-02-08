@@ -56,6 +56,8 @@ function logClientEntry(entry: { ts: number; event: string; agent: string; data:
 const FEATHERLESS_API_KEYS = [
   process.env.FEATHERLESS_API_KEY ?? "",
   process.env.FEATHERLESS_API_KEY_2 ?? "",
+  process.env.FEATHERLESS_API_KEY_3 ?? "",
+  process.env.FEATHERLESS_API_KEY_4 ?? "",
 ].filter(Boolean);
 
 if (FEATHERLESS_API_KEYS.length === 0) console.warn("[Server] No FEATHERLESS_API_KEY set in .env — agents will auto-wander only");
