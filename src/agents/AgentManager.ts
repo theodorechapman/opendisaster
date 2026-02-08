@@ -11,6 +11,7 @@ import {
 } from "../core/Components.ts";
 import type { SimWorld } from "../core/World.ts";
 import type { AgentConfig, AgentMemory, ParsedAction } from "./types.ts";
+import type { DangerZone } from "./AgentActionSystem.ts";
 import { AgentVisuals } from "./AgentVisuals.ts";
 import { agentLog } from "./AgentLogger.ts";
 import type * as THREE from "three";
@@ -22,6 +23,7 @@ export interface AgentRuntime {
   eid: number;        // bitecs entity id
   index: number;      // dense index
   memory: AgentMemory;
+  dangerZones: DangerZone[];
 }
 
 export class AgentManager {
@@ -79,6 +81,7 @@ export class AgentManager {
         decisions: [],
         recentEvents: [],
       },
+      dangerZones: [],
     };
 
     this.agents.push(runtime);

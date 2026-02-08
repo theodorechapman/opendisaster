@@ -24,6 +24,28 @@ const STUCK_PROGRESS_RATIO = 0.3; // must close at least 30% of expected distanc
 
 const ACTION_NAMES = ["IDLE","MOVE_TO","RUN_TO","HELP_PERSON","EVACUATE","WAIT","ENTER_BUILDING","EXIT_BUILDING"];
 
+/** A circular zone agents should avoid (e.g. fire). */
+export interface DangerZone {
+  x: number;
+  z: number;
+  radius: number;
+  expiresAt: number; // Date.now() timestamp
+}
+
+const DANGER_ZONE_MARGIN = 5; // extra meters beyond fire radius
+
+/** Test if a point is inside any active danger zone. */
+function isInDangerZone(x: number, z: number, zones: DangerZone[]): boolean {
+  const now = Date.now();
+  for (const zone of zones) {
+    if (zone.expiresAt < now) continue;
+    const dx = x - zone.x;
+    const dz = z - zone.z;
+    if (dx * dx + dz * dz < zone.radius * zone.radius) return true;
+  }
+  return false;
+}
+
 /** Simple XZ axis-aligned rectangle for collision. */
 export interface Obstacle {
   minX: number;
@@ -79,28 +101,48 @@ function moveWithCollision(
   return { x: px, z: pz, blocked: true };
 }
 
-/** Pick a wander target that isn't inside an obstacle. */
+/** Pick a wander target that isn't inside an obstacle or danger zone. */
 function pickWanderTarget(
   px: number,
   pz: number,
   obstacles: Obstacle[],
   sceneBound: number,
+  dangerZones: DangerZone[] = [],
 ): { x: number; z: number } {
-  for (let attempt = 0; attempt < 8; attempt++) {
+  for (let attempt = 0; attempt < 16; attempt++) {
     const angle = Math.random() * Math.PI * 2;
     const r = WANDER_RADIUS * (0.3 + Math.random() * 0.7);
     const tx = Math.max(-sceneBound, Math.min(sceneBound, px + Math.cos(angle) * r));
     const tz = Math.max(-sceneBound, Math.min(sceneBound, pz + Math.sin(angle) * r));
-    if (!collidesWithObstacle(tx, tz, obstacles)) {
+    if (!collidesWithObstacle(tx, tz, obstacles) && !isInDangerZone(tx, tz, dangerZones)) {
       return { x: tx, z: tz };
     }
   }
-  // Fallback: small step in random direction
-  const angle = Math.random() * Math.PI * 2;
-  return {
-    x: Math.max(-sceneBound, Math.min(sceneBound, px + Math.cos(angle) * 8)),
-    z: Math.max(-sceneBound, Math.min(sceneBound, pz + Math.sin(angle) * 8)),
-  };
+  // Fallback: pick direction that maximizes distance from danger zones
+  let bestX = px;
+  let bestZ = pz;
+  let bestScore = -Infinity;
+  for (let i = 0; i < 8; i++) {
+    const angle = (i / 8) * Math.PI * 2;
+    const tx = Math.max(-sceneBound, Math.min(sceneBound, px + Math.cos(angle) * 8));
+    const tz = Math.max(-sceneBound, Math.min(sceneBound, pz + Math.sin(angle) * 8));
+    if (collidesWithObstacle(tx, tz, obstacles)) continue;
+    // Score by minimum distance to any danger zone (higher = safer)
+    let minDist = Infinity;
+    const now = Date.now();
+    for (const zone of dangerZones) {
+      if (zone.expiresAt < now) continue;
+      const dx = tx - zone.x;
+      const dz = tz - zone.z;
+      minDist = Math.min(minDist, Math.sqrt(dx * dx + dz * dz) - zone.radius);
+    }
+    if (minDist > bestScore) {
+      bestScore = minDist;
+      bestX = tx;
+      bestZ = tz;
+    }
+  }
+  return { x: bestX, z: bestZ };
 }
 
 /**
@@ -110,7 +152,13 @@ function pickWanderTarget(
  */
 export function createAgentActionSystem(manager: AgentManager, obstacles: Obstacle[] = [], sceneBound = 180) {
   return (_world: any, dt: number) => {
+    const now = Date.now();
     for (const agent of manager.agents) {
+      // Prune expired per-agent danger zones inline
+      const zones = agent.dangerZones;
+      for (let i = zones.length - 1; i >= 0; i--) {
+        if (zones[i]!.expiresAt < now) zones.splice(i, 1);
+      }
       const eid = agent.eid;
       if (AgentState.alive[eid]! === 0) continue;
 
@@ -131,7 +179,7 @@ export function createAgentActionSystem(manager: AgentManager, obstacles: Obstac
           // Auto-wander: after being idle for a bit, pick a random nearby target
           AgentAction.progress[eid] = (AgentAction.progress[eid] ?? 0) + dt;
           if (AgentAction.progress[eid]! >= WANDER_IDLE_TIME) {
-            const target = pickWanderTarget(px, pz, obstacles, sceneBound);
+            const target = pickWanderTarget(px, pz, obstacles, sceneBound, zones);
             agentLog.log("auto_wander", agent.config.name, {
               fromX: px, fromZ: pz,
               targetX: target.x, targetZ: target.z,
@@ -201,8 +249,33 @@ export function createAgentActionSystem(manager: AgentManager, obstacles: Obstac
           if (dist > ARRIVAL_DIST) {
             const stamina = AgentState.stamina[eid]!;
             const speed = stamina > 0 ? RUN_SPEED : WALK_SPEED;
-            const nx = dx / dist;
-            const nz = dz / dist;
+            let nx = dx / dist;
+            let nz = dz / dist;
+
+            // Check if the flee target is dangerous or if we'd enter a danger zone.
+            // But if we're already IN a zone heading toward a safe target, let us escape.
+            const agentInZone = isInDangerZone(px, pz, zones);
+            const targetInZone = isInDangerZone(tx, tz, zones);
+            const nextX = px + nx * speed * dt;
+            const nextZ = pz + nz * speed * dt;
+            const shouldRedirect = targetInZone || (!agentInZone && isInDangerZone(nextX, nextZ, zones));
+            if (shouldRedirect) {
+              const safe = pickWanderTarget(px, pz, obstacles, sceneBound, zones);
+              agentLog.log("flee_redirected", agent.config.name, {
+                originalTargetX: tx, originalTargetZ: tz,
+                safeTargetX: safe.x, safeTargetZ: safe.z,
+              });
+              AgentAction.targetX[eid] = safe.x;
+              AgentAction.targetZ[eid] = safe.z;
+              const sdx = safe.x - px;
+              const sdz = safe.z - pz;
+              const sDist = Math.sqrt(sdx * sdx + sdz * sdz);
+              if (sDist > 0.01) {
+                nx = sdx / sDist;
+                nz = sdz / sDist;
+              }
+            }
+
             const result = moveWithCollision(px, pz, nx, nz, speed, dt, obstacles);
             Position.x[eid] = result.x;
             Position.z[eid] = result.z;

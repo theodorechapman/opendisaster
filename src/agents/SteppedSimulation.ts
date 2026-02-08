@@ -5,6 +5,7 @@ import type { AgentRecorder } from "./AgentRecorder.ts";
 import { parseActionType } from "./PromptTemplates.ts";
 import type { PerceiveMessage, DecisionResponse, PerceptionPayload } from "./types.ts";
 import { AgentState, AgentAction, AgentFacing, Position, ActionType } from "../core/Components.ts";
+import type { EventBus, FireSpreadEvent } from "../core/EventBus.ts";
 import { agentLog } from "./AgentLogger.ts";
 
 const ACTION_NAMES = ["IDLE","MOVE_TO","RUN_TO","HELP_PERSON","EVACUATE","WAIT","ENTER_BUILDING","EXIT_BUILDING"];
@@ -50,12 +51,15 @@ export class SteppedSimulation {
   private latestAppliedStep = new Map<number, number>();
   /** Frame data stored at send time for snapshot pairing. Key: "agentIndex:step". */
   private pendingPayloads = new Map<string, { payload: PerceptionPayload; simTime: number }>();
+  /** Tracked fire sources from EventBus FIRE_SPREAD events. */
+  private activeFireSources: { x: number; z: number; radius: number }[] = [];
 
   constructor(
     world: SimWorld,
     manager: AgentManager,
     perception: AgentPerceptionSystem,
     recorder: AgentRecorder,
+    eventBus: EventBus,
     config: SteppedSimConfig = { stepDurationSec: 1, enabled: true },
   ) {
     this.world = world;
@@ -63,6 +67,21 @@ export class SteppedSimulation {
     this.perception = perception;
     this.recorder = recorder;
     this.config = config;
+
+    // Subscribe to FIRE_SPREAD events to track fire sources
+    eventBus.on("FIRE_SPREAD", (event) => {
+      const fire = event as FireSpreadEvent;
+      const [fx, _fy, fz] = fire.position;
+      // Deduplicate: update radius if same position exists
+      const existing = this.activeFireSources.find(
+        (s) => Math.abs(s.x - fx) < 1 && Math.abs(s.z - fz) < 1,
+      );
+      if (existing) {
+        existing.radius = Math.max(existing.radius, fire.radius);
+      } else {
+        this.activeFireSources.push({ x: fx, z: fz, radius: fire.radius });
+      }
+    });
 
     // Ctrl+P to download all POV snapshots
     document.addEventListener("keydown", (e) => {
@@ -373,6 +392,58 @@ export class SteppedSimulation {
           targetZ: dec.targetZ,
           targetEid: dec.targetEntity,
         });
+
+        // Create per-agent danger zone based on VLM perception
+        if (agent) {
+          const eid = agent.eid;
+          const px = Position.x[eid]!;
+          const pz = Position.z[eid]!;
+          const yaw = AgentFacing.yaw[eid]!;
+          const facingX = Math.sin(yaw);
+          const facingZ = Math.cos(yaw);
+
+          // Find nearest fire source within ~120° forward cone
+          let bestFire: { x: number; z: number; radius: number } | null = null;
+          let bestDist = Infinity;
+          for (const fire of this.activeFireSources) {
+            const dx = fire.x - px;
+            const dz = fire.z - pz;
+            const dist = Math.sqrt(dx * dx + dz * dz);
+            if (dist < 0.01) continue;
+            // Dot product with facing direction (normalized)
+            const dot = (dx / dist) * facingX + (dz / dist) * facingZ;
+            if (dot > -0.1 && dist < bestDist) {
+              bestDist = dist;
+              bestFire = fire;
+            }
+          }
+
+          if (bestFire) {
+            agent.dangerZones.push({
+              x: bestFire.x,
+              z: bestFire.z,
+              radius: bestFire.radius + 5,
+              expiresAt: Date.now() + 60_000,
+            });
+            agentLog.log("danger_zone_added", agentName, {
+              fireX: bestFire.x, fireZ: bestFire.z,
+              radius: bestFire.radius + 5, source: "fire_match",
+            });
+          } else {
+            // No tracked fire in facing direction — estimate 15m ahead
+            const estX = px + facingX * 15;
+            const estZ = pz + facingZ * 15;
+            agent.dangerZones.push({
+              x: estX,
+              z: estZ,
+              radius: 10,
+              expiresAt: Date.now() + 60_000,
+            });
+            agentLog.log("danger_zone_added", agentName, {
+              estX, estZ, radius: 10, source: "estimated",
+            });
+          }
+        }
       }
       // WANDER = no danger, do nothing — auto-wander continues
     }

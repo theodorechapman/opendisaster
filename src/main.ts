@@ -377,7 +377,7 @@ function launchScenario(scenarioId: string) {
   // 3. Create perception, recorder, stepped simulation
   const perception = new AgentPerceptionSystem(renderer, scene, agentManager);
   const recorder = new AgentRecorder(agentManager);
-  steppedSim = new SteppedSimulation(world, agentManager, perception, recorder, {
+  steppedSim = new SteppedSimulation(world, agentManager, perception, recorder, sharedEventBus, {
     stepDurationSec: 1,
     enabled: true,
   });
