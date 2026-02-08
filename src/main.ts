@@ -10,11 +10,13 @@ import { AgentManager } from "./agents/AgentManager.ts";
 import { AgentPerceptionSystem } from "./agents/AgentPerceptionSystem.ts";
 import { AgentRecorder } from "./agents/AgentRecorder.ts";
 import { SteppedSimulation } from "./agents/SteppedSimulation.ts";
+import { ReplayRecorder } from "./replay/ReplayRecorder.ts";
 import { createAgentActionSystem, type Obstacle } from "./agents/AgentActionSystem.ts";
 import { createAgentDamageSystem } from "./agents/AgentDamageSystem.ts";
 import { startTestFire } from "./scenarios/TestFire.ts";
 import type { AgentConfig } from "./agents/types.ts";
 import { Position } from "./core/Components.ts";
+import { ReplayCaptureSystem } from "./replay/ReplayCaptureSystem.ts";
 
 const overlay = document.getElementById("overlay")!;
 const goBtn = document.getElementById("go") as HTMLButtonElement;
@@ -164,6 +166,7 @@ let world: SimWorld | null = null;
 let agentManager: AgentManager | null = null;
 let steppedSim: SteppedSimulation | null = null;
 let heightSampler: HeightSampler | null = null;
+let replayCaptureSystem: ReplayCaptureSystem | null = null;
 
 // Exploration phase shared state
 let explorationReady = false;
@@ -384,10 +387,15 @@ function launchScenario(scenarioId: string) {
   const locLon = lonInput.value;
   const locationStr = locAddr || `${locLat}, ${locLon}`;
 
-  steppedSim = new SteppedSimulation(world, agentManager, perception, recorder, sharedEventBus, {
+  const replayRecorder = new ReplayRecorder(agentManager, locationStr);
+
+  steppedSim = new SteppedSimulation(world, agentManager, perception, recorder, sharedEventBus, replayRecorder, {
     stepDurationSec: 1,
     enabled: true,
-  }, locationStr);
+  });
+
+  // 3b. Create replay capture system (round-robin 512x512 captures in animate loop)
+  replayCaptureSystem = new ReplayCaptureSystem(renderer, scene, agentManager, replayRecorder);
 
   // 4. Start stepped simulation (connects WebSocket)
   steppedSim.start();
@@ -431,6 +439,10 @@ stopSimBtn.addEventListener("click", async () => {
   if (!steppedSim) return;
   stopSimBtn.disabled = true;
   stopSimBtn.textContent = "Saving...";
+  if (replayCaptureSystem) {
+    replayCaptureSystem.dispose();
+    replayCaptureSystem = null;
+  }
   await steppedSim.stop();
   steppedSim = null;
   stopSimBtn.style.display = "none";
@@ -452,6 +464,10 @@ goBtn.addEventListener("click", async () => {
   loading.style.display = "block";
 
   // Clean up previous agent system
+  if (replayCaptureSystem) {
+    replayCaptureSystem.dispose();
+    replayCaptureSystem = null;
+  }
   if (steppedSim) {
     await steppedSim.stop();
     steppedSim = null;
@@ -545,6 +561,11 @@ function animate() {
   hud.textContent = `pos: (${pos.x.toFixed(1)}, ${pos.y.toFixed(1)}, ${pos.z.toFixed(1)})  |  WASD move · Mouse look · Space ↑ · Shift ↓  |  Click to capture mouse`;
 
   renderer.render(scene, camera);
+
+  // Round-robin replay capture (1 agent per frame)
+  if (replayCaptureSystem) {
+    replayCaptureSystem.captureNext();
+  }
 }
 
 animate();

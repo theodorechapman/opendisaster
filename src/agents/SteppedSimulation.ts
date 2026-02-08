@@ -7,7 +7,7 @@ import type { PerceiveMessage, DecisionResponse, PerceptionPayload } from "./typ
 import { AgentState, AgentAction, AgentFacing, Position, ActionType } from "../core/Components.ts";
 import type { EventBus, FireSpreadEvent } from "../core/EventBus.ts";
 import { agentLog } from "./AgentLogger.ts";
-import { ReplayRecorder } from "../replay/ReplayRecorder.ts";
+import type { ReplayRecorder } from "../replay/ReplayRecorder.ts";
 
 const ACTION_NAMES = ["IDLE","MOVE_TO","RUN_TO","HELP_PERSON","EVACUATE","WAIT","ENTER_BUILDING","EXIT_BUILDING"];
 
@@ -63,15 +63,15 @@ export class SteppedSimulation {
     perception: AgentPerceptionSystem,
     recorder: AgentRecorder,
     eventBus: EventBus,
+    replayRecorder: ReplayRecorder,
     config: SteppedSimConfig = { stepDurationSec: 1, enabled: true },
-    location: string = "Unknown",
   ) {
     this.world = world;
     this.manager = manager;
     this.perception = perception;
     this.recorder = recorder;
     this.config = config;
-    this.replayRecorder = new ReplayRecorder(manager, location);
+    this.replayRecorder = replayRecorder;
 
     // Subscribe to FIRE_SPREAD events to track fire sources
     eventBus.on("FIRE_SPREAD", (event) => {
@@ -313,8 +313,6 @@ export class SteppedSimulation {
           payload: p,
           simTime: captureSimTime,
         });
-        // Record frame for replay
-        this.replayRecorder.recordFrame(p, this.step, captureSimTime);
       }
 
       // Log every agent's state at capture time
@@ -397,8 +395,8 @@ export class SteppedSimulation {
       obsMap.set(dec.agentIndex, dec.observation);
       decMap.set(dec.agentIndex, { reasoning: dec.reasoning, action: dec.action });
 
-      // Attach VLM output to replay frame
-      this.replayRecorder.attachVLM(dec.agentIndex, step, {
+      // Attach VLM output to replay session
+      this.replayRecorder.attachVLM(dec.agentIndex, step, this.simTime, {
         observation: dec.observation,
         reasoning: dec.reasoning,
         action: dec.action,
