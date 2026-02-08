@@ -6,7 +6,7 @@ type Proj = { lon: number; lat: number };
 
 // ─── Height sampler (bilinear interpolation over the elevation grid) ────────
 
-class HeightSampler {
+export class HeightSampler {
   private values: number[][];
   private gridSize: number;
   private minElev: number;
@@ -74,7 +74,7 @@ export function buildAllLayers(
   data: LayerData,
   centerLat: number,
   centerLon: number,
-): THREE.Group {
+): { group: THREE.Group; heightSampler: HeightSampler } {
   const root = new THREE.Group();
   const mpd = metersPerDegree(centerLat);
 
@@ -94,7 +94,7 @@ export function buildAllLayers(
   root.add(buildTrees(data.trees, centerLat, centerLon, mpd, sampler));
   root.add(buildBarriers(data.barriers, centerLat, centerLon, mpd, sampler));
 
-  return root;
+  return { group: root, heightSampler: sampler };
 }
 
 // ─── Projection helpers ─────────────────────────────────────────────────────

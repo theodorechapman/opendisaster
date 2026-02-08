@@ -67,6 +67,41 @@
       padding: 8px 20px; font-size: 13px; z-index: 15;
       display: none;
     }
+
+    /* Agent system UI */
+    #info {
+      position: fixed; top: 12px; left: 12px;
+      font-size: 12px; color: #4fc3f7;
+      pointer-events: none; z-index: 5;
+      font-family: monospace;
+    }
+
+    #agent-hud {
+      position: fixed; top: 12px; right: 12px;
+      background: rgba(0,0,0,0.75); border: 1px solid #333;
+      border-radius: 8px; padding: 10px 14px;
+      font-size: 12px; font-family: monospace;
+      z-index: 5; min-width: 180px;
+    }
+    .agent-header { color: #4fc3f7; margin-bottom: 6px; font-weight: bold; }
+    .agent-row { color: #ccc; padding: 2px 0; }
+    .agent-row.dead { color: #666; text-decoration: line-through; }
+
+    #snapshot-gallery {
+      position: fixed; bottom: 12px; left: 12px; right: 12px;
+      display: flex; gap: 8px; overflow-x: auto;
+      z-index: 5; padding: 4px;
+      pointer-events: auto;
+    }
+    .snapshot-card {
+      flex-shrink: 0; width: 200px;
+      background: rgba(0,0,0,0.8); border: 1px solid #333;
+      border-radius: 6px; overflow: hidden;
+    }
+    .snapshot-card img { width: 200px; height: 200px; object-fit: cover; display: block; }
+    .snapshot-card .caption { padding: 6px 8px; font-size: 10px; color: #aaa; font-family: monospace; }
+    .snapshot-card .caption .name { color: #4fc3f7; font-weight: bold; margin-bottom: 2px; }
+    .snapshot-card .caption .step-info { color: #888; margin-bottom: 4px; }
   </style>
 </head>
 <body>
@@ -95,6 +130,9 @@
       <button id="go">Load Buildings</button>
     </div>
   </div>
+  <div id="info"></div>
+  <div id="agent-hud"></div>
+  <div id="snapshot-gallery"></div>
   <div id="crosshair"></div>
   <div id="hud"></div>
   <div id="loading">Loading building data…</div>
